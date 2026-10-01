@@ -1,0 +1,50 @@
+# CI for agentmap.nvim: runs tests/run.sh on Linux and macOS against the oldest supported
+# Neovim (0.10), the latest stable release and nightly (nightly is allowed to fail).
+# Windows is not tested in v0.1.0 (Windows-native Neovim is "experimental", see DECISIONS D5).
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / nvim ${{ matrix.nvim }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        nvim: [v0.10.4, stable, nightly]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.nvim == 'nightly' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rhysd/action-setup-vim@v1
+        id: nvim
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Show versions
+        run: |
+          "${{ steps.nvim.outputs.executable }}" --version | head -n 3
+          python3 --version
+
+      - name: Run tests
+        env:
+          AGENTMAP_TEST_NVIM: ${{ steps.nvim.outputs.executable }}
+        run: bash tests/run.sh

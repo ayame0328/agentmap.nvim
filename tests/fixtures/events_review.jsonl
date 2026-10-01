@@ -1,0 +1,4 @@
+{"v":1,"ts":"2026-09-27T19:24:00.000Z","event":"review_submitted","run_id":"c0ffee01-0000-4000-8000-000000000001","src":"user","agent_id":"afeed000000000007","attempt":1,"note":"GRAND だけ返したか確認","by":"user"}
+{"v":1,"ts":"2026-09-27T19:24:05.000Z","event":"review_result","run_id":"c0ffee01-0000-4000-8000-000000000001","src":"user","agent_id":"afeed000000000007","verdict":"RETRY","decided_by":"user","attempt":1,"reason":"根拠が無い","rubric_version":1}
+{"v":1,"ts":"2026-09-27T19:24:10.000Z","event":"rework_started","run_id":"c0ffee01-0000-4000-8000-000000000001","src":"user","agent_id":"afeed000000000007","trigger":"user"}
+{"v":1,"ts":"2026-09-27T19:24:20.000Z","event":"review_result","run_id":"c0ffee01-0000-4000-8000-000000000001","src":"user","agent_id":"afeed000000000007","verdict":"PASS","decided_by":"user","attempt":2,"reason":"再実行で確認できた","rubric_version":1}

@@ -1,0 +1,21 @@
+{"name": "ja_only", "prompt": "【目的】orders を拡張する\n【任せる理由】ファイルが多い\n【期待する結果】テストが通る\n本文", "brief": {"purpose": "orders を拡張する", "reason": "ファイルが多い", "expected": "テストが通る"}}
+{"name": "en_only", "prompt": "[Goal] Extend the orders model\n[Why delegate] Many files to read\n[Done when] Tests pass\n\nBody text", "brief": {"purpose": "Extend the orders model", "reason": "Many files to read", "expected": "Tests pass"}}
+{"name": "mixed", "prompt": "[Goal] Extend orders\n【任せる理由】ファイルが多い\n[Done when] tests pass", "brief": {"purpose": "Extend orders", "reason": "ファイルが多い", "expected": "tests pass"}}
+{"name": "lower_case", "prompt": "[goal] fix the parser\n[why delegate] runs in parallel\n[done when] green build", "brief": {"purpose": "fix the parser", "reason": "runs in parallel", "expected": "green build"}}
+{"name": "upper_case", "prompt": "[GOAL] fix it\n[DONE WHEN] done", "brief": {"purpose": "fix it", "expected": "done"}}
+{"name": "colon_variants", "prompt": "[Goal]: half-width colon\n[Why delegate]： full-width colon\n【期待する結果】:一覧", "brief": {"purpose": "half-width colon", "reason": "full-width colon", "expected": "一覧"}}
+{"name": "colon_ja", "prompt": "【目的】：　調べる　\n【任せる理由】: 多い", "brief": {"purpose": "調べる", "reason": "多い"}}
+{"name": "marker_mid_line", "prompt": "Please read this first. [Goal] Review the PR\nmore text", "brief": {"purpose": "Review the PR"}}
+{"name": "one_line_en", "prompt": "[Goal] A [Why delegate] B [Done when] C", "brief": {"purpose": "A", "reason": "B", "expected": "C"}}
+{"name": "one_line_mixed", "prompt": "【目的】既存の dbt モデルを把握する [Why delegate] many files 【期待する結果】一覧", "brief": {"purpose": "既存の dbt モデルを把握する", "reason": "many files", "expected": "一覧"}}
+{"name": "first_wins_en_first", "prompt": "[Goal] first\n【目的】second", "brief": {"purpose": "first"}}
+{"name": "first_wins_ja_first", "prompt": "【目的】一番目\n[Goal] second", "brief": {"purpose": "一番目"}}
+{"name": "first_wins_same_lang", "prompt": "[Goal] A\nbody [goal] B", "brief": {"purpose": "A"}}
+{"name": "brackets_in_value", "prompt": "[Goal] see [docs] and (notes)", "brief": {"purpose": "see [docs] and (notes)"}}
+{"name": "crlf", "prompt": "[Goal] A\r\n[Done when] B\r\n", "brief": {"purpose": "A", "expected": "B"}}
+{"name": "partial_missing", "prompt": "[Goal] investigate\n[Done when] a list", "brief": {"purpose": "investigate", "expected": "a list"}}
+{"name": "empty_values", "prompt": "[Goal]\n[Why delegate]   \nbody", "brief": null}
+{"name": "no_marker", "prompt": "Just a plain prompt without the convention", "brief": null}
+{"name": "near_miss", "prompt": "[Goals] x\n[Why] y\n[Done] z", "brief": null}
+{"name": "clip_300", "prompt": "[Goal] aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n[Why delegate] x", "brief": {"purpose": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "reason": "x"}}
+{"name": "clip_300_ja", "prompt": "【目的】ああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああ", "brief": {"purpose": "ああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああ"}}

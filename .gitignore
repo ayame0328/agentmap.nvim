@@ -1,0 +1,6 @@
+*.bak
+*.orig
+.DS_Store
+/tests/.tmp/
+doc/tags
+__pycache__/

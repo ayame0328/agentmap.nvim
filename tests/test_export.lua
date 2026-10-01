@@ -1,0 +1,265 @@
+-- Tests of export.lua: Markdown / HTML / PDF from hand-made states.
+--   ・Markdown に 7 つの見出しがある（既定の英語。最後に setup("ja") の日本語も少し確かめる）
+--   ・Mermaid の形が正しい（名前は安全な文字だけ・ラベルの記号は置き換え済み・矢印の先は全部宣言済み）
+--   ・HTML は同梱の md.lua（export.html_command があればそちら）
+--   ・PDF は export.pdf_command が無ければ分かりやすい知らせを出す。あれば %{html} %{out} %{title} を置き換えて呼ぶ
+local t = require("t")
+local mc = require("mermaid_check")
+local export = require("agentmap.export")
+
+-- 知らせ（vim.notify）を横取りして確かめる
+local notes = {}
+vim.notify = function(msg, lvl) notes[#notes + 1] = { msg = msg, lvl = lvl } end
+
+-- 手で作った state（DESIGN §4 の形）。わざと扱いにくい名前や ID を混ぜる
+local function hand_state()
+  return {
+    v = 1, run_id = "c0ffee01-0000-4000-8000-000000000001", cwd = "/tmp/proj/work",
+    title = 'AgentMap "設計" [確認] <テスト>', started_at = "2026-09-28T04:23:38.000Z",
+    ended_at = "2026-09-28T04:40:00.000Z", end_reason = "other",
+    order = { "ROOT", "a1", "a2", "a3", "pending:toolu_01", "x-y.z", "end" },
+    agents = {
+      ROOT = { id = "ROOT", status = "DONE", model = "claude-fable-5-1", children = { "a1", "a3" },
+        attempts = { { n = 1 } }, last_head = "全部終わりました", tool_counts = { Agent = 2, Bash = 1 },
+        files = { "/tmp/proj/work/README.md" } },
+      a1 = { id = "a1", index = 1, name = 'probe "child" | pipe', agent_type = "general-purpose",
+        model = "claude-haiku-4-5-20251001", parent_id = "ROOT", children = { "a2" }, status = "DONE",
+        attempts = {
+          { n = 1, started_at = "2026-09-28T04:23:40.000Z", finished_at = "2026-09-28T04:25:00.000Z",
+            submitted_at = "2026-09-28T04:25:10.000Z", verdict = "RETRY", decided_by = "user",
+            reason = "根拠が無い", retried_by = "a3" },
+        },
+        review_count = 1, rework_count = 1, started_at = "2026-09-28T04:23:40.000Z",
+        finished_at = "2026-09-28T04:25:00.000Z", elapsed_ms = 80000, tool_counts = { Write = 2 },
+        files = { "/tmp/proj/work/a.lua", "/tmp/proj/work/README.md" }, last_head = "A を書きました" },
+      a2 = { id = "a2", index = 2, name = "grand #1 {x}", agent_type = "Explore", model = "claude-opus-5-5",
+        parent_id = "a1", children = {}, status = "DONE", attempts = { { n = 1 } }, last_head = "GRAND" },
+      a3 = { id = "a3", index = 3, name = "probe child (retry)", agent_type = "general-purpose",
+        parent_id = "ROOT", children = {}, status = "REVIEW", worktree = "/tmp/wt", branch = "feat/x",
+        attempts = { { n = 1, retry_of = "a1", submitted_at = "2026-09-28T04:30:00.000Z" } },
+        review_count = 1, rework_count = 0, started_at = "2026-09-28T04:26:00.000Z" },
+      ["pending:toolu_01"] = { id = "pending:toolu_01", index = 4, placeholder = true, name = "待ち",
+        parent_id = "a3", children = {}, status = "PENDING", attempts = {} },
+      ["x-y.z"] = { id = "x-y.z", index = 5, name = "親不明 <a>", parent_id = nil, children = {},
+        status = "FAILED", error_head = "session ended", attempts = { { n = 1 } } },
+      ["end"] = { id = "end", index = 6, name = "予約語の ID", parent_id = "a2", status = "ESCALATE_TEST",
+        escalated_to = "a1", attempts = { { n = 1, verdict = "ESCALATE", decided_by = "user" } },
+        review_count = 1 },
+    },
+  }
+end
+
+local HEADINGS = { "## Run overview", "## Map", "## Agents", "## Reviews and rework",
+  "## Final outputs", "## Changed files", "## Tool calls" }
+
+local function check_markdown(md, label)
+  for _, h in ipairs(HEADINGS) do
+    t.ok(md:find("\n" .. h .. "\n", 1, true), label .. ": 見出しがある " .. h)
+  end
+  local blocks, unclosed = mc.blocks(md)
+  t.eq(#blocks, 1, label .. ": mermaid の囲みが 1 つ")
+  t.ok(not unclosed, label .. ": mermaid の囲みが閉じている")
+  local fences = select(2, md:gsub("\n```", ""))
+  t.eq(fences % 2, 0, label .. ": ``` の数が偶数（囲みが釣り合っている）")
+  local errs, declared = mc.check(blocks[1] or "")
+  t.eq(errs, {}, label .. ": Mermaid の形が正しい")
+  return blocks[1] or "", declared
+end
+
+-- 1. 手で作った state
+local s = hand_state()
+local md = export.to_markdown(s, { source = "hooks" })
+local mer, declared = check_markdown(md, "手作り state")
+t.ok(declared.n_ROOT, "ROOT がある")
+t.ok(declared.n_a1 and declared.n_a2 and declared.n_a3, "Agent の箱がある")
+t.ok(declared.n_pending_toolu_01, "起動待ちの ID が安全な名前になる")
+t.ok(declared.n_x_y_z, "記号入りの ID が安全な名前になる")
+t.ok(declared.n_end, "予約語の ID も n_ が付いて安全")
+t.ok(declared.n_UNKNOWN_PARENT, "親不明のまとめ役がある")
+t.matches(mer, "\n  n_ROOT %-%-> n_a1\n", "ROOT → [1]")
+t.matches(mer, "\n  n_a1 %-%-> n_a2\n", "[1] → [2]（孫）")
+t.matches(mer, "\n  n_UNKNOWN_PARENT %-%.%-> n_x_y_z\n", "親不明は点線でつなぐ")
+t.matches(mer, "g_a1_1{{\"Review #35;1<br/>RETRY by user\"}}", "レビューの関所（# は置き換え）")
+t.matches(mer, "g_a1_1 %-%->|RETRY| n_a3", "差し戻し → 再実行した Agent へ")
+t.matches(mer, "g_end_1 %-%->|ESCALATE| n_a1", "上位へ相談の矢印")
+t.matches(mer, "#quot;child#quot;", "ラベルの \" は #quot; に")
+t.matches(mer, "#91;1#93;", "ラベルの [ ] は文字コードに")
+t.matches(mer, "classDef done", "色の定義がある")
+t.matches(mer, "class n_a3 review", "REVIEW の色")
+t.matches(mer, 'n_a1%["[^"]*<br/>DONE ~100%%"%]', "Agent の箱に状態と進み具合（子 1 人中 1 人 DONE）")
+t.matches(mer, 'n_a3%["[^"]*<br/>REVIEW ~0%%"%]', "子のいる Agent には進み具合")
+t.matches(mer, "ROOT c0ffee01", "ROOT に run の短い ID")
+t.matches(mer, "DONE ~50%%", "ROOT の進み具合は子 2 人中 1 人 DONE で ~50%")
+t.matches(mer, 'n_x_y_z%["[^"]*<br/>FAILED"%]', "子の無い Agent に % は出さない")
+t.matches(md, "```text\nROOT  fable%-5%-1  %[DONE%] ~50%%", "文字の木の先頭")
+-- ROOT の子は時刻で 2 段（[1] 04:23–04:25 → [3] 04:26〜）に分かれる
+t.matches(md, "\n├─ Stage 1\n│  └─ %[1%] probe", "文字の木に Stage 1 と [1]")
+t.matches(md, "│     └─ %[2%] grand", "文字の木に孫（段の下で 1 段深い）")
+t.matches(md, "\n└─ Stage 2\n   └─ %[3%] probe child", "文字の木に Stage 2 と [3]")
+t.matches(md, "\nEND  %[PENDING%]\n", "文字の木の最後に END（[3] が REVIEW 中なので未完了）")
+t.matches(mer, 'subgraph s_ROOT_1%["Stage 1"%]', "Mermaid：Stage 1 の囲み")
+t.matches(mer, 'subgraph s_ROOT_2%["Stage 2"%]', "Mermaid：Stage 2 の囲み")
+t.matches(mer, "\n  end\n", "Mermaid：囲みの終わり")
+t.matches(mer, "n_START ==> n_ROOT", "Mermaid：START → ROOT")
+t.matches(mer, "n_a1 ==> n_a3", "Mermaid：段1 → 段2 は順番の線")
+t.matches(mer, "n_ROOT %-%-> n_a1", "Mermaid：ROOT → 段1 は起動の線")
+t.matches(mer, "n_a3 ==> n_END", "Mermaid：最後の段 → END")
+t.matches(mer, 'n_END%["END<br/>PENDING"%]', "Mermaid：END の状態")
+t.matches(md, "\nUNKNOWN_PARENT\n└─ %[5%]", "文字の木に親不明")
+t.matches(md, "Review #1 %[RETRY%] → %[3%]", "文字の木に関所と再実行先")
+t.matches(md, "| 1 | probe \"child\" \\| pipe |", "表の | は \\| に")
+t.matches(md, "#1 start %d%d:%d%d → finished %d%d:%d%d → submitted %d%d:%d%d → RETRY %(user%) \"根拠が無い\" → rerun %[3%]",
+  "レビュー履歴の流れ")
+t.matches(md, " %(rerun of %[1%]%)", "再実行元が分かる")
+t.matches(md, "`/tmp/proj/work/README.md` — ROOT %[1%]", "変更ファイルと Agent")
+t.matches(md, "| Agent | Agent | Bash | Write |", "ツール実行数の見出し")
+t.matches(md, "> 全部終わりました", "ROOT の最終メッセージ")
+t.matches(md, "| Source | hooks |", "記録元")
+t.matches(md, "| Rework | 1 |", "差し戻し回数")
+t.matches(md, "\n# AgentMap run record: AgentMap \"設計\" %[確認%] <テスト>\n", "題名の見出し")
+t.matches(md, "\n| 4 | 待ち | %(waiting to start%) | ", "起動待ちの ID")
+t.matches(md, "\n%- %[1%] probe \"child\" | pipe %(submitted 1, rework 1, now %[DONE%]%)\n", "レビュー履歴の Agent の行")
+t.matches(md, "  %- Escalated to: %[1%]", "上位へ相談")
+t.matches(md, "| Status | ended %(other%) |", "終わった run の状態")
+t.matches(md, "feat/x", "branch")
+
+-- 2. 空に近い state（ROOT だけ）でも壊れない
+local md0 = export.to_markdown({ run_id = "r0", agents = { ROOT = { id = "ROOT", status = "RUNNING" } } })
+check_markdown(md0, "ROOT だけ")
+t.matches(md0, "No tool calls recorded%.", "空のときの文")
+t.matches(md0, "No reviews or rework recorded%.", "レビューが無いときの文")
+t.matches(md0, "No file changes recorded%.", "変更ファイルが無いときの文")
+t.matches(md0, "No final messages recorded%.", "最終成果物が無いときの文")
+t.matches(md0, "| Status | running %(at export time%) |", "終わっていない run の状態")
+t.matches(md0, "| ROOT model | %? %(not recorded%) |", "model が無い")
+
+-- 3. 親子が輪になっていても止まらず、全員載る
+local loop = { run_id = "loop", agents = {
+  ROOT = { id = "ROOT", status = "RUNNING" },
+  p = { id = "p", index = 1, parent_id = "q", status = "RUNNING" },
+  q = { id = "q", index = 2, parent_id = "p", status = "RUNNING" },
+} }
+local mdl = export.to_markdown(loop)
+local _, dl = check_markdown(mdl, "輪")
+t.ok(dl.n_p and dl.n_q, "輪の Agent も載る")
+
+-- 4. B の試験用 state（あれば）
+local okb, small = pcall(dofile, vim.g.agentmap_test_dir .. "/fixtures/state_small.lua")
+if okb and type(small) == "table" then
+  local mds = export.to_markdown(small)
+  local ms = check_markdown(mds, "state_small")
+  t.matches(ms, "n_ROOT %-%-> n_a1", "state_small: ROOT → a1")
+  t.matches(ms, "g_a2_1 %-%->|RETRY| n_a2", "state_small: 差し戻しは自分へ戻る")
+else
+  t.skip("fixtures/state_small.lua が無い")
+end
+
+-- 5. ファイルに書き出す（markdown / html / pdf）
+local dir = vim.fn.tempname()
+local p_md = export.write(s, "markdown", dir .. "/out.md")
+t.eq(p_md, dir .. "/out.md", "markdown を書き出した")
+local function no_stamp(x) return (x:gsub("Exported: [^\n]*", "")) end
+t.eq(no_stamp(table.concat(vim.fn.readfile(p_md), "\n") .. "\n"), no_stamp(export.to_markdown(s, {})),
+  "書き出した中身は to_markdown と同じ")
+t.matches(notes[#notes] and notes[#notes].msg or "", "^AgentMap: Exported: " .. vim.pesc(dir) .. "/out%.md", "書き出した知らせ")
+
+local p_def = export.write(s, "md", nil, { dir = dir .. "/run" })
+t.matches(p_def or "", "^" .. vim.pesc(dir) .. "/run/exports/agentmap%-c0ffee01%-%d+%-%d+%.md$", "既定の書き出し先")
+
+-- HTML：同梱の md.lua（外部の道具は使わない）
+local cfg = require("agentmap.config").get()
+cfg.export = cfg.export or {}
+cfg.export.html_command, cfg.export.pdf_command = nil, nil
+local p_html = export.write(s, "html", dir .. "/out.html")
+t.eq(p_html, dir .. "/out.html", "html を書き出した")
+local html = p_html and table.concat(vim.fn.readfile(p_html), "\n") or ""
+t.matches(html, "^<!doctype html>", "HTML になっている")
+t.matches(html, "<title>AgentMap run record c0ffee01</title>", "題名が入っている")
+t.matches(html, '<h2 id="sec%-%d+">Agents</h2>', "見出しが入っている")
+t.ok(html:find("AgentMap \"設計\" [確認] &lt;テスト&gt;", 1, true) ~= nil, "本文の < > は置き換える")
+t.matches(html, '<pre class="mermaid">flowchart LR\n', "Mermaid は元の文のまま残す")
+t.ok(html:find("n_a1 %-%-&gt; n_a2") ~= nil, "Mermaid の矢印の > は置き換える")
+t.matches(html, "prefers%-color%-scheme: dark", "暗い配色にも対応")
+t.matches(html, '<nav class="toc">', "目次がある")
+t.ok(not html:find("<script", 1, true) and not html:find("<link", 1, true) and not html:find("@import", 1, true)
+  and not html:find("https?://") and not html:find("url%("), "外部の読み込みが無い")
+
+-- HTML：export.html_command があればそちら（標準入力に Markdown、最後の引数に題名）
+cfg.export.html_command = { "sh", "-c", 'cat > /dev/null; printf "<p>%s</p>" "$1"', "sh" }
+local p_html2 = export.write(s, "html", dir .. "/cmd.html")
+t.eq(p_html2, dir .. "/cmd.html", "html_command で書き出した")
+t.eq(p_html2 and table.concat(vim.fn.readfile(p_html2), "\n"), "<p>AgentMap run record c0ffee01</p>", "html_command の出力をそのまま書く")
+cfg.export.html_command = { "sh", "-c", "exit 3" }
+notes = {}
+t.eq(export.write(s, "html", dir .. "/bad.html"), nil, "html_command が失敗したら nil")
+t.matches(notes[#notes] and notes[#notes].msg or "", "HTML conversion failed", "失敗を知らせる")
+t.eq(notes[#notes] and notes[#notes].lvl, vim.log.levels.ERROR, "知らせは ERROR")
+cfg.export.html_command = nil
+
+-- PDF：export.pdf_command が無いとき（D4）
+notes = {}
+t.eq(export.write(s, "pdf", dir .. "/out.pdf"), nil, "PDF の設定が無いと nil")
+t.matches(notes[#notes] and notes[#notes].msg or "", "PDF export is not configured%. Set export%.pdf_command", "PDF が使えない理由を知らせる")
+t.eq(notes[#notes] and notes[#notes].lvl, vim.log.levels.WARN, "知らせは WARN")
+t.ok(not vim.uv.fs_stat(dir .. "/out.pdf"), "何も作らない")
+
+-- PDF：export.pdf_command があるとき（本物のブラウザは呼ばず、HTML をそのまま写すコマンドで呼ばれ方を見る）
+cfg.export.pdf_command = { "sh", "-c", 'cp "$1" "$2" && printf "%s" "$3" > "$2.title"', "sh", "%{html}", "%{out}", "%{title}" }
+notes = {}
+t.eq(export.write(s, "pdf", dir .. "/out.pdf"), dir .. "/out.pdf", "PDF の書き出し先を返す")
+local pdf_in = table.concat(vim.fn.readfile(dir .. "/out.pdf"), "\n")
+t.matches(pdf_in, "^<!doctype html>", "%{html} に HTML のファイルを渡している")
+t.matches(pdf_in, "<h2 id=\"sec%-%d+\">Map</h2>", "HTML の中身は書き出しと同じ")
+t.eq(table.concat(vim.fn.readfile(dir .. "/out.pdf.title"), "\n"), "AgentMap run record c0ffee01", "%{title} を置き換える")
+t.eq(vim.fn.glob(dir .. "/*.agentmap-print.html"), "", "印刷用の一時 HTML は消す")
+t.matches(notes[#notes] and notes[#notes].msg or "", "^AgentMap: Exported: .*/out%.pdf", "書き出した知らせ")
+-- 失敗するコマンド・PDF を作らないコマンド
+cfg.export.pdf_command = { "sh", "-c", "echo broken >&2; exit 2" }
+notes = {}
+t.eq(export.write(s, "pdf", dir .. "/x.pdf"), nil, "コマンドが失敗したら nil")
+t.matches(notes[#notes] and notes[#notes].msg or "", "PDF export failed.*broken", "失敗と標準エラーを知らせる")
+cfg.export.pdf_command = { "true" }
+notes = {}
+t.eq(export.write(s, "pdf", dir .. "/y.pdf"), nil, "PDF ができなければ nil")
+t.matches(notes[#notes] and notes[#notes].msg or "", "did not create .*/y%.pdf", "できていないことを知らせる")
+cfg.export.pdf_command = nil
+-- argv の組み立て：/mnt/ で始まるコマンド（WSL から Windows のプログラム）だけ Windows の道のりにする（S13）
+t.eq(export.pdf_argv({ "/mnt/c/Program Files/chrome.exe", "--print-to-pdf=%{out}", "%{html}", "--t=%{title}", "%{nope}" },
+  "/mnt/c/tmp/a.html", "/mnt/c/tmp/a.pdf", "T 100%"),
+  { "/mnt/c/Program Files/chrome.exe", "--print-to-pdf=C:\\tmp\\a.pdf", "C:\\tmp\\a.html", "--t=T 100%", "%{nope}" },
+  "/mnt/ のコマンドは道のりを Windows 形式に")
+t.eq(export.pdf_argv({ "chromium", "--print-to-pdf=%{out}", "%{html}" }, "/tmp/a.html", "/tmp/a.pdf", "t"),
+  { "chromium", "--print-to-pdf=/tmp/a.pdf", "/tmp/a.html" }, "ふつうのコマンドは道のりそのまま")
+t.eq(export.pdf_argv("wkhtmltopdf", "/tmp/a.html", "/tmp/a.pdf", "t"), { "wkhtmltopdf" }, "文字列 1 つのコマンドも受ける")
+
+-- 知らない形式
+t.eq(export.write(s, "docx", dir .. "/x.docx"), nil, "知らない形式は nil")
+
+-- 本物の mermaid があれば、そちらでも確かめる
+for label, src in pairs({ hand = mer, root_only = mc.blocks(md0)[1], loop = mc.blocks(mdl)[1] }) do
+  local real, out = mc.mmdc(src)
+  if real == nil then
+    t.skip("mermaid-cli（mmdc）が無いので、形の確認だけ")
+    break
+  end
+  t.ok(real, "本物の mermaid でも読める: " .. label .. "\n" .. tostring(out))
+end
+
+-- setup({ lang = "ja" }) で今までの日本語の書き出し
+require("agentmap.i18n").setup("ja")
+local mdj = export.to_markdown(hand_state(), { source = "hooks" })
+for _, h in ipairs({ "## Run 概要", "## 構成図", "## Agent 一覧", "## レビュー・差し戻し履歴",
+  "## 最終成果物", "## 主な変更ファイル", "## ツール実行数" }) do
+  t.ok(mdj:find("\n" .. h .. "\n", 1, true), "日本語: 見出しがある " .. h)
+end
+t.matches(mdj, "\ntitle: AgentMap 実行記録 c0ffee01\n", "日本語: 題名")
+t.matches(mdj, 'subgraph s_ROOT_1%["段1"%]', "日本語: Mermaid の 段1")
+t.matches(mdj, "\n├─ 段1\n", "日本語: 文字の木の 段1")
+t.matches(mdj, "#1 開始 %d%d:%d%d → 完了 %d%d:%d%d → 提出 %d%d:%d%d → RETRY（user）「根拠が無い」 → 再実行 %[3%]", "日本語: レビュー履歴")
+t.matches(mdj, "| 記録元 | hooks |", "日本語: 記録元")
+t.eq(mc.check(mc.blocks(mdj)[1] or ""), {}, "日本語でも Mermaid の形が正しい")
+t.matches(require("agentmap.md").to_html(mdj), '<html lang="ja">', "日本語: HTML の lang")
+require("agentmap.i18n").setup("en")
+
+vim.fn.delete(dir, "rf")
+t.done()

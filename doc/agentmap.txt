@@ -1,0 +1,177 @@
+*agentmap.txt*    Live map of Claude Code agents inside Neovim
+
+Author:  ayame0328
+License: MIT
+Home:    https://github.com/ayame0328/agentmap.nvim
+
+==============================================================================
+CONTENTS                                                    *agentmap-contents*
+
+  1. Introduction ............................. |agentmap-intro|
+  2. Setup .................................... |agentmap-setup|
+  3. Commands ................................. |agentmap-commands|
+  4. Keys ..................................... |agentmap-keys|
+  5. Configuration ............................ |agentmap-config|
+  6. Writing convention ....................... |agentmap-convention|
+  7. HUMAN CHECK .............................. |agentmap-human-check|
+  8. Review ................................... |agentmap-review|
+  9. Export ................................... |agentmap-export|
+ 10. Records and privacy ...................... |agentmap-privacy|
+
+==============================================================================
+1. INTRODUCTION                                                *agentmap-intro*
+
+agentmap.nvim draws the agents that Claude Code starts (parent, children,
+grandchildren) as a map from START through stages to END, inside Neovim.
+The map updates while Claude Code works; runs are kept for later.
+
+Claude Code calls a small recorder (`bin/agentmap-collect`, Python 3) through
+its hooks. The recorder appends one short line per event to a file in the
+record folder; Neovim reads that file. The recorder never prints, never fails
+and never changes what Claude Code does.
+
+Requirements: Neovim 0.10+, Python 3, Claude Code (verified with 2.1.283 to
+2.1.286). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
+Windows-native Neovim is experimental.
+
+==============================================================================
+2. SETUP                                                       *agentmap-setup*
+
+Install with your plugin manager. `setup()` is optional. Then once:
+
+1. |:AgentMapInstallHooks| registers the recorder in Claude Code's
+   settings.json (shows a diff and asks first; keeps a backup).
+2. `:checkhealth agentmap` checks everything.
+3. Start a new Claude Code session; recording starts there.
+4. Paste the writing convention into your CLAUDE.md (|agentmap-convention|).
+
+Claude Code in a container: see `docs/containers.md` in the plugin folder.
+
+==============================================================================
+3. COMMANDS                                                 *agentmap-commands*
+
+:AgentMap [{session_id} [{prompt_id}]]                             *:AgentMap*
+        Open the map of the latest prompt that started agents, and follow
+        new runs. With arguments, open that run (and prompt) and stay on it.
+
+:AgentMapRuns                                                  *:AgentMapRuns*
+        Pick a past run, or a Claude Code session to import.
+
+:AgentMapAgent {n|id}                                         *:AgentMapAgent*
+        Details of agent number {n} in the map, or of the agent {id}.
+
+:AgentMapRefresh                                            *:AgentMapRefresh*
+        Read the records again.
+
+:AgentMapExport [{format} [{path}]]                          *:AgentMapExport*
+        Export the prompt shown in the map. {format} is `markdown`, `html`
+        or `pdf`; without it you are asked. See |agentmap-export|.
+
+:AgentMapReview {n|id} {verdict} [{reason}]                  *:AgentMapReview*
+        Record a review. {verdict} is PASS, RETRY, ESCALATE or SUBMIT.
+
+:AgentMapInstallHooks [{settings.json}]                *:AgentMapInstallHooks*
+        Register the recording hooks. Other settings and hooks are kept.
+        Running it again changes nothing.
+
+:AgentMapImport [{session_id}]                               *:AgentMapImport*
+        Import a run from Claude Code's transcript (default: the newest
+        session of the current folder).
+
+==============================================================================
+4. KEYS                                                         *agentmap-keys*
+
+All keys are local to the map and side buffers. No global mapping is made
+unless `keymaps = { global = true }` (adds <leader>aa, <leader>ar, <leader>ae).
+
+Map:
+  1-9        details of agent number n
+  <CR>       details of the box under the cursor (HUMAN CHECK: the question)
+  n / p      next / previous box
+  + / -      expand / collapse children
+  z / <BS>   only this agent and below / back up
+  t          transcript          d    git diff        w    working folder
+  a          review              e    export          r    reload
+  R          past runs           v    map / list      ?    key list
+  q          close
+
+Detail, transcript and diff views:
+  <BS>       back               q     close
+  <CR>       open the agent / parent / HUMAN CHECK on the line
+  t d w a    as in the map
+
+==============================================================================
+5. CONFIGURATION                                              *agentmap-config*
+
+>lua
+  require("agentmap").setup({
+    lang = "en",              -- "en" | "ja" (or vim.g.agentmap_lang)
+    root = nil,               -- nil: $AGENTMAP_DIR, then stdpath("data").."/agentflow"
+    claude_config_dir = nil,  -- nil: $CLAUDE_CONFIG_DIR, then ~/.claude
+    python = nil,             -- nil: python3, python, py -3
+    open = "tab",             -- "tab" | "vsplit" | "current"
+    mode = "auto",            -- "box" | "tree" | "auto"
+    keymaps = { global = false },
+    review = { provider = "auto", rubric = nil },
+    export = { html_command = nil, pdf_command = nil },
+  })
+<
+The full list with defaults is in the README.
+
+==============================================================================
+6. WRITING CONVENTION                                     *agentmap-convention*
+
+The map shows why an agent was started and what it reported only when Claude
+writes them in a fixed form; nothing is guessed. The parent's prompt starts
+with three lines:
+>
+  [Goal] what this is for
+  [Why delegate] why it is delegated
+  [Done when] what has to come back
+<
+The child ends with `## Report` (`Done:`, `Approach:`, `Why:`, `Open issues:`)
+or, when it needs a decision, `## Needs confirmation` (`Working on:`,
+`Blocked at:`, `Question:`, `Options:`). Japanese markers (【目的】, ## 報告, ...)
+are always accepted too. The text to paste into CLAUDE.md is in
+`docs/writing-convention.md`.
+
+==============================================================================
+7. HUMAN CHECK                                            *agentmap-human-check*
+
+When Claude asks you a question (AskUserQuestion), a HUMAN CHECK box appears:
+purple [WAITING] until you answer, green [DONE] with the answer, grey
+[UNANSWERED] if the turn ended without one. It is linked to the sub-agent
+whose description is in the question.
+
+==============================================================================
+8. REVIEW                                                     *agentmap-review*
+
+`a` in the map records PASS, RETRY or ESCALATE with a reason. Reviews go to the
+run's records and to `<root>/review_log.jsonl`. A verdict provider can propose
+a verdict; you always decide:
+>lua
+  require("agentmap.review").register("name", {
+    available = function() return true end,        -- optional
+    evaluate = function(ctx, cb) cb({ verdict = "PASS", reason = "..." }) end,
+  })
+<
+==============================================================================
+9. EXPORT                                                     *agentmap-export*
+
+Markdown always works. HTML uses a bundled converter (or
+`export.html_command`). PDF needs `export.pdf_command`, an argument list in
+which %{html}, %{out} and %{title} are replaced, for example:
+>lua
+  export = { pdf_command = { "google-chrome", "--headless=new",
+    "--no-pdf-header-footer", "--print-to-pdf=%{out}", "%{html}" } }
+<
+==============================================================================
+10. RECORDS AND PRIVACY                                      *agentmap-privacy*
+
+Records stay in the record folder on your disk: per event the ids, times,
+tool names and file names, the first 200 characters of prompts, the three
+convention lines, questions and answers, and the child's report (up to 2000
+characters). Full prompts, tool output and file contents are not stored.
+Strings that look like keys or passwords are replaced with `***`.
+
+ vim:tw=78:ts=8:ft=help:norl:

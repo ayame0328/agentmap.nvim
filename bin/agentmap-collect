@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+# ============================================================
+#  agentmap-collect -- recorder called by Claude Code hooks (part of agentmap.nvim)
+#
+#  Usage   : agentmap-collect [--root DIR | --root=DIR]   (hook payload JSON on stdin)
+#  Input   : one hook payload (JSON) on stdin
+#  Output  : one line appended to <root>/projects/<slug>/runs/<session_id>/hooks.jsonl
+#  Root    : --root -> $AGENTMAP_DIR -> $AGENTFLOW_DIR (deprecated) ->
+#            $XDG_DATA_HOME/nvim/agentflow -> ~/.local/share/nvim/agentflow
+#            (the folder name stays "agentflow" so existing records keep working)
+#
+#  Guarantees
+#    - Always exits 0 and never prints anything (must never disturb Claude Code).
+#      Unknown arguments are ignored. Failures go to <root>/collector.log only.
+#    - Keeps only the fields it needs; full prompts and full tool inputs are not stored.
+#      Secrets that look like keys or passwords are redacted.
+#    - Python 3 standard library only; no external commands (speed).
+#    - The writing convention ([Goal] / 【目的】 ...) is parsed with the same rules as
+#      lua/agentmap/brief.lua (parity test: tests/fixtures/convention_cases.jsonl).
+# ============================================================
+import sys
+import os
+import json
+import re
+import datetime
+
+MAX_LINE = 8000          # 1 行の上限（バイト）。超えたら長い項目から削る
+MAX_LINE_BIG = 16000     # 報告（report）や質問（questions）を持つ行だけの上限。中身が長いのが当たり前なので別枠
+HEAD = 200               # 依頼文・最終メッセージの先頭何文字を残すか
+TARGET = 120             # ファイル名・コマンドの上限文字数
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+# 長さの上限（文字数）。lua/agentmap/brief.lua の LIMITS と同じ数にしてある（画面と記録で切り方をそろえる）
+BRIEF = 300              # 【目的】【任せる理由】【期待する結果】の各 1 項目
+ASK_Q = 300              # AskUserQuestion の question（と答えの値 1 つ）
+ASK_LABEL = 60           # option の label（header も同じ長さで切る）
+ASK_DESC = 240           # option の description
+ASK_QUESTIONS = 4        # 1 回の AskUserQuestion の question の数
+ASK_OPTIONS = 6          # 1 問あたりの option の数
+REPORT = 2000            # 子の報告の本文
+REPORT_SHRUNK = 800      # 行が長すぎるときに報告を縮める長さ
+REPORT_TAIL = 65536      # 子の transcript の末尾何バイトから報告を探すか
+# 書き方の決まり（親の指示の 3 行）。日本語と英語の両方を受ける。英語は大文字小文字を無視（ASCII の範囲だけ）
+BRIEF_KEYS = (("purpose", "【目的】", "[Goal]"), ("reason", "【任せる理由】", "[Why delegate]"),
+              ("expected", "【期待する結果】", "[Done when]"))
+BRIEF_EN = {k: re.compile(re.escape(en), re.IGNORECASE | re.ASCII) for k, _ja, en in BRIEF_KEYS}
+# 値の終わり：次の改行・次の「【」・次の英語のマーカー
+BRIEF_STOP = re.compile("\n|【|" + "|".join(re.escape(en) for _k, _ja, en in BRIEF_KEYS), re.IGNORECASE | re.ASCII)
+COMMON = ("session_id", "hook_event_name", "cwd", "transcript_path",
+          "prompt_id", "agent_id", "agent_type")
+
+
+def root_arg(argv):
+    """--root DIR / --root=DIR を読む。無ければ None。知らない引数は無視する"""
+    for i, a in enumerate(argv):
+        if a == "--root" and i + 1 < len(argv) and argv[i + 1]:
+            return argv[i + 1]
+        if a.startswith("--root=") and len(a) > len("--root="):
+            return a[len("--root="):]
+    return None
+
+
+def root_dir(argv=None):
+    """保存先のいちばん上のフォルダ。--root → AGENTMAP_DIR → AGENTFLOW_DIR（旧名）→ XDG → ~/.local/share"""
+    d = root_arg(argv if argv is not None else sys.argv[1:])
+    if d:
+        return os.path.expanduser(d)
+    for env in ("AGENTMAP_DIR", "AGENTFLOW_DIR"):
+        d = os.environ.get(env)
+        if d:
+            return d
+    x = os.environ.get("XDG_DATA_HOME")
+    if x:
+        return os.path.join(x, "nvim", "agentflow")
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "nvim", "agentflow")
+
+
+def slug_of(d):
+    """プロジェクトの名札。Claude 自身のフォルダ名（transcript の親フォルダ名）をそのまま使う"""
+    tp = d.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        s = os.path.basename(os.path.dirname(tp))
+        if s:
+            return s
+    return re.sub(r"[^A-Za-z0-9]", "-", str(d.get("cwd") or "unknown"))
+
+
+def safe_name(s):
+    """フォルダ名に使えない文字を消す（session_id に / などが混ざっても外へ出ない）"""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(s or "unknown"))[:128] or "unknown"
+
+
+SECRET_KV = re.compile(r"(?i)((?:api[_-]?key|access[_-]?key|token|secret|password|passwd|authorization)[\"']?\s*[=:]\s*[\"']?(?:bearer\s+)?|bearer\s+)[^\s\"']+")
+SECRET_TOK = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}|xox[abprs]-[\w-]{10,}|AIza[\w-]{30,})")
+
+
+def redact(s):
+    """鍵やパスワードらしい部分を *** にする（記録に秘密を残さないため）"""
+    if not isinstance(s, str):
+        return s
+    return SECRET_TOK.sub("***", SECRET_KV.sub(lambda m: m.group(1) + "***", s))
+
+
+def head(s, n=HEAD):
+    """先頭 n 文字だけ。改行は空白にする。鍵らしい部分は伏せる"""
+    if not isinstance(s, str):
+        return None
+    return redact(s[:n * 4]).replace("\r", " ").replace("\n", " ")[:n]
+
+
+def clip(s, n):
+    """先頭 n 文字だけ。head() と違って改行は残す（報告は見出しと箇条書きの形が意味を持つため）。鍵らしい部分は伏せる"""
+    if not isinstance(s, str):
+        return None
+    return redact(s[:n * 4])[:n]
+
+
+def parse_brief(text):
+    """依頼文から 3 項目を抜く（brief.lua の parse_brief と同じ規則）。
+    マーカーは 【目的】/[Goal]・【任せる理由】/[Why delegate]・【期待する結果】/[Done when]（英語は大文字小文字を無視）。
+    同じ項目は日本語・英語のうち先に出てきた方。値はマーカーの直後から「次の改行」「次の【」「次の英語のマーカー」まで。
+    前後の空白とマーカー直後のコロンを落とし、300 文字で切る。1 つも無ければ None（そのときは brief のキー自体を付けない）"""
+    if not isinstance(text, str) or not text:
+        return None
+    out = {}
+    for k, ja, _en in BRIEF_KEYS:
+        cands = []
+        i = text.find(ja)
+        if i >= 0:
+            cands.append((i, i + len(ja)))
+        m = BRIEF_EN[k].search(text)
+        if m:
+            cands.append((m.start(), m.end()))
+        if not cands:
+            continue
+        rest = text[min(cands)[1]:]
+        stop = BRIEF_STOP.search(rest)
+        v = (rest[:stop.start()] if stop else rest).strip()
+        # Lua と同じく「：」→「:」の順に 1 つずつ落としてから空白を落とす
+        if v.startswith("："):
+            v = v[1:]
+        if v.startswith(":"):
+            v = v[1:]
+        v = v.strip()
+        if v:
+            out[k] = redact(v)[:BRIEF]
+    return out or None
+
+
+def ask_input(ti):
+    """AskUserQuestion の入力から、question / header / multiSelect / options(label, description) だけ残す。
+    個数と長さは上の定数で切る（質問の中身は画面に出すために残すが、行が際限なく長くならないように）"""
+    qs = ti.get("questions") if isinstance(ti, dict) else None
+    if not isinstance(qs, list):
+        return {}
+    out = []
+    for q in qs[:ASK_QUESTIONS]:
+        if not isinstance(q, dict):
+            continue
+        r = {}
+        if isinstance(q.get("question"), str):
+            r["question"] = clip(q["question"], ASK_Q)
+        if isinstance(q.get("header"), str):
+            r["header"] = clip(q["header"], ASK_LABEL)
+        if q.get("multiSelect") is not None:
+            r["multiSelect"] = bool(q.get("multiSelect"))
+        opts = []
+        for o in (q.get("options") if isinstance(q.get("options"), list) else [])[:ASK_OPTIONS]:
+            if not isinstance(o, dict):
+                continue
+            oo = {}
+            if isinstance(o.get("label"), str):
+                oo["label"] = clip(o["label"], ASK_LABEL)
+            if isinstance(o.get("description"), str):
+                oo["description"] = clip(o["description"], ASK_DESC)
+            opts.append(oo)
+        r["options"] = opts
+        out.append(r)
+    return {"questions": out}
+
+
+def ask_answers(tr):
+    """AskUserQuestion の答え（{質問文: 答え}）。答えは文字列でも配列でもそのまま。値ごとに 300 文字で切る"""
+    a = tr.get("answers") if isinstance(tr, dict) else None
+    if not isinstance(a, dict):
+        return None
+    out = {}
+    for k, v in a.items():
+        key = clip(str(k), ASK_Q)
+        if isinstance(v, list):
+            out[key] = [clip(x, ASK_Q) if isinstance(x, str) else x for x in v]
+        elif isinstance(v, str):
+            out[key] = clip(v, ASK_Q)
+        elif v is not None:
+            out[key] = clip(str(v), ASK_Q)
+    return out
+
+
+def handback_report(path):
+    """子の transcript の末尾から、最後の SubagentHandback の message を取る。無ければ None。
+    SubagentStop の last_assistant_message は handback の後の一言か空なので、報告の本文はここにしか無い。
+    SubagentStop の時点で transcript は最後まで書かれている（2026-10-01 実測 6 件）"""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            off = max(0, size - REPORT_TAIL)
+            f.seek(off)
+            data = f.read()
+    except Exception:
+        return None
+    lines = data.split(b"\n")
+    if off > 0 and lines:
+        lines = lines[1:]  # 途中から始まる 1 行目は捨てる
+    for raw in reversed(lines):
+        if b'"name":"SubagentHandback"' not in raw or b'"type":"assistant"' not in raw:
+            continue
+        try:
+            t = json.loads(raw)
+        except Exception:
+            continue
+        content = ((t.get("message") or {}).get("content")) if isinstance(t, dict) else None
+        for b in reversed(content if isinstance(content, list) else []):
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "SubagentHandback":
+                m = (b.get("input") or {}).get("message")
+                if isinstance(m, str) and m.strip():
+                    return m
+    return None
+
+
+def tail(s, n=TARGET):
+    """長いファイル名は後ろを残して先頭を … にする"""
+    if not isinstance(s, str):
+        return None
+    return s if len(s) <= n else "…" + s[-(n - 1):]
+
+
+def now_iso():
+    t = datetime.datetime.now(datetime.timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (t.microsecond // 1000)
+
+
+def agent_input(ti):
+    """Agent ツールの入力から、残してよい項目だけ取り出す"""
+    if not isinstance(ti, dict):
+        return {}
+    out = {}
+    for k in ("description", "subagent_type", "model", "isolation"):
+        if ti.get(k) is not None:
+            out[k] = ti.get(k)
+    if isinstance(ti.get("prompt"), str):
+        out["prompt_head"] = head(ti["prompt"])
+        b = parse_brief(ti["prompt"])
+        if b:
+            out["brief"] = b
+    return out
+
+
+def read_meta(d):
+    """SubagentStart のとき、Claude 自身が書いた agent-<id>.meta.json を読めたら読む（無くてもよい）"""
+    tp, sid, aid = d.get("transcript_path"), d.get("session_id"), d.get("agent_id")
+    if not (isinstance(tp, str) and sid and aid):
+        return None
+    sub = os.path.join(os.path.dirname(tp), str(sid), "subagents")
+    name = "agent-%s.meta.json" % aid
+    m, wf = None, None
+    try:
+        with open(os.path.join(sub, name), "rb") as f:
+            m = json.loads(f.read(4096))
+    except Exception:
+        m = None
+    if m is None:
+        # Workflow から起動された Agent は subagents/workflows/<wf_id>/ の下に置かれる（1 段だけ見る）
+        wf_root = os.path.join(sub, "workflows")
+        try:
+            names = sorted(os.listdir(wf_root))
+        except Exception:
+            names = []
+        for w in names:
+            p = os.path.join(wf_root, w, name)
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        m = json.loads(f.read(4096))
+                    wf = w
+                except Exception:
+                    m = None
+                break
+    if not isinstance(m, dict):
+        return None
+    out = {}
+    for k in ("toolUseId", "parentAgentId", "model", "description", "spawnDepth", "agentType", "workflowPhase"):
+        if m.get(k) is not None:
+            out[k] = m[k]
+    if wf:
+        out["wf_id"] = wf
+    return out or None
+
+
+def task_notification_head(prompt):
+    """<task-notification> の依頼文は、task-id と status だけ残す"""
+    tid = re.search(r"<task-id>.*?</task-id>", prompt, re.S)
+    st = re.search(r"<status>.*?</status>", prompt, re.S)
+    return head(" ".join(x.group(0) for x in (tid, st) if x))
+
+
+def build(d):
+    """hook の中身から、保存する 1 行（辞書）を作る"""
+    ev = d.get("hook_event_name")
+    rec = {k: d[k] for k in COMMON if d.get(k) is not None}
+    tool = d.get("tool_name")
+
+    if ev == "SessionStart":
+        if d.get("source") is not None:
+            rec["source"] = d["source"]
+    elif ev == "UserPromptSubmit":
+        p = d.get("prompt")
+        if isinstance(p, str):
+            if p.lstrip().startswith("<task-notification>"):
+                rec["kind"] = "task_notification"
+                rec["prompt_head"] = task_notification_head(p)
+            else:
+                rec["prompt_head"] = head(p)
+    elif ev == "PreToolUse":
+        rec["tool_use_id"] = d.get("tool_use_id")
+        rec["tool_name"] = tool
+        if tool == "Agent":
+            rec["tool_input"] = agent_input(d.get("tool_input"))
+        elif tool == "AskUserQuestion":
+            rec["tool_input"] = ask_input(d.get("tool_input"))
+        elif tool == "Workflow" and isinstance(d.get("tool_input"), dict):
+            desc = d["tool_input"].get("description")
+            if desc is not None:
+                rec["tool_input"] = {"description": head(desc) if isinstance(desc, str) else desc}
+    elif ev == "PostToolUse":
+        rec["tool_use_id"] = d.get("tool_use_id")
+        rec["tool_name"] = tool
+        if d.get("duration_ms") is not None:
+            rec["duration_ms"] = d["duration_ms"]
+        ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+        tr = d.get("tool_response")
+        if tool == "Agent":
+            rec["tool_input"] = agent_input(ti)
+            if isinstance(tr, dict):
+                rec["tool_response"] = {k: tr[k] for k in
+                                        ("agentId", "resolvedModel", "status", "isAsync", "description")
+                                        if tr.get(k) is not None}
+        elif tool == "AskUserQuestion":
+            rec["tool_input"] = ask_input(ti)
+            ans = ask_answers(tr)
+            if ans is not None:
+                rec["tool_response"] = {"answers": ans}
+        elif tool == "Workflow":
+            # 台本（script）の中身は保存しない。説明・再開元・起動結果の札だけ
+            rec["tool_input"] = {k: ti[k] for k in ("description", "resumeFromRunId") if ti.get(k) is not None}
+            if isinstance(tr, dict):
+                rec["tool_response"] = {k: tr[k] for k in ("status", "taskId", "runId", "workflowName")
+                                        if tr.get(k) is not None}
+                if isinstance(tr.get("summary"), str):
+                    rec["tool_response"]["summary"] = head(tr["summary"], 120)
+        elif tool in WRITE_TOOLS:
+            rec["target"] = tail(ti.get("file_path") or ti.get("notebook_path"))
+        elif tool == "Bash":
+            c = ti.get("command")
+            if isinstance(c, str):
+                rec["target"] = redact(c.strip().split("\n", 1)[0])[:TARGET]
+        elif tool in ("EnterWorktree", "ExitWorktree"):
+            rec["target"] = json.dumps(ti, ensure_ascii=False, separators=(",", ":"))[:TARGET]
+            if tr is not None:
+                rec["response_head"] = str(tr)[:TARGET]
+    elif ev == "PostToolUseFailure":
+        rec["tool_use_id"] = d.get("tool_use_id")
+        rec["tool_name"] = tool
+        e = d.get("error")
+        if not isinstance(e, str):
+            e = d.get("stderr") if isinstance(d.get("stderr"), str) else (None if e is None else str(e))
+        if e is not None:
+            rec["error_head"] = head(e)
+    elif ev == "SubagentStart":
+        m = read_meta(d)
+        if m:
+            rec["meta"] = m
+    elif ev == "SubagentStop":
+        if d.get("agent_transcript_path") is not None:
+            rec["agent_transcript_path"] = d["agent_transcript_path"]
+        if isinstance(d.get("last_assistant_message"), str):
+            rec["last_head"] = head(d["last_assistant_message"])
+        # 子の報告：handback の message があればそれ、無ければ最後の返答（handback を使わずに終わった子）
+        rep = handback_report(d.get("agent_transcript_path"))
+        if rep is None and isinstance(d.get("last_assistant_message"), str) and d["last_assistant_message"].strip():
+            rep = d["last_assistant_message"]
+        if rep is not None:
+            rec["report"] = clip(rep, REPORT)
+    elif ev == "Stop":
+        if isinstance(d.get("last_assistant_message"), str):
+            rec["last_head"] = head(d["last_assistant_message"])
+    elif ev == "SessionEnd":
+        if d.get("reason") is not None:
+            rec["reason"] = d["reason"]
+
+    rec = {k: v for k, v in rec.items() if v is not None}
+    rec["_v"] = 1
+    rec["_ts"] = now_iso()
+    rec["_src"] = "claude_hook"
+    return rec
+
+
+def encode(rec):
+    """1 行にする。長すぎたら prompt_head → last_head → target → report（800 に縮める → 消す）
+    → 質問の description（消す）→ 2 問目以降の質問（消す）の順に削る。
+    上限は報告か質問を持つ行だけ MAX_LINE_BIG、ほかは MAX_LINE"""
+    def dump():
+        return json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    ti = rec.get("tool_input") if isinstance(rec.get("tool_input"), dict) else {}
+    qs = ti.get("questions") if isinstance(ti.get("questions"), list) else None
+    limit = MAX_LINE_BIG if ("report" in rec or qs is not None) else MAX_LINE
+
+    def drop_key(k):
+        rec.pop(k, None)
+        ti.pop(k, None)
+
+    def shrink_report():
+        if isinstance(rec.get("report"), str):
+            rec["report"] = rec["report"][:REPORT_SHRUNK]
+
+    def drop_desc():
+        for q in qs or []:
+            for o in q.get("options") or []:
+                o.pop("description", None)
+
+    def drop_more_questions():
+        if qs:
+            del qs[1:]
+
+    steps = [lambda: drop_key("prompt_head"), lambda: drop_key("last_head"), lambda: drop_key("target"),
+             shrink_report, lambda: rec.pop("report", None), drop_desc, drop_more_questions]
+    line = dump()
+    for step in steps:
+        if len(line) <= limit:
+            break
+        step()
+        line = dump()
+    return line
+
+
+def append(path, data):
+    """O_APPEND で 1 回の write。複数の hook が同時に書いても行が混ざらない"""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, data + b"\n")
+    finally:
+        os.close(fd)
+
+
+def write_project(pdir, d, slug):
+    """project.json（どのフォルダの記録か）を書き換える。途中で切れないよう tmp → rename"""
+    p = os.path.join(pdir, "project.json")
+    tmp = p + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"cwd": d.get("cwd"), "slug": slug, "updated_at": now_iso()}, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def main():
+    root = None
+    ev = None
+    try:
+        root = root_dir()
+        raw = sys.stdin.buffer.read(4 * 1024 * 1024)
+        if not raw.strip():
+            return
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            return
+        ev = d.get("hook_event_name")
+        slug = safe_name(slug_of(d))
+        pdir = os.path.join(root, "projects", slug)
+        run = os.path.join(pdir, "runs", safe_name(d.get("session_id")))
+        os.makedirs(run, exist_ok=True)
+        if ev == "SessionStart" or not os.path.exists(os.path.join(pdir, "project.json")):
+            write_project(pdir, d, slug)
+        append(os.path.join(run, "hooks.jsonl"), encode(build(d)))
+    except Exception as e:  # 失敗は自分用の記録にだけ残す
+        try:
+            if root:
+                os.makedirs(root, exist_ok=True)
+                line = json.dumps({"ts": now_iso(), "error": (type(e).__name__ + ": " + str(e))[:300], "event": ev},
+                                  ensure_ascii=False).encode("utf-8")
+                append(os.path.join(root, "collector.log"), line)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        pass
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(0)

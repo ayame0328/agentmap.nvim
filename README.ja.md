@@ -73,6 +73,7 @@ snacks.nvim・telescope・fzf-lua・mini.pick のどれかをそのために設�
 ```lua
 {
   "ayame0328/agentmap.nvim",
+  lazy = false,                   -- 起動時に読み込む（下の説明を参照）
   opts = { lang = "ja" },         -- 画面を日本語にする
   keys = {
     { "<leader>aa", "<Cmd>AgentMap<CR>",       desc = "AgentMap: 図を開く" },
@@ -82,7 +83,9 @@ snacks.nvim・telescope・fzf-lua・mini.pick のどれかをそのために設�
 }
 ```
 
-`setup()` は呼ばなくても、コマンドはそのまま使えます。
+`setup()` は呼ばなくても、コマンドはそのまま使えます。`lazy = false` は消さないでください。
+`keys` だけだと lazy.nvim はそのキーを押すまでプラグインを読み込まず、それまで
+`:AgentMapInstallHooks` も `:checkhealth agentmap` も存在しません。起動時に読み込んでも、読むのは小さなファイル 1 つで、体感できる差はありません。
 
 そのあと 1 回だけ、次を行います。
 
@@ -102,10 +105,12 @@ hooks を入れる前のセッションも、Claude Code が残している会�
 ```sh
 cd ~/.local/share/nvim/lazy/agentmap.nvim      # プラグインが入っている場所
 python3 demo/replay.py --root /tmp/agentmap-demo --claude-dir /tmp/agentmap-demo-claude &
-AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
+sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 ```
 
 上の動画と同じ作り物のセッション（約 30 秒）を、本物の記録係を通して再生します。
+`sleep 1` は最初の記録が書かれるのを待つためです。無いと `:AgentMap` が記録より先に動いて
+「記録された run がありません」と出ることがあります（その場合は `:AgentMap` をもう一度実行すれば開きます）。
 
 ## 使い方
 

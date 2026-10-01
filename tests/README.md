@@ -16,7 +16,7 @@ Exit code is `0` when every test passes (skipped tests do not count as failures)
 The last line looks like:
 
 ```
-Total: PASS 29 / FAIL 0 / SKIP 0 (17 s)
+Total: PASS 32 / FAIL 0 / SKIP 0 (18 s)
 ```
 
 A full run takes about 20 seconds.

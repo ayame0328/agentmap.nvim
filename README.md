@@ -77,6 +77,7 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
 ```lua
 {
   "ayame0328/agentmap.nvim",
+  lazy = false,                   -- load at startup (see below)
   opts = {},                      -- lang = "ja" for Japanese
   keys = {
     { "<leader>aa", "<Cmd>AgentMap<CR>",       desc = "AgentMap: open map" },
@@ -86,7 +87,10 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
 }
 ```
 
-`setup()` is optional; the commands work without it.
+`setup()` is optional; the commands work without it. Keep `lazy = false`: with `keys` alone,
+lazy.nvim loads the plugin only when one of those keys is pressed, and until then
+`:AgentMapInstallHooks` and `:checkhealth agentmap` do not exist. Loading it costs nothing
+noticeable (one small file).
 
 Then, once:
 
@@ -107,11 +111,12 @@ with `:AgentMapRuns` or `:AgentMapImport`.
 ```sh
 cd ~/.local/share/nvim/lazy/agentmap.nvim      # or wherever the plugin is
 python3 demo/replay.py --root /tmp/agentmap-demo --claude-dir /tmp/agentmap-demo-claude &
-AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
+sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 ```
 
 The script plays the session from the demo above (about 30 seconds of made-up events)
-through the real recorder.
+through the real recorder. The `sleep 1` gives it time to write the first record; without it
+`:AgentMap` can run before anything exists and say "No recorded runs" (then just run `:AgentMap` again).
 
 ## Usage
 

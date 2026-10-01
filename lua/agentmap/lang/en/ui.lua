@@ -20,7 +20,7 @@ return {
   ["keymaps.help_close"] = "  q / Esc closes this window",
   ["keymaps.key_1_9"] = "1-9",
   ["keymaps.help_index"] = "Open details of agent number n",
-  ["keymaps.help_enter"] = "Details of the agent under the cursor (gate: review history, HUMAN CHECK: the question)",
+  ["keymaps.help_enter"] = "Details of the box under the cursor (review box: its history, HUMAN CHECK: the question)",
   ["keymaps.help_move"] = "Move to next / previous box (instead of number keys)",
   ["keymaps.help_fold"] = "Expand / collapse children",
   ["keymaps.help_transcript"] = "transcript (conversation log)",

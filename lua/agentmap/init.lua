@@ -153,7 +153,17 @@ local function check_new_flow(ui)
   local nf = st.latest_flow_id(ui.run.state)
   if not nf or nf == ui.flow_id then return end
   local f = st.flow_of(ui.run.state, nf)
-  local cur = ui.flow_id and st.flow_of(ui.run.state, ui.flow_id)
+  if not ui.flow_id then
+    -- 図を開いたとき Agent を持つ流れがまだ無く、セッション全体を見せていた（指示の直後に開いたとき）。
+    -- 最初の流れは「新しい流れ」ではないので、知らせずにそのまま採用する
+    ui.set_flow(nf)
+    local util = try("agentmap.util")
+    shown = shown or {}
+    shown.flow_id = nf
+    shown.t = util and util.parse_iso(f and f.started_at) or shown.t
+    return
+  end
+  local cur = st.flow_of(ui.run.state, ui.flow_id)
   -- 今見せている流れより前に始まったものなら何もしない
   if cur and f and (f.n or 0) < (cur.n or 0) then return end
   if follow_latest and shown_busy(ui) then

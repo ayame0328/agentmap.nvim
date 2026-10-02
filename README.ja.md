@@ -59,7 +59,7 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <保存先>/pr
 |---|---|
 | Neovim | 0.10 以上 |
 | Python | 3（標準部品だけ）。`python3` → `python` → `py -3` の順に探します |
-| Claude Code | 2.1.283 〜 2.1.286 で確かめました（[対応している版](#対応している版)） |
+| Claude Code | 2.1.283 〜 2.1.286 で確かめました（下の「対応している版」を参照） |
 | OS | Linux・macOS・WSL。Windows で直接動かす Neovim は**試験的な対応**です |
 
 なくても動くもの：`git`（差分の画面に使う）、[oil.nvim](https://github.com/stevearc/oil.nvim)（`w` キーでエージェントの作業フォルダを開く）、
@@ -96,7 +96,7 @@ snacks.nvim・telescope・fzf-lua・mini.pick のどれかをそのために設�
 2. `:checkhealth agentmap` を実行します。Neovim・Python・記録係・Claude Code のフォルダ・hooks・記録の保存先・
    なくても動く道具を順に確かめて、結果を出します。
 3. Claude Code を新しく起動します。そのセッションから記録されます。
-4. [書き方の決まり](#書き方の決まり)を `CLAUDE.md` に貼ります（おすすめ）。
+4. 下の「書き方の決まり」の文を `CLAUDE.md` に貼ります（おすすめ）。
 
 hooks を入れる前のセッションも、Claude Code が残している会話の記録から `:AgentMapRuns` または `:AgentMapImport` で取り込めます。
 

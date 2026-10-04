@@ -395,8 +395,9 @@ What to know:
   that is why the main agent gets it through its terminal.
 - No Claude terminal (for example Claude Code runs in another terminal window): the text is
   delivered through the hooks at the main agent's next tool call (`steer.no_terminal = "hook"`),
-  copied to the clipboard (`"clipboard"`), or not sent (`"none"`). With several Claude terminals,
-  the one in the run's folder is used; otherwise you pick one, once per run.
+  copied to the clipboard (`"clipboard"`), or not sent (`"none"`). The Claude terminal in the run's
+  folder (or a parent folder) is used; if there are several, or only ones in other folders, you
+  pick one, once per run.
   Glance at the terminal after sending: agentmap.nvim cannot see whether Claude Code is waiting at
   a different prompt (for example the folder trust question).
 - The box shows ` ✎1` (purple) while an instruction waits, ` ✎` (green) for a minute after it was

@@ -473,6 +473,42 @@ do
   eq(s.steers[A .. "-9"].owner_id, nil, "flow_view does not change the original")
 end
 
+-- ---------- 12) 終わりで止めて届けた（block）：その終わりは取り消す ----------
+print("[12] steer at stop (block) reopens")
+do
+  local P1 = "p2100000-0000-4000-8000-000000000001"
+  local C = "afeed120000000001"
+  local function H(ev, ts, f)
+    local r = { session_id = "r12", hook_event_name = ev, prompt_id = P1, _ts = "2026-10-04T11:" .. ts .. ".000Z" }
+    for k, v in pairs(f or {}) do r[k] = v end
+    return r
+  end
+  local s = state.new("r12")
+  local function feed(rec) for _, e in ipairs(claude.normalize_hook(rec)) do state.apply(s, e) end end
+  feed(H("UserPromptSubmit", "00:00", { prompt_head = "go" }))
+  feed(H("PreToolUse", "00:01", { tool_name = "Agent", tool_use_id = "tC", tool_input = { description = "child" } }))
+  feed(H("SubagentStart", "00:02", { agent_id = C, agent_type = "general-purpose" }))
+  -- 1 回目の SubagentStop（記録）→ 同じ hook の配達の行（block）
+  feed(H("SubagentStop", "00:10", { agent_id = C, last_head = "first end" }))
+  eq(s.agents[C].status, "DONE", "first SubagentStop → DONE")
+  feed(H("SubagentStop", "00:10", { agent_id = C, steer = { ids = { C .. "-1" }, mode = "block", target = C } }))
+  eq(s.agents[C].status, "RUNNING", "blocked stop → back to RUNNING")
+  eq(s.agents[C].finished_at, nil, "… finished_at cleared")
+  feed(H("PostToolUse", "00:15", { agent_id = C, tool_name = "Write", tool_use_id = "tw", target = "c.txt" }))
+  eq(#s.agents[C].attempts, 1, "work after the blocked stop is not a rework")
+  feed(H("SubagentStop", "00:20", { agent_id = C, last_head = "real end" }))
+  eq(s.agents[C].status, "DONE", "second SubagentStop → DONE")
+  eq(s.agents[C].finished_at, "2026-10-04T11:00:20.000Z", "finished_at = the real end")
+  eq(s.agents[C].last_head, "real end", "last_head = the real end")
+  -- ROOT の Stop を止めた：その流れは終わっていない
+  feed(H("Stop", "00:30", { last_head = "root first" }))
+  eq(state.flow_of(s, P1).ended_at, "2026-10-04T11:00:30.000Z", "Stop → flow ended")
+  feed(H("Stop", "00:30", { steer = { ids = { "ROOT-1" }, mode = "block", target = "ROOT" } }))
+  eq(state.flow_of(s, P1).ended_at, nil, "blocked Stop → flow not ended")
+  feed(H("Stop", "00:40", { last_head = "root end" }))
+  eq(state.flow_of(s, P1).ended_at, "2026-10-04T11:00:40.000Z", "second Stop → flow ended")
+end
+
 vim.fn.delete(TMP, "rf")
 print(string.format("%d passed, %d failed", passes, fails))
 print(fails == 0 and "PASS test_reducer.lua" or "FAIL test_reducer.lua")

@@ -985,6 +985,24 @@ function H.steer_delivered(s, ev)
     st.tool_use_id = ev.tool_use_id
     st.mode = ev.mode
     st.ended_at, st.end_reason = nil, nil
+    -- 終わりで止めて届けた（SubagentStop / Stop の block）：その終わりは本当の終わりではない。
+    --   収集係は終わりの記録 → 配達の記録の順に書くので、直前に付けた「完了」を戻す（宛先は続けて働き、
+    --   本当の終わりはもう一度来る）。戻さないと、働いている間ずっと DONE・100% に見え、
+    --   s がやり直し（親の端末）に回り、2 回目の終わりの時刻と最後の返事が捨てられる
+    if ev.mode == "block" then
+      if st.agent_id == "ROOT" or st.agent_id == nil then
+        local f = ev.prompt_id and flow_of(s, resolve_pid(s, ev.prompt_id))
+        if f and f.ended_at then f.ended_at = nil end
+      else
+        local a = s.agents[st.agent_id]
+        local cur = a and cur_attempt(a)
+        if a and a.status == "DONE" and cur and cur.finished_at then
+          a.status = "RUNNING"
+          a.finished_at = nil
+          cur.finished_at = nil
+        end
+      end
+    end
   else
     fill(st, "delivered_at", ev.ts)
     fill(st, "delivered_via", ev.via)

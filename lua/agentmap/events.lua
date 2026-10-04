@@ -451,14 +451,30 @@ local function is_pending_name(name)
   return name:match("^[%w_%-]+%-%d+%.json$") ~= nil
 end
 
+-- 秒。これより古い未配達ファイルは、もう届かないものとして消す（開かれない run に残ると印が消えず、
+-- 全セッションの道具の呼び出しごとに Python が起動し続けるため）。道具を使う宛先なら数秒で届くので十分に長い。
+-- 消した指示は、その run を開いたときに sweep_steers が EXPIRED にする
+local STEER_STALE = 6 * 3600
+M.STEER_STALE = STEER_STALE
+
 --- どの run にも未配達ファイルが無ければ <root>/steer.pending を消す。消したら true
-local function sweep_flag(run)
+local function sweep_flag(run, now)
   local p = flag_path(run)
   if not uv.fs_stat(p) then return false end
   local root = root_of(run)
+  now = now or os.time()
+  local live = false
   for _, f in ipairs(vim.fn.glob(root .. "/projects/*/runs/*/steer/*.json", false, true)) do
-    if is_pending_name(util.basename(f)) then return false end
+    if is_pending_name(util.basename(f)) then
+      local st = uv.fs_stat(f)
+      if st and now - st.mtime.sec > STEER_STALE then
+        os.remove(f)
+      else
+        live = true
+      end
+    end
   end
+  if live then return false end
   os.remove(p)
   return true
 end

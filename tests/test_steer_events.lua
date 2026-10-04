@@ -144,6 +144,12 @@ t.ok(vim.uv.fs_stat(FLAG) ~= nil, "a pending file in another run keeps the flag"
 os.remove(other .. "/ROOT-1790000000000.json")
 vim.fn.writefile({ "{}" }, other .. "/ROOT-1790000000000.delivered.json")
 t.eq(events._sweep_flag(run), true, "only .delivered.json left → flag removed")
+-- 開かれない run に古い未配達が取り残された：一定時間を過ぎたら消して印も消す（Python が起動し続けない）
+vim.fn.writefile({}, FLAG)
+vim.fn.writefile({ "{}" }, other .. "/ROOT-1790000000001.json")
+t.eq(events._sweep_flag(run), false, "a fresh pending file in another run keeps the flag")
+t.eq(events._sweep_flag(run, os.time() + events.STEER_STALE + 60), true, "a stale pending file no longer keeps the flag")
+t.eq(vim.uv.fs_stat(other .. "/ROOT-1790000000001.json"), nil, "… and the stale file is removed")
 -- 開いた直後の 1 回：取り残された印を消す
 vim.fn.writefile({}, FLAG)
 local fresh = events.load(run_dir)

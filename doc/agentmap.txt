@@ -271,9 +271,11 @@ instruction, send with <C-s>, `:w` or <CR> in normal mode, cancel with `q`.
                        finish first (`steer.at_stop`). The model sees
                        `PreToolUse:<Tool> hook error: [AgentMap] ...`.
   Main agent (ROOT)    typed into the |terminal| running `claude` in this
-                       Neovim as `[AgentMap] <text>` and Enter. Without such
-                       a terminal: `steer.no_terminal` ("hook", "clipboard"
-                       or "none").
+                       Neovim as `[AgentMap] <text>` and Enter. The one in
+                       the run's folder (or a parent) is used; with several,
+                       or only ones in other folders, you pick one. Without
+                       such a terminal: `steer.no_terminal` ("hook",
+                       "clipboard" or "none").
   Finished agent       a redo request is typed into the main agent's
                        terminal; nothing is marked as rework automatically.
 

@@ -74,12 +74,15 @@ function M.candidates(cwd, bufs)
   return out
 end
 
---- The one terminal to send to: the only candidate, or the single best score.
---- When the best score is shared, returns nil and the candidates (the caller lets the user pick).
+--- The one terminal to send to: the single best score, when it is the run's folder (3) or a parent of it (2).
+--- When the best score is shared, or the best is only "another folder" (1: most likely the Claude of a
+--- different project), returns nil and the candidates (the caller lets the user pick, or falls back).
 ---@return table|nil cand, table[] candidates, boolean tied
 function M.find(cwd, bufs)
   local list = M.candidates(cwd, bufs)
   if #list == 0 then return nil, list, false end
+  -- 別のフォルダの Claude には黙って送らない（別プロジェクトの Claude に指示が入るのを防ぐ）
+  if list[1].score < 2 then return nil, list, true end
   if #list == 1 or list[1].score > list[2].score then return list[1], list, false end
   return nil, list, true
 end

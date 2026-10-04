@@ -23,6 +23,21 @@ t.run("should_tick", function()
   s.agents.a2.status = "DONE"
   s.agents.ROOT.status = "RUNNING"
   t.eq(ui.should_tick(s), true, "ROOT が RUNNING なら動く")
+  s.flows = { { id = "p1", status = "DONE", ended_at = "2026-10-04T10:00:00Z" } }
+  t.eq(ui.should_tick(s), false, "ROOT が RUNNING でも、指示の番が全部終わっていれば動かない（待っているだけ）")
+  s.flows[2] = { id = "p2", status = "RUNNING" }
+  t.eq(ui.should_tick(s), true, "動いている番があれば動く")
+  s.flows = nil
+  s.flow = { id = "p1", ended_at = "2026-10-04T10:00:00Z" }
+  t.eq(ui.should_tick(s), false, "終わった流れを見ているときは動かない")
+  s.flow = { id = "p2" }
+  t.eq(ui.should_tick(s), true, "動いている流れを見ているときは動く")
+  s.flow = { id = "p1", ended_at = "2026-10-04T10:00:00Z" }
+  s.steers = { ["ROOT-1"] = { id = "ROOT-1", status = "PENDING" } }
+  t.eq(ui.should_tick(s), true, "未配達の修正指示があれば動く（期限切れにする sweep のため）")
+  s.steers["ROOT-1"].status = "EXPIRED"
+  t.eq(ui.should_tick(s), false, "期限切れになったら止まる")
+  s.flow, s.steers = nil, nil
   s.agents.ROOT.status = "PENDING"
   t.eq(ui.should_tick(s), false, "ROOT の PENDING は数えない")
   s.checks = { ["check:q"] = { id = "check:q", status = "WAITING" } }

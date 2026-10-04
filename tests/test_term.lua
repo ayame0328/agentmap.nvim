@@ -79,6 +79,8 @@ t.run("candidates / find", function()
   t.eq({ c and c.buf, tied }, { b_work, false }, "find は一番よいもの")
   local c2, l2, tied2 = term.find(tmp .. "/elsewhere")
   t.eq({ c2, #l2, tied2 }, { nil, 2, true }, "同点なら選ばせる（nil と候補）")
+  local c3, l3, tied3 = term.find(tmp .. "/elsewhere", { b_other })
+  t.eq({ c3, #l3, tied3 }, { nil, 1, true }, "別のフォルダの端末 1 つだけなら黙って送らない（選ばせる）")
   t.eq(#term.candidates(work, { b_helper }), 0, "引数のバッファだけを見る")
 end)
 

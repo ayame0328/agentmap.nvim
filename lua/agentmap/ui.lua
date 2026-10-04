@@ -176,14 +176,27 @@ end
 local MOVING = { RUNNING = true, PENDING = true, REVIEW = true }
 
 --- True when something on screen changes by itself every second: an agent that is RUNNING,
---- PENDING or REVIEW (ROOT only when RUNNING), or a HUMAN CHECK that waits for an answer.
+--- PENDING or REVIEW (ROOT only while a turn (flow) runs), a HUMAN CHECK that waits for an answer,
+--- or a steering instruction that waits for delivery.
 ---@param s table|nil state (usually display_state())
 function M.should_tick(s)
   if type(s) ~= "table" then return false end
+  -- ROOT はセッションが開いている間ずっと RUNNING なので、指示の番（流れ）が動いているときだけ数える
+  -- （DESIGN-v0.2 §2.7。数えないと、待っているだけのセッションや終わった流れを見ている間も毎秒描き直す）
+  local function root_turn_running()
+    if type(s.flow) == "table" then return s.flow.ended_at == nil end
+    if type(s.flows) == "table" and #s.flows > 0 then
+      for _, f in ipairs(s.flows) do
+        if f.status == "RUNNING" or (f.status == nil and not f.ended_at) then return true end
+      end
+      return false
+    end
+    return true -- 流れの記録が無い（古い記録）：今までどおり
+  end
   for id, a in pairs(s.agents or {}) do
     if type(a) == "table" then
       if id == "ROOT" then
-        if a.status == "RUNNING" then return true end
+        if a.status == "RUNNING" and root_turn_running() then return true end
       elseif MOVING[a.status] then
         return true
       end
@@ -191,6 +204,10 @@ function M.should_tick(s)
   end
   for _, c in pairs(type(s.checks) == "table" and s.checks or {}) do
     if type(c) == "table" and c.status == "WAITING" then return true end
+  end
+  -- 未配達の修正指示：宛先が終わってから数秒後に期限切れにするのは tick の sweep なので、それまで回す
+  for _, st in pairs(type(s.steers) == "table" and s.steers or {}) do
+    if type(st) == "table" and st.status == "PENDING" then return true end
   end
   return false
 end

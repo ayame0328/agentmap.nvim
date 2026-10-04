@@ -121,7 +121,8 @@ local function elapsed_since(iso, now)
 end
 
 --- Progress of agent `id` (DESIGN-v0.2 §2.3; appendix D: boxes without a step list are
---- estimated from elapsed time when config.progress.no_steps == "time").
+--- estimated from elapsed time when config.progress.no_steps == "time"). A parent without a step
+--- list shows the plain average of its children: finished = 100, not yet started (PENDING) = 0.
 ---@param state table
 ---@param id string
 ---@param opts? { now?: number, stats?: table, config?: table, flow_id?: string }
@@ -200,9 +201,15 @@ function M.compute(state, id, opts)
     local sum, n, est = 0, 0, false
     for _, c in ipairs(kids) do
       local cr = M.compute(state, c, sub)
+      local ca = state.agents[c]
       -- 失敗した子は「その子の値」、事実が無ければ 100（その子の分はもう進まない）
-      if not cr and state.agents[c] and state.agents[c].status == "FAILED" then
+      if not cr and ca and ca.status == "FAILED" then
         cr = { pct = 100.0, estimated = false }
+      end
+      -- まだ始まっていない子（PENDING。起動待ちの仮の箱も）は除かず 0 として平均に入れる
+      -- （2026-10-04 本人の決定：子が増える予定が見えているのに進み過ぎに見せない）
+      if not cr and ca and (ca.status or "PENDING") == "PENDING" then
+        cr = { pct = 0.0, estimated = false }
       end
       if cr then
         sum = sum + cr.pct

@@ -202,8 +202,20 @@ local gid = events.request_steer(run2, GC, "use docs/v3")
 sys({ event = "steer_delivered", steer_id = gid, agent_id = GC, via = "PreToolUse:Write" })
 t.eq(events.sweep_steers(run2), false, "events itself creates no notice (the UI does)")
 t.eq(#run2.state.steer_order, 1, "… only the instruction")
+-- 同じ run を開いているもう 1 つの Neovim（知らせが作られる前の状態のまま）
+local stale = events.load(run2_dir)
+t.eq(stale.state.steers[gid].status, "DELIVERED", "the other Neovim sees the delivered instruction")
 local nid = events.request_steer(run2, PA, "The user sent this instruction directly to your sub-agent [2] \"grandchild\": use docs/v3.",
   { kind = "notice", notice_of = gid })
+-- 二重防止（本人の指定 2026-10-04）：同じ指示の 2 つ目の知らせは、記録を読み直して断る
+t.eq(select(2, events.request_steer(run2, PA, "again", { kind = "notice", notice_of = gid })), "duplicate",
+  "a second notice for the same instruction is refused")
+t.eq(stale.state.steers[gid].notice_id, nil, "the other Neovim has not read the notice yet")
+t.eq(select(2, events.request_steer(stale, PA, "again", { kind = "notice", notice_of = gid })), "duplicate",
+  "… it catches up with the records before writing and refuses as well")
+t.eq(stale.state.steers[gid].notice_id, nid, "… and now knows the notice")
+t.eq(#vim.fn.glob(run2_dir .. "/steer/" .. PA .. "-*.json", false, true), 1, "exactly one pending notice file")
+t.ok(events.request_steer(run2, PA, "a plain instruction is not a duplicate") ~= nil, "ordinary instructions are not affected")
 local nreq
 for _, e in ipairs(util.json_lines(run2_dir .. "/events.jsonl", 0)) do
   if e.event == "steer_requested" and e.steer_id == nid then nreq = e end

@@ -1064,7 +1064,7 @@ end
 -- ------------------------------------------------------------
 local STEER_DEFAULTS = {
   enabled = true, mode = "deny", at_stop = true, root_via = "terminal", no_terminal = "hook",
-  submit_delay_ms = 0, input = "window", text_max = 4000,
+  submit_delay_ms = 300, input = "window", text_max = 4000,
 }
 local STEER_PREFIX = "[AgentMap] " -- 端末へ送る文の先頭（固定。state が「流れの続き」の判定に使う）
 local FINISHED = { DONE = true, REWORK = true, FAILED = true }
@@ -1169,6 +1169,26 @@ local function events_mod()
   return ev
 end
 
+--- True when the hooks registered in Claude Code's settings.json are the current ones. An
+--- instruction that goes through hooks (a running sub-agent, or ROOT with `steer.root_via = "hook"`)
+--- reaches the agent only then: the v0.1.0 registration has no delivery hook, so the file would
+--- wait unread. The terminal route does not depend on the hooks and is not checked.
+--- True as well when the check itself is not possible (hooks module missing).
+function M.steer_hooks_ok()
+  local hooks = try_require("agentmap.hooks")
+  if not hooks or type(hooks.status) ~= "function" then return true end
+  local ok, st = pcall(hooks.status)
+  if not ok then return true end
+  return st == "installed"
+end
+
+--- True when the run on screen has ended (SessionEnd recorded). Its Claude is gone; a terminal
+--- found by folder would belong to another conversation, so nothing is sent to it.
+local function run_ended()
+  local s = M.run and M.run.state
+  return type(s) == "table" and s.ended_at ~= nil
+end
+
 local function request(ev, agent_id, text, opts)
   local ok, id, err = pcall(ev.request_steer, M.run, agent_id, text, opts)
   if not ok then return nil, id end
@@ -1183,6 +1203,10 @@ end
 local function no_terminal(ev, cfg, agent_id, hook_text, line, opts)
   local how = cfg.no_terminal or "hook"
   if how == "hook" then
+    if not M.steer_hooks_ok() then
+      notify(t("ui.steer_hooks_outdated"), vim.log.levels.WARN)
+      return "outdated"
+    end
     local id = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "hook" }))
     notify(t("ui.steer_no_terminal_hook"))
     after_steer()
@@ -1208,7 +1232,9 @@ local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick)
   local s = M.run and M.run.state or {}
   local cwd = s.cwd or vim.fn.getcwd()
   local function send_to(cand)
-    local id = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
+    local id, err = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
+    -- 同じ指示の知らせが（別の Neovim で）もう作られていた：端末にも打たない
+    if not id and err == "duplicate" then return cb(nil) end
     local ok = term.send(cand.job, line, { delay_ms = cfg.submit_delay_ms })
     if ok then
       if id and ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, id) end
@@ -1249,7 +1275,9 @@ end
 --- (running agent: hooks; ROOT: terminal; finished agent: ask ROOT in the terminal to redo it).
 ---@param id string agent id (gate: ids are accepted)
 ---@param text string
----@param cb? fun(result: string|nil) "queued" | "sent" | "fallback_hook" | "clipboard" | "none" | "empty" | nil
+---@param cb? fun(result: string|nil) "queued" | "sent" | "fallback_hook" | "clipboard" | "none" | "empty"
+---   | "outdated" (hooks route, but the registered hooks are outdated: nothing sent)
+---   | "ended" (terminal route, but the run has ended: nothing sent) | nil
 ---@return string|nil result (nil while waiting for the user to pick a terminal)
 function M.steer_send(id, text, cb)
   local result
@@ -1283,6 +1311,18 @@ function M.steer_send(id, text, cb)
   local s = M.run.state
   local prompt_id = M.flow_id or (s and state_mod.latest_flow_id(s)) or nil
   local kind = M.steer_kind(aid)
+  -- hooks で届ける経路：登録が古ければ届かないので、送らずに知らせる（端末へ送る経路は関係ない）
+  if kind == "hook" or (kind == "root" and cfg.root_via == "hook") then
+    if not M.steer_hooks_ok() then
+      notify(t("ui.steer_hooks_outdated"), vim.log.levels.WARN)
+      return done("outdated")
+    end
+  end
+  -- 端末へ送る経路：実行が終わっていれば、同じフォルダの別の会話の端末に送ることになるので止める
+  if (kind == "root" or kind == "redo") and run_ended() then
+    notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
+    return done("ended")
+  end
   if kind == "hook" then
     local sid = request(ev, aid, text, { via = "hook", kind = "steer", prompt_id = prompt_id })
     if not sid then
@@ -1416,6 +1456,11 @@ function M.steer_menu(id)
     return
   end
   local kind = M.steer_kind(aid)
+  -- 終わった実行の ROOT・やり直し：端末へは送らない（別の会話の端末に入る）。書かせる前に止める
+  if (kind == "root" or kind == "redo") and run_ended() then
+    notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
+    return
+  end
   local first = kind == "redo" and t("ui.steer_redo")
     or (kind == "root" and cfg.root_via ~= "hook") and t("ui.steer_terminal")
     or t("ui.steer_write")
@@ -1519,6 +1564,14 @@ end
 --- (DESIGN-v0.2-steer.md appendix E): once per instruction, only for deliveries seen while the
 --- map was open, not when the parent has finished. A parent that is ROOT gets it like any ROOT
 --- instruction (terminal, else hooks); a parent that is a sub-agent gets it through hooks.
+---
+--- "Once" is checked in three places, so two Neovims showing the same run still make one notice:
+---   1. this Neovim's memory (notice_done): instructions it already handled or decided to skip;
+---   2. the state, after catching up with the records (events.poll): an instruction whose
+---      `notice_id` is set, or a notice whose `notice_of` names it, was already told, by whoever
+---      wrote that record;
+---   3. events.request_steer itself, which catches up once more right before writing and refuses
+---      a notice for an instruction that already has one ("duplicate").
 ---@return integer number of notices created
 function M.notify_parents()
   local s = M.run and M.run.state
@@ -1533,8 +1586,13 @@ function M.notify_parents()
     M._seed_expired()
     return 0
   end
-  -- 既に知らせがある指示（記録に notice_of が残っていれば、それも見る）
-  for _, st in pairs(s.steers) do
+  -- 記録に追いつく：別の Neovim が同じ run を開いて先に知らせを作っていれば、ここで state に入る
+  if ev.poll then pcall(ev.poll, M.run) end
+  s = M.run.state
+  if type(s.steers) ~= "table" then return 0 end
+  -- 既に知らせがある指示（state の notice_id、または記録に残った知らせの notice_of）
+  for k, st in pairs(s.steers) do
+    if st.notice_id then done[k] = true end
     if st.kind == "notice" and st.notice_of then done[st.notice_of] = true end
   end
   local n = 0
@@ -1550,16 +1608,19 @@ function M.notify_parents()
         and parent ~= "UNKNOWN_PARENT" and parent:sub(1, 3) ~= "wf:" then
         local text = M.notice_text(child, st.text)
         local opts = { kind = "notice", notice_of = k, prompt_id = st.prompt_id }
+        local made
         if parent == "ROOT" then
           if cfg.root_via == "hook" then
-            request(ev, "ROOT", text, vim.tbl_extend("force", opts, { via = "hook" }))
+            made = request(ev, "ROOT", text, vim.tbl_extend("force", opts, { via = "hook" })) ~= nil
           else
-            via_terminal(ev, cfg, "ROOT", text, opts, function() end, true)
+            -- 端末が無いときの落とし先（hooks）も request を通るので、二重なら作られない
+            local SENT = { sent = true, fallback_hook = true, clipboard = true }
+            via_terminal(ev, cfg, "ROOT", text, opts, function(r) made = SENT[r] == true end, true)
           end
         else
-          request(ev, parent, text, vim.tbl_extend("force", opts, { via = "hook" }))
+          made = request(ev, parent, text, vim.tbl_extend("force", opts, { via = "hook" })) ~= nil
         end
-        n = n + 1
+        if made then n = n + 1 end
       end
     end
   end

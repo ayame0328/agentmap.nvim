@@ -5,7 +5,7 @@
 local M = {}
 
 --- Claude Code version the hook payloads were last verified with.
-M.VERIFIED_CLAUDE_CODE = "2.1.288"
+M.VERIFIED_CLAUDE_CODE = "2.1.289"
 
 local function t(key, vars)
   return require("agentmap.i18n").t(key, vars)

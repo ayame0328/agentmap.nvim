@@ -36,7 +36,7 @@ changes what Claude Code does, except to deliver a steering instruction you
 wrote (|agentmap-steer|).
 
 Requirements: Neovim 0.10+, Python 3, Claude Code (verified with 2.1.283 to
-2.1.288). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
+2.1.289). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
 Windows-native Neovim is experimental.
 
 ==============================================================================
@@ -150,7 +150,7 @@ Detail, transcript and diff views:
       at_stop = true,         -- also deliver when the agent tries to finish
       root_via = "terminal",  -- "terminal" | "hook"
       no_terminal = "hook",   -- "hook" | "clipboard" | "none"
-      submit_delay_ms = 0,
+      submit_delay_ms = 300,   -- Enter this many ms after the text (0: one write)
       input = "window",       -- "window" | "line"
       text_max = 4000,
     },
@@ -240,8 +240,10 @@ agent type and model; 10 minutes without history). A parent's running step
 uses the average of its running children. Values are rounded down and stay
 below 100 until the agent finishes. Boxes without a step list are estimated
 from elapsed time only (at most 95.0); `progress.no_steps = "none"` shows no
-number for them. The map is redrawn once a second while something runs, and
-not while it is hidden or in another tab page.
+number for them. A parent without a step list shows the plain average of its
+children (finished = 100, not started yet = 0). The map is redrawn once a
+second while something runs, and not while it is hidden or in another tab
+page.
 
 The light: in the map (box) view a dot of light runs along the line into each
 [RUNNING] agent, from parent to child. When the agent finishes, the same line
@@ -289,5 +291,17 @@ Undelivered text waits in `<run>/steer/<agent>-<ms>.json` (mode 0600) with
 the flag `<root>/steer.pending`. An agent usually follows the instruction,
 but it is not guaranteed (the main agent on Haiku ignored hook-delivered
 instructions in tests).
+
+The text goes into the terminal as one line and Enter follows
+`steer.submit_delay_ms` (300 ms) later: Claude Code 2.1.289 treats a long
+line (about 250 characters, a parent notice) that arrives in one write as a
+paste and leaves it unsent in its input box. The detail view shows SENT until
+Claude Code reads the line, then DELIVERED (read by Claude Code).
+
+Nothing is sent, and a message says why, when the registered hooks are
+outdated (`s` on a running agent: run |:AgentMapInstallHooks| first; the
+terminal route is not affected) or when the run has ended (`s` on the main
+agent or a finished agent would reach another conversation's terminal in the
+same folder; give new instructions in Claude Code itself).
 
  vim:tw=78:ts=8:ft=help:norl:

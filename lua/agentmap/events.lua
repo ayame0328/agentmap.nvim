@@ -341,7 +341,9 @@ end
 
 -- ---------- 手順表（## Steps の目印）を読む ----------
 
-local STEPS_PATH_RETRY = 10 -- 秒。transcript の場所が分からなかった Agent を次に探すまでの間
+-- 秒。transcript の場所が分からなかった Agent を次に探すまでの間。Agent の transcript は始まってから最初の
+-- 発言まで（1〜3 秒）存在しないので、最初の tick で見つからないのが普通。長く待つと「## Steps」がその分遅れて出る
+local STEPS_PATH_RETRY = 2
 
 --- Read new step lists / step marks from the transcripts of running agents and record changes.
 --- 動いている Agent（RUNNING / REVIEW。ROOT を含む）の transcript の増えた分から手順表を読み、
@@ -489,13 +491,20 @@ M._sweep_flag = sweep_flag
 ---@param opts? { via?: "hook"|"terminal", kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string }
 ---   kind = "notice" with notice_of = <steer_id>: a notice to the parent about an instruction delivered to its
 ---   sub-agent (DESIGN-v0.2-steer appendix E; created by the UI). The state links them both ways
----   (s.steers[id].notice_of and s.steers[notice_of].notice_id), so a second notice can be avoided.
----@return string|nil steer_id, string|nil err  err: "no_run" | "bad_target" | "empty" | write error
+---   (s.steers[id].notice_of and s.steers[notice_of].notice_id). Before writing, the records are read once
+---   more; when the instruction already has a notice (made by this or another Neovim showing the same run)
+---   nothing is written and "duplicate" is returned.
+---@return string|nil steer_id, string|nil err  err: "no_run" | "bad_target" | "empty" | "duplicate" | write error
 function M.request_steer(run, agent_id, text, opts)
   opts = opts or {}
   if not run or not run.dir or not run.state then return nil, "no_run" end
   if type(agent_id) ~= "string" or not agent_id:match("^[%w_%-]+$") then return nil, "bad_target" end
   if type(text) ~= "string" or not text:find("%S") then return nil, "empty" end
+  if opts.kind == "notice" and opts.notice_of then
+    M.poll(run) -- 別の Neovim が先に知らせを作っていれば、ここで state に入る
+    local orig = state_mod.steer_of(run.state, opts.notice_of)
+    if orig and orig.notice_id then return nil, "duplicate" end
+  end
   local scfg = config.get().steer or {}
   text = brief.clip(text, tonumber(scfg.text_max) or 4000)
   local via = opts.via == "terminal" and "terminal" or "hook"

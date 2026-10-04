@@ -328,4 +328,7 @@ return {
   ["ui.steer_empty"] = "（空のため送っていません）",
   -- v0.2.0: 親への知らせ（steer 設計書 付録 E）
   ["detail.steer_notice"] = "      → 親 %{parent} に知らせた: ",
+  -- v0.2.0: 送る前に断る（hooks で届ける経路だけ／実行が終わっている）
+  ["ui.steer_hooks_outdated"] = "hooks の登録が古いので届きません。:AgentMapInstallHooks で登録し直してください",
+  ["ui.steer_run_ended"] = "この実行は終わっています。新しい指示は Claude の画面で出してください",
 }

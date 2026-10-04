@@ -72,7 +72,7 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <root>/project
 |---|---|
 | Neovim | 0.10 or newer |
 | Python | 3 (standard library only). `python3`, `python` or `py -3` is used, in that order |
-| Claude Code | verified with 2.1.283 – 2.1.288 (see [Compatibility](#compatibility)) |
+| Claude Code | verified with 2.1.283 – 2.1.289 (see [Compatibility](#compatibility)) |
 | OS | Linux, macOS, WSL. Windows-native Neovim is **experimental** |
 
 Optional: `git` (for the diff view), [oil.nvim](https://github.com/stevearc/oil.nvim)
@@ -203,6 +203,9 @@ Each box shows how far the agent is, next to its elapsed time:
   its step list.
 - **Boxes without a step list** are estimated from elapsed time only (elapsed ÷ typical time,
   at most 95.0%), also marked `~`. Set `progress.no_steps = "none"` to show no number for them.
+- **A parent without a step list** (the main agent before it creates tasks, a Workflow box) shows
+  the plain average of its children: finished children count as 100, children that have not
+  started yet (`PENDING`) count as 0, so the number does not run ahead while more are still to come.
 - **Typical times** come from your finished agents (`:checkhealth agentmap` shows how many). With
   no history the default is 10 minutes per agent (`progress.default_ms`). They improve as records
   accumulate; per-step times are used once v0.2.0 has recorded enough steps.
@@ -279,7 +282,8 @@ require("agentmap").setup({
     at_stop = true,            -- also deliver when the agent tries to finish (stops it once)
     root_via = "terminal",     -- main agent: "terminal" | "hook"
     no_terminal = "hook",      -- no Claude terminal found: "hook" | "clipboard" | "none"
-    submit_delay_ms = 0,       -- 0: text and Enter in one write; > 0: Enter after this many ms
+    submit_delay_ms = 300,     -- Enter is sent this many ms after the text (0: one write; long
+                               -- lines then stay unsent in Claude Code's input box, see below)
     input = "window",          -- "window" (floating editor) | "line" (vim.ui.input)
     text_max = 4000,           -- characters
   },
@@ -400,6 +404,17 @@ What to know:
   pick one, once per run.
   Glance at the terminal after sending: agentmap.nvim cannot see whether Claude Code is waiting at
   a different prompt (for example the folder trust question).
+- Text typed into the terminal is sent as one line, and Enter follows `steer.submit_delay_ms`
+  (300 ms) later. With `0` a long line (about 250 characters, the length of a parent notice) is
+  treated as a paste by Claude Code 2.1.289 and stays unsent in its input box; short lines are
+  submitted either way. The detail view shows `SENT` until Claude Code reads the line, then
+  `DELIVERED (read by Claude Code)`, so you can tell the two apart.
+- Two cases where nothing is sent and a message tells you why: the registered hooks are outdated
+  (`:checkhealth agentmap` says so; `s` on a running agent asks you to run `:AgentMapInstallHooks`
+  first, since the old registration has no delivery hook; the main agent's terminal route is not
+  affected), and the run has ended (its session is closed; `s` on the main agent or on a finished
+  agent would type into the Claude of another conversation in the same folder, so give new
+  instructions in Claude Code itself).
 - The box shows ` ✎1` (purple) while an instruction waits, ` ✎` (green) for a minute after it was
   delivered, and ` ✎!` (red) if the agent finished before it could be delivered (you also get a
   notice). The detail view lists every instruction with its full text (`Enter` on a line opens
@@ -504,6 +519,7 @@ real hook payloads (see `tests/fixtures/`).
 |---|---|---|
 | 2.1.283 – 2.1.286 | 2026-10-01 | The real hook payloads in `tests/fixtures/` were captured from 2.1.283 |
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList payloads; steering (deny wording, `stop_hook_active`, typing into a running `claude`) |
+| 2.1.289 | 2026-10-04 | Full run through Neovim: progress, light, steering, parent notice, HUMAN CHECK, export. A long line typed into `claude` needs Enter sent separately (`steer.submit_delay_ms`, now 300) |
 
 Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion; and every
 tool for steering, synchronous), `PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit,

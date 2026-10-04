@@ -54,6 +54,36 @@ def prompt_id(n):
     return "d3m0p000-0000-4000-8000-%012d" % n
 
 
+# The matchers of the registered recording hooks (lua/agentmap/hooks.lua M.EVENTS): a PreToolUse
+# for Write, say, never reaches the recorder, only the steering guard (which runs for every tool).
+RECORD_MATCH = {
+    "PreToolUse": {"Agent", "AskUserQuestion"},
+    "PostToolUse": {"Agent", "AskUserQuestion", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
+                    "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskList"},
+    "PostToolUseFailure": {"Agent", "AskUserQuestion"},
+}
+# SubagentStop / Stop are registered once, synchronously, as "record + deliver" (steer at stop).
+STOP_EVENTS = {"SubagentStop", "Stop"}
+
+
+def run_hooks(python, root, ev, data):
+    """Call the collector the way the registered hooks would for this payload."""
+    name = ev.get("hook_event_name")
+    if name == "PreToolUse":
+        # the steering guard: `[ -e <root>/steer.pending ] || exit 0; exec ... --steer --mode deny`
+        if os.path.exists(os.path.join(root, "steer.pending")):
+            subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny"],
+                           input=data, check=False, stdout=subprocess.DEVNULL)
+    if name in STOP_EVENTS:
+        subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny", "--at-stop", "--record"],
+                       input=data, check=False, stdout=subprocess.DEVNULL)
+        return
+    match = RECORD_MATCH.get(name)
+    if match is not None and ev.get("tool_name") not in match:
+        return
+    subprocess.run([python, COLLECTOR, "--root", root], input=data, check=False)
+
+
 def payload(line):
     ev = dict(line["ev"])
     ev["session_id"] = SESSION
@@ -144,8 +174,8 @@ def main():
             pre = pending.pop(0)
             if args.claude_dir:
                 write_meta(ev.get("agent_id"), pre, models.get(pre["ev"].get("tool_use_id")))
-        data = json.dumps(payload(line), ensure_ascii=False).encode("utf-8")
-        subprocess.run([args.python, COLLECTOR, "--root", args.root], input=data, check=False)
+        p = payload(line)
+        run_hooks(args.python, args.root, p, json.dumps(p, ensure_ascii=False).encode("utf-8"))
 
 
 if __name__ == "__main__":

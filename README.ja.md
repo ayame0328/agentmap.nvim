@@ -67,7 +67,7 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <保存先>/pr
 |---|---|
 | Neovim | 0.10 以上 |
 | Python | 3（標準部品だけ）。`python3` → `python` → `py -3` の順に探します |
-| Claude Code | 2.1.283 〜 2.1.288 で確かめました（下の「対応している版」を参照） |
+| Claude Code | 2.1.283 〜 2.1.289 で確かめました（下の「対応している版」を参照） |
 | OS | Linux・macOS・WSL。Windows で直接動かす Neovim は**試験的な対応**です |
 
 なくても動くもの：`git`（差分の画面に使う）、[oil.nvim](https://github.com/stevearc/oil.nvim)（`w` キーでエージェントの作業フォルダを開く）、
@@ -193,6 +193,8 @@ sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
   エージェントが手順表を書き直すと、数字が下がることがあります。
 - **手順表の無い箱**は、経過時間だけから推定します（経過時間 ÷ 典型的な時間、上限 95.0%）。これにも `~` が付きます。
   数字を出したくなければ `progress.no_steps = "none"` にします。
+- **手順表の無い親**（手順表を作る前のメインの Claude、Workflow の箱）は、子の進み具合の単純平均を出します。
+  終わった子は 100、まだ始まっていない子（`PENDING`）は 0 として数えるので、これから動く子が残っている間に数字が先走りません。
 - **典型的な時間**は、終わったエージェントの記録から作ります（`:checkhealth agentmap` に件数が出ます）。
   記録が無い間は 1 件 10 分（`progress.default_ms`）とみなします。記録が増えるほど当たるようになり、
   手順ごとの時間は 0.2.0 で手順の記録が十分に溜まってから使われます。
@@ -264,7 +266,8 @@ require("agentmap").setup({
     at_stop = true,            -- 終わろうとした瞬間にも届ける（1 回だけ止めて続けさせる）
     root_via = "terminal",     -- 親への届け方 "terminal" | "hook"
     no_terminal = "hook",      -- Claude の端末が見つからないとき "hook" | "clipboard" | "none"
-    submit_delay_ms = 0,       -- 0: 本文と Enter を 1 回で送る。> 0: 本文のあと、この ms 待って Enter
+    submit_delay_ms = 300,     -- 本文のあと、この ms 待って Enter を送る（0 だと 1 回で送るが、長い行は
+                               -- Claude Code の入力欄に残って送信されない。下の「知っておくこと」）
     input = "window",          -- "window"（浮かせた小さな窓）| "line"（1 行の入力）
     text_max = 4000,           -- 文字数の上限
   },
@@ -371,6 +374,14 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
   hooks で届けます（`steer.no_terminal = "hook"`）。クリップボードにコピーする（`"clipboard"`）、送らない（`"none"`）も選べます。
   その実行のフォルダ（かその親）で動いている Claude の端末を使います。複数あって決まらないときや、別のフォルダの端末しか無いときは、1 回だけ選んでもらいます。
   送ったあとは端末を一度見てください。Claude Code が別の質問（フォルダを信頼するかの確認など）で止まっていても、agentmap.nvim には分かりません。
+- 端末へは本文を 1 行で打ち込み、`steer.submit_delay_ms`（300 ms）あとに Enter を送ります。`0` にすると 1 回で送りますが、
+  長い行（親への知らせの長さ、約 250 文字）は Claude Code 2.1.289 が貼り付けとして扱い、入力欄に残ったまま送信されません
+  （短い行はどちらでも送信されます）。詳細画面では、Claude Code が読むまでは「端末へ送信」、読んだら「配達（Claude Code が受け取った）」
+  と出るので、届いたかどうかが分かります。
+- 送らずに知らせだけ出す場合が 2 つあります。hooks の登録が古いとき（`:checkhealth agentmap` が「古い」と言う状態。
+  古い登録には届ける hook が無いので、動いている子に `s` を押すと「登録が古いので届きません。:AgentMapInstallHooks で登録し直してください」と出ます。
+  親を端末へ送る経路は関係ありません）と、実行が終わっているとき（セッションが閉じた run で親や終わった箱に `s` を押すと、
+  同じフォルダの別の会話の Claude に打ち込むことになるので、「この実行は終わっています。新しい指示は Claude の画面で出してください」と出ます）。
 - 箱の 4 行目に、届く前の指示があれば ` ✎1`（紫）、届けてから 1 分の間は ` ✎`（緑）、
   届く前にエージェントが終わってしまったら ` ✎!`（赤）が出ます（そのときは知らせも出ます）。
   詳細画面に指示の一覧と全文が出ます（行の上で `Enter` を押すと全文を開きます）。まだ届いていない指示は
@@ -469,6 +480,7 @@ Claude Code が hooks に渡す中身には版の番号が入っていません�
 |---|---|---|
 | 2.1.283 〜 2.1.286 | 2026-10-01 | `tests/fixtures/` の実物の hooks の中身は 2.1.283 から採取 |
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList の中身。修正指示（止めたときの文言、`stop_hook_active`、動いている `claude` への打ち込み） |
+| 2.1.289 | 2026-10-04 | Neovim からの通しの確認（進み具合・光・修正指示・親への知らせ・HUMAN CHECK・書き出し）。`claude` に打ち込む長い行は Enter を分けて送る必要がある（`steer.submit_delay_ms`、既定を 300 に） |
 
 使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion。修正指示用に全部の道具・待たせる形でもう 1 つ）、
 `PostToolUse`（Agent・AskUserQuestion・Write・Edit・MultiEdit・NotebookEdit・Bash・EnterWorktree・ExitWorktree・TaskCreate・TaskUpdate・TaskList）、

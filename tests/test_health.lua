@@ -123,7 +123,7 @@ vim.env.AGENTMAP_DIR, vim.env.AGENTFLOW_DIR = store, nil
 require("agentmap.stats").reset()
 config.setup({})
 run_health()
-t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.288", "確かめた Claude Code の版")
+t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.289", "確かめた Claude Code の版")
 t.ok(find("warn", "^Progress history: only 0 finished agents; estimates use the default 10:00 until records accumulate$"), "10: 記録が無ければ warn")
 t.ok(find("info", "^Estimate check: not enough samples yet %(0 of 20%)$"), "11: 標本が足りなければ info")
 t.ok(find("warn", "^Animation: low%-color terminal") or find("ok", "^Animation: on %(frame 100 ms, termguicolors o[nf]+%)$"), "12: 光の行")

@@ -3,8 +3,11 @@
 --   (DESIGN-v0.2-steer.md §4). A candidate is a terminal buffer whose name is
 --   term://<dir>//<pid>:<cmd> (:terminal, snacks.nvim and toggleterm all follow this) and whose
 --   <cmd> contains the word "claude", with a job that is still running.
---   Claude Code reads text typed while it works at its next tool boundary; text + "\r" in one
---   chansend is submitted (verified with Claude Code 2.1.288).
+--   Claude Code reads text typed while it works at its next tool boundary. A short line with "\r"
+--   in one chansend is submitted, but a long line (about 250 characters, the length of a notice to
+--   the parent) arriving in one write is treated as a paste and stays in the input box unsent;
+--   sending "\r" 150 ms or more later submits it (measured with Claude Code 2.1.289), hence
+--   steer.submit_delay_ms = 300 by default.
 local M = {}
 
 local function norm(p)
@@ -94,11 +97,46 @@ function M.sanitize(text)
   return (vim.trim(text:gsub("  +", " ")))
 end
 
+-- Lines whose Enter is delayed are sent one at a time per terminal job: text, "\r" after the
+-- delay, then the same gap before the next line. Without this, two lines sent within the delay
+-- (for example two notices to the parent in the same tick) would land in Claude Code's input box
+-- as one line.
+local queues = {} -- [job] = { items = { { line, submit, delay }, … }, busy = boolean }
+
+local function pump(job)
+  local q = queues[job]
+  if not q or q.busy then return end
+  local it = table.remove(q.items, 1)
+  if not it or not job_alive(job) then
+    queues[job] = nil
+    return
+  end
+  q.busy = true
+  pcall(vim.fn.chansend, job, it.line)
+  vim.defer_fn(function()
+    if it.submit and job_alive(job) then pcall(vim.fn.chansend, job, "\r") end
+    vim.defer_fn(function()
+      q.busy = false
+      pump(job)
+    end, it.delay)
+  end, it.delay)
+end
+
+--- Lines still queued or in flight for `job` (0 when idle). Tests wait on this.
+---@param job integer
+---@return integer
+function M.pending(job)
+  local q = queues[job]
+  if not q then return 0 end
+  return #q.items + (q.busy and 1 or 0)
+end
+
 --- Type `text` into the terminal job and press Enter.
 ---@param job integer terminal job id (vim.b[buf].terminal_job_id)
 ---@param text string
 ---@param opts? { submit?: boolean, delay_ms?: integer }  submit (default true) sends "\r";
----   delay_ms > 0 sends the text first and "\r" after that many milliseconds (default 0: one write)
+---   delay_ms > 0 sends the text first and "\r" after that many milliseconds (default 0: one
+---   write). Delayed lines to the same job are queued and sent one after another.
 ---@return boolean ok, string|nil err
 function M.send(job, text, opts)
   opts = opts or {}
@@ -107,18 +145,14 @@ function M.send(job, text, opts)
   if line == "" then return false, "empty" end
   local submit = opts.submit ~= false
   local delay = tonumber(opts.delay_ms) or 0
-  local ok, n
-  if submit and delay <= 0 then
-    ok, n = pcall(vim.fn.chansend, job, line .. "\r")
-  else
-    ok, n = pcall(vim.fn.chansend, job, line)
-    if ok and n ~= 0 and submit then
-      vim.defer_fn(function()
-        if job_alive(job) then pcall(vim.fn.chansend, job, "\r") end
-      end, delay)
-    end
+  if submit and delay <= 0 and not queues[job] then
+    local ok, n = pcall(vim.fn.chansend, job, line .. "\r")
+    if not ok or n == 0 then return false, ok and "chansend failed" or tostring(n) end
+    return true
   end
-  if not ok or n == 0 then return false, ok and "chansend failed" or tostring(n) end
+  queues[job] = queues[job] or { items = {}, busy = false }
+  table.insert(queues[job].items, { line = line, submit = submit, delay = math.max(0, delay) })
+  pump(job)
   return true
 end
 

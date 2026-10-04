@@ -7,8 +7,13 @@ local t = require("t")
 local ui = require("agentmap.ui")
 local events = require("agentmap.events")
 local config = require("agentmap.config")
+local hooks = require("agentmap.hooks")
 local i18n = require("agentmap.i18n")
 local T = i18n.t
+
+-- hooks の登録の確認（settings.json を読む）の差し替え：この試験の CLAUDE_CONFIG_DIR には settings.json が無い
+local hooks_status = "installed"
+hooks.status = function() return hooks_status end
 
 local notes = {}
 vim.notify = function(msg) notes[#notes + 1] = tostring(msg) end
@@ -54,7 +59,7 @@ s.agents.a2.finished_at = "2026-09-28T04:28:00.000Z"
 s.steers = {}
 local dir = vim.env.AGENTMAP_DIR .. "/projects/-tmp-steer/runs/" .. s.run_id
 vim.fn.mkdir(dir, "p")
-local run = { dir = dir, sid = s.run_id, slug = "-tmp-steer", state = s, off = {} }
+local run = { dir = dir, sid = s.run_id, slug = "-tmp-steer", state = s, off = { hooks = 0, events = 0 } }
 ui.open_map(run)
 
 -- 1. 宛先と経路
@@ -254,6 +259,53 @@ t.run("refuse / disabled", function()
   config.get().steer.enabled = true
 end)
 
+-- 6b. hooks の登録が古い（v0.1.0 の形）：hooks で届ける経路は送らずに知らせる。端末へ送る経路は関係ない
+t.run("hooks outdated", function()
+  notes = {}
+  hooks_status = "outdated"
+  local n0 = #calls
+  t.eq(ui.steer_send("a1", "will not arrive"), "outdated", "動いている子（hooks）→ 送らない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(T("ui.steer_hooks_outdated")), "「登録が古いので届きません」と知らせた")
+  notes = {}
+  local before = #read(out1)
+  t.eq(ui.steer_send("ROOT", "terminal still works"), "sent", "ROOT を端末へ → 送る")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], "[AgentMap] terminal still works", "端末に届いた")
+  t.ok(not noted(T("ui.steer_hooks_outdated")), "端末へ送るときは警告しない")
+  config.get().steer.root_via = "hook"
+  n0 = #calls
+  t.eq(ui.steer_send("ROOT", "x"), "outdated", "ROOT を hooks へ（root_via = hook）→ 送らない")
+  t.eq(#calls, n0, "記録もしない")
+  config.get().steer.root_via = "terminal"
+  -- 登録が無い（missing）も同じ扱い
+  hooks_status = "missing"
+  t.eq(ui.steer_send("a1", "x"), "outdated", "登録が無くても同じ")
+  hooks_status = "installed"
+  t.eq(ui.steer_send("a1", "ok now"), "queued", "登録し直せば送れる")
+end)
+
+-- 6c. 終わった実行（SessionEnd 済み）：ROOT・やり直しは端末へ送らない（同じフォルダの別の会話に入る）
+t.run("run ended", function()
+  notes = {}
+  menus = {}
+  s.ended_at = "2026-09-28T05:00:00.000Z"
+  local n0 = #calls
+  local before = #read(out1)
+  ui.steer_menu("ROOT")
+  t.eq(#menus, 0, "終わった実行の ROOT にはメニューを出さない")
+  t.ok(noted(T("ui.steer_run_ended")), "「この実行は終わっています」と知らせた")
+  t.eq(ui.steer_send("ROOT", "x"), "ended", ":AgentMapSteer ROOT も送らない")
+  menus = {}
+  ui.steer_menu("a2")
+  t.eq(#menus, 0, "終わった箱のやり直し依頼もメニューを出さない")
+  t.eq(ui.steer_send("a2", "redo me"), "ended", "やり直し依頼も送らない")
+  t.eq(#calls, n0, "記録もしない")
+  vim.wait(300)
+  t.eq(#read(out1), before, "端末には何も打たれていない")
+  s.ended_at = nil
+end)
+
 -- 7. :AgentMapSteer と s キー
 t.run("command and key", function()
   vim.cmd("AgentMapSteer 1 from the command line")
@@ -337,6 +389,20 @@ t.run("notice to parent", function()
   -- 記録に notice_of がある指示は、もう知らせ済み
   s.steers["n9"] = { id = "n9", agent_id = "a1", kind = "steer", status = "DELIVERED" }
   t.eq(ui.notify_parents(), 0, "記録に知らせがあれば作らない")
+  -- state の notice_id だけで分かる場合（別の Neovim が作った知らせ。この Neovim の覚えには無い）
+  s.steers["n10"] = { id = "n10", agent_id = "a1", kind = "steer", status = "DELIVERED", text = "x", notice_id = "made-elsewhere" }
+  s.steer_order[#s.steer_order + 1] = "n10"
+  t.eq(ui.notify_parents(), 0, "state の notice_id が付いていれば作らない")
+  -- events が「duplicate」と断ったら数えず、端末にも打たない
+  local orig_req = events.request_steer
+  events.request_steer = function() return nil, "duplicate" end
+  s.steers["n11"] = { id = "n11", agent_id = "a1", kind = "steer", status = "DELIVERED", text = "y" }
+  s.steer_order[#s.steer_order + 1] = "n11"
+  local before2 = #read(out1)
+  t.eq(ui.notify_parents(), 0, "events が duplicate と断れば作らない")
+  vim.wait(300)
+  t.eq(#read(out1), before2, "端末にも打たない")
+  events.request_steer = orig_req
   s.steers, s.steer_order = {}, {}
 end)
 

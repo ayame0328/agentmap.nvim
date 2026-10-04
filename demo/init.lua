@@ -24,4 +24,17 @@ require("agentmap").setup({
   poll_ms = 300,
   debounce_ms = 100,
   keymaps = { global = true },
+  -- the demo has no history: with the real default (10 min per agent) the estimate would move
+  -- by a tenth of a percent per second; 1 min makes the "~" numbers visibly move in 40 s
+  progress = { default_ms = 60000 },
 })
+
+-- Register the hooks in the demo's own (throwaway) Claude folder, so the steering route through
+-- hooks is "installed" (otherwise `s` refuses: an outdated or missing registration cannot deliver).
+-- demo/replay.py plays the same guard the registration describes.
+if vim.env.DEMO_CLAUDE_DIR and vim.env.AGENTMAP_DIR then
+  vim.fn.mkdir(vim.env.DEMO_CLAUDE_DIR, "p")
+  pcall(require("agentmap.hooks").install, {
+    path = vim.env.DEMO_CLAUDE_DIR .. "/settings.json", root = vim.env.AGENTMAP_DIR, yes = true, quiet = true,
+  })
+end

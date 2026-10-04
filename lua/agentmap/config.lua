@@ -60,7 +60,10 @@ M.defaults = {
     at_stop = true,          -- SubagentStop / Stop でも届ける（終わりを 1 回止めて続けさせる）
     root_via = "terminal",   -- ROOT への経路 "terminal" | "hook"
     no_terminal = "hook",    -- 端末が無いとき "hook" | "clipboard" | "none"
-    submit_delay_ms = 0,     -- 0: 本文と Enter を 1 回で送る。>0: 本文の後にこの ms だけ待って Enter
+    -- 本文を送ってから Enter を送るまでの間（ms）。0 なら 1 回で送る。
+    -- Claude Code 2.1.289 の実測：長い 1 行（親への知らせの長さ、約 250 文字）を Enter ごと 1 回で送ると
+    -- 貼り付け扱いになって送信されず入力欄に残る。150 ms 以上空けると送信される（短い行はどちらでも送信される）
+    submit_delay_ms = 300,
     input = "window",        -- "window" | "line"
     text_max = 4000,
   },

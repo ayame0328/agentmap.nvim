@@ -11,7 +11,8 @@ changes; records written by older versions stay readable.
 - Progress per box: finished steps ÷ all steps as fact; the running step is estimated from the
   typical time of similar past agents (median of your own records per agent type and model) and
   marked `~` (`[RUNNING] ~62.4%`). Boxes without a step list are estimated from elapsed time only
-  (at most 95.0%). The detail view lists the steps; exports show the value at export time.
+  (at most 95.0%); a parent without a step list shows the plain average of its children (finished
+  = 100, not started yet = 0). The detail view lists the steps; exports show the value at export time.
 - Step lists: the main agent's TaskCreate / TaskUpdate / TaskList are recorded; sub-agents write
   `## Steps` and `Step N done` (`## 手順` / `手順 N 完了`), read from their transcript.
   The writing convention has a new paragraph for it.
@@ -25,8 +26,11 @@ changes; records written by older versions stay readable.
   their next tool call (a synchronous `PreToolUse` hook denies it with the text as the reason) or
   when they try to finish (`SubagentStop`); the main agent gets it typed into its `:terminal`;
   a finished agent becomes a redo request to the main agent. When an instruction reaches a
-  sub-agent, its parent is told once by the same route. Marks `✎n` / `✎` / `✎!` in the
-  box, a steering section in the detail view and in exports.
+  sub-agent, its parent is told once by the same route (also when two Neovims show the same run:
+  the records are checked before a notice is written). Marks `✎n` / `✎` / `✎!` in the
+  box, a steering section in the detail view and in exports. Nothing is sent, with a message,
+  when the registered hooks are outdated (hooks route only) or when the run has ended (terminal
+  route: the Claude in that folder would be another conversation).
 - Settings `progress`, `animation` and `steer` (each also accepts `false`).
 - `:checkhealth agentmap`: progress history, estimate check, light, steering hook, pending
   steering flag and Claude terminal rows.
@@ -41,7 +45,7 @@ changes; records written by older versions stay readable.
   `PreToolUse` registration (a shell guard that returns in about 2 ms when nothing is pending),
   and `SubagentStop` is now synchronous. Existing registrations show as outdated: run
   `:AgentMapInstallHooks` again.
-- Verified with Claude Code 2.1.288.
+- Verified with Claude Code 2.1.288 and 2.1.289.
 
 ### Notes
 
@@ -51,6 +55,13 @@ changes; records written by older versions stay readable.
   agent at its end shows `Stop hook error occurred` in Claude Code's terminal. The main agent may
   ignore hook-delivered instructions depending on the model, so it is steered through its terminal.
 - Steering text is stored as written (not redacted).
+- `steer.submit_delay_ms` defaults to 300: Claude Code 2.1.289 treats a long line (about 250
+  characters, the length of a parent notice) arriving in one write as a paste and leaves it unsent
+  in its input box; Enter sent 150 ms or more later submits it. Short lines submit either way.
+  Lines to the same terminal are sent one after another, so two instructions in the same second
+  do not end up as one line.
+- A sub-agent's transcript does not exist until its first message; the step list is now looked for
+  again after 2 seconds (was 10), so `## Steps` shows up a few seconds after the agent starts.
 
 ## [0.1.0] - unreleased
 

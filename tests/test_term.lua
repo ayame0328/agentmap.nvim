@@ -99,6 +99,8 @@ t.run("send", function()
   t.ok(term.send(j_work, "second", { delay_ms = 50 }), "分けて送れた")
   vim.wait(3000, function() return #read(out_work) >= 2 end, 20)
   t.eq(read(out_work)[2], "second", "遅れて Enter が届く")
+  vim.wait(1000, function() return term.pending(j_work) == 0 end, 10)
+  t.eq(term.pending(j_work), 0, "送り終えると待ちは 0")
   -- chansend の呼ばれ方
   local calls = {}
   local orig = vim.fn.chansend
@@ -106,6 +108,11 @@ t.run("send", function()
   term.send(j_work, "one write")
   vim.fn.chansend = orig
   t.eq(calls, { { j_work, "one write\r" } }, "既定は本文と \\r を 1 回で")
+  -- Enter を遅らせる設定で続けて 2 行：1 行ずつ順に届き、前の行の Enter の前に次の本文が割り込まない
+  --（割り込むと Claude Code の入力欄で 1 行につながる。親への知らせが同じ tick に 2 件出たときなど）
+  t.ok(term.send(j_work, "third", { delay_ms = 50 }) and term.send(j_work, "fourth", { delay_ms = 50 }), "続けて送れた")
+  vim.wait(3000, function() return #read(out_work) >= 4 end, 20)
+  t.eq({ read(out_work)[3], read(out_work)[4] }, { "third", "fourth" }, "遅らせた Enter の間に次の本文が割り込まない")
   t.eq({ term.send(j_work, "  \n ") }, { false, "empty" }, "空は送らない")
 end)
 

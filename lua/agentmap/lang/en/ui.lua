@@ -328,4 +328,7 @@ return {
   ["ui.steer_empty"] = "(empty; nothing sent)",
   -- v0.2.0: notice to the parent (steer appendix E)
   ["detail.steer_notice"] = "      → told the parent %{parent}: ",
+  -- v0.2.0: refusals before sending (hooks route only / the run has ended)
+  ["ui.steer_hooks_outdated"] = "The registered hooks are outdated, so the instruction would not arrive; run :AgentMapInstallHooks to register them again",
+  ["ui.steer_run_ended"] = "This run has ended; give new instructions in Claude's own screen",
 }

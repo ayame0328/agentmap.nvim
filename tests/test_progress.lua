@@ -127,14 +127,22 @@ t.run("(h) ROOT: tasks k=1,n=2、動いている子 40.0 と 60.0 → 75.0", fun
   t.eq(r.estimated, true, "推定")
 end)
 
-t.run("(i) 手順表の無い ROOT：子 DONE・RUNNING(50.0)・nil → 75.0", function()
+t.run("(i) 手順表の無い ROOT：子 DONE・RUNNING(50.0)・PENDING(0) → 50.0", function()
   local done = steps_agent("d", "DONE", 0)
   local half = steps_agent("h", "RUNNING", 0)
   half.steps.items = { { n = 1, done_at = iso(NOW) }, { n = 2 } }
   local none = { id = "p", status = "PENDING", children = {} }
   local s = state_with({ done, half, none })
   local r = progress.compute(s, "ROOT", opts())
-  t.eq({ r.pct, r.basis, r.estimated }, { 75.0, "children", false }, "単純平均")
+  t.eq({ r.pct, r.basis, r.estimated }, { 50.0, "children", false },
+    "単純平均。まだ始まっていない子は除かず 0 として入れる（2026-10-04 本人の決定）")
+  t.eq(r.n_children, 3, "PENDING の子も数に入る")
+  -- 起動待ちの仮の箱（placeholder）も「まだ始まっていない子」
+  local s0 = state_with({ steps_agent("d", "DONE", 0), { id = "pending:toolu_1", placeholder = true, status = "PENDING", children = {} } })
+  t.eq(progress.compute(s0, "ROOT", opts()).pct, 50.0, "DONE 100 と仮の箱 0 → 50.0")
+  -- REVIEW で事実の無い子は今までどおり除く（進みを測れない）
+  local s6 = state_with({ steps_agent("d", "DONE", 0), { id = "rv", status = "REVIEW", children = {} } })
+  t.eq(progress.compute(s6, "ROOT", opts()).pct, 99.9, "事実の無い REVIEW の子は除く → DONE だけ → 子が動いている間の上限 99.9")
   -- 子が全部終わっても、自分が動いている間は 99.9 の推定
   local s2 = state_with({ steps_agent("d", "DONE", 0) })
   local r2 = progress.compute(s2, "ROOT", opts())

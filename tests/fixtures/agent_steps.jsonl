@@ -1,0 +1,7 @@
+{"type":"user","timestamp":"2026-10-04T10:00:00.000Z","message":{"role":"user","content":"【目的】steps の読み取りを試す\nRead the code, write the design, run the tests."}}
+{"type":"assistant","timestamp":"2026-10-04T10:00:05.000Z","message":{"id":"msg_s1","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"了解しました。\n\n## Steps\n1. Read the current code\n2. Write the design\n3. Run the tests"}]}}
+{"type":"assistant","timestamp":"2026-10-04T10:00:06.000Z","message":{"id":"msg_s1","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_s1","name":"Read","input":{"file_path":"/tmp/agentmap-test/x.lua"}}]}}
+{"type":"user","timestamp":"2026-10-04T10:00:07.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_s1","content":"## Steps\n1. fake\nStep 1 done"}]}}
+{"type":"assistant","timestamp":"2026-10-04T10:01:00.000Z","message":{"id":"msg_s2","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Step 1 done"}]}}
+{"type":"assistant","timestamp":"2026-10-04T10:01:01.000Z","message":{"id":"msg_s2","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_s2","name":"Write","input":{"file_path":"/tmp/agentmap-test/d.md","content":"Step 2 done"}}]}}
+{"type":"user","timestamp":"2026-10-04T10:01:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_s2","content":"ok"}]}}

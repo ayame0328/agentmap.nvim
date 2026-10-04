@@ -28,6 +28,13 @@ every run, so you can open old ones later.
   Reviews are kept as history, and a rerun is shown as a new attempt of the same agent.
 - **Export.** Save the map of a prompt as Markdown, HTML or PDF (with a Mermaid diagram and a
   text tree), for a report or a pull request.
+- **Progress per box.** Finished steps ÷ all steps is shown as fact; between two steps the number
+  is an estimate marked `~` (from your own past runs). A light flows along the line into each
+  running agent, and back to the parent for a moment when the agent reports.
+  See [Progress and the light](#progress-and-the-light).
+- **Steering.** Press `s` on a running agent and write what to change: a sub-agent gets it at its
+  next tool call, the main agent gets it typed into its terminal.
+  See [Steering a running agent](#steering-a-running-agent).
 
 ### How is it different from other tools?
 
@@ -48,11 +55,14 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <root>/project
 ```
 
 - Claude Code calls a small recorder through its [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
-  The recorder appends one short line per event and exits. It never prints, never fails,
-  and never changes what Claude Code does.
-- Almost all hooks run asynchronously, so Claude Code does not wait for them. Only `Stop`
-  and `SessionEnd` run synchronously (a few milliseconds), because asynchronous ones were
-  lost when Claude Code exited.
+  The recorder appends one short line per event and exits. It never fails and never changes what
+  Claude Code does, with one exception you start yourself: a [steering instruction](#steering-a-running-agent)
+  you wrote is delivered by stopping the agent's next tool call.
+- Most hooks run asynchronously, so Claude Code does not wait for them. `Stop`, `SubagentStop`
+  and `SessionEnd` run synchronously (a few milliseconds; asynchronous ones were lost when Claude
+  Code exited, and the stop hooks also deliver steering). One more synchronous `PreToolUse` hook
+  delivers steering: it is a one-line shell check for a flag file and returns in about 2 ms when
+  nothing is waiting.
 - Neovim reads the records. Neovim does not have to be open while Claude Code runs; you can
   look at a run afterwards.
 
@@ -62,7 +72,7 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <root>/project
 |---|---|
 | Neovim | 0.10 or newer |
 | Python | 3 (standard library only). `python3`, `python` or `py -3` is used, in that order |
-| Claude Code | verified with 2.1.283 – 2.1.286 (see [Compatibility](#compatibility)) |
+| Claude Code | verified with 2.1.283 – 2.1.288 (see [Compatibility](#compatibility)) |
 | OS | Linux, macOS, WSL. Windows-native Neovim is **experimental** |
 
 Optional: `git` (for the diff view), [oil.nvim](https://github.com/stevearc/oil.nvim)
@@ -106,6 +116,14 @@ Then, once:
 Sessions from before the hooks were installed can be imported from Claude Code's transcripts
 with `:AgentMapRuns` or `:AgentMapImport`.
 
+### Upgrading
+
+After upgrading from 0.1.0, run `:AgentMapInstallHooks` again. Version 0.2.0 records
+TaskCreate / TaskUpdate / TaskList (the main agent's step list), adds the synchronous
+`PreToolUse` guard that delivers steering, and makes `SubagentStop` synchronous.
+`:checkhealth agentmap` says "outdated" until you do. Run it again as well when you change
+`steer.mode` or `steer.at_stop`, because they are written into the hook command.
+
 ### Try it without Claude Code
 
 ```sh
@@ -132,6 +150,7 @@ through the real recorder. The `sleep 1` gives it time to write the first record
 | `:AgentMapReview {n\|id} {PASS\|RETRY\|ESCALATE\|SUBMIT} [reason]` | Record a review |
 | `:AgentMapInstallHooks [settings.json]` | Register the recording hooks in Claude Code |
 | `:AgentMapImport [session_id]` | Import a run from a transcript |
+| `:AgentMapSteer {n\|id} [text]` | Send a steering instruction to an agent (no text: opens the editor) |
 
 ### Keys in the map
 
@@ -149,6 +168,7 @@ All keys are local to the map buffer; nothing global is mapped unless you ask fo
 | `d` | git diff of the agent |
 | `w` | Go to the agent's working folder |
 | `a` | Review (submit / PASS / RETRY / ESCALATE / rerun / name) |
+| `s` | Steer: write an instruction to this agent (see [Steering](#steering-a-running-agent)) |
 | `e` | Export |
 | `r` | Reload |
 | `R` | Past runs |
@@ -157,9 +177,49 @@ All keys are local to the map buffer; nothing global is mapped unless you ask fo
 | `q` | Close |
 
 In the detail, transcript and diff views: `BS` goes back, `q` closes, `Enter` opens the
-agent / parent / HUMAN CHECK on the line, and `t` / `d` / `w` / `a` work as in the map.
+agent / parent / HUMAN CHECK on the line, and `t` / `d` / `w` / `a` / `s` work as in the map.
 
 When the map is too wide for the window it opens as a list (tree) instead; `v` switches.
+
+### Progress and the light
+
+Each box shows how far the agent is, next to its elapsed time:
+
+```
+[RUNNING] ~62.4% 12:34      estimate: "~" in front
+[REVIEW] 66.6% 12:34        fact only (2 of 3 steps finished)
+[DONE] 100.0% 15:02
+```
+
+- **What is fact.** The number of finished steps divided by all steps of the agent's step list.
+  The main agent keeps its list with TaskCreate / TaskUpdate (recorded by the hooks). Sub-agents
+  cannot use those tools (Claude Code 2.1.288), so they write `## Steps` and `Step N done` lines
+  as text; see the [writing convention](#writing-convention). The detail view lists the steps.
+- **What is estimated (`~`).** Only the step that is running: elapsed time ÷ the typical time of
+  similar past agents, taken from your own records (the median per agent type and model; a step's
+  share of it while there are no per-step records). A parent's running step is filled in with the
+  average of its running children. The value is rounded down and stays below 100 until the agent
+  finishes, so it never looks further along than it is. It can go down when the agent rewrites
+  its step list.
+- **Boxes without a step list** are estimated from elapsed time only (elapsed ÷ typical time,
+  at most 95.0%), also marked `~`. Set `progress.no_steps = "none"` to show no number for them.
+- **Typical times** come from your finished agents (`:checkhealth agentmap` shows how many). With
+  no history the default is 10 minutes per agent (`progress.default_ms`). They improve as records
+  accumulate; per-step times are used once v0.2.0 has recorded enough steps.
+- **Every second.** While something runs, the map is redrawn once a second (only changed lines).
+  With a long typical time the last digit moves only every few seconds. Nothing runs while the
+  map is hidden or in another tab page. Exports show the value at the time of export.
+- **The light.** In the map (box) view, a dot of light runs along the line into every
+  `[RUNNING]` agent, from parent to child. When the agent finishes, the same line flows back from
+  child to parent for 3 seconds (`animation.back_ms`). The line into a HUMAN CHECK that waits for
+  your answer flows in purple. Only colors move; the text is never rewritten, and the timer stops
+  when nothing is lit. The list (tree) view has no light. On terminals with fewer than 16 colors
+  the head of the light is drawn bold and reversed.
+- `progress = false` hides the numbers in the boxes (details and exports still show them);
+  `animation = false` turns the light off completely.
+- For checking the estimate later, one line per running box every 30 seconds and one when it
+  finishes go to `<root>/progress_log.jsonl` (`progress.log = false` turns this off);
+  `:checkhealth agentmap` reports the median error.
 
 ### Language
 
@@ -197,8 +257,37 @@ require("agentmap").setup({
     pdf_command = nil,         -- argv with %{html} %{out} %{title}; nil → PDF export is off
   },
   brief = { markers = nil },   -- reserved (custom markers are planned, see Roadmap)
+  progress = {                 -- false = { enabled = false }
+    enabled = true,            -- show % in the boxes (false hides it there; details and exports keep it)
+    tick_ms = 1000,            -- redraw interval while something runs (% and elapsed time move)
+    default_ms = 600000,       -- typical time of one agent while there is no history (10 min)
+    min_samples = 3,           -- finished agents needed before a type+model median is used
+    no_steps = "time",         -- boxes without a step list: "time" = estimate from elapsed time (max 95.0) | "none"
+    log = true,                -- write <root>/progress_log.jsonl to check the estimate later
+  },
+  animation = {                -- false = { enabled = false }
+    enabled = true,
+    frame_ms = 100,            -- one frame
+    period = 6,                -- cells between two dots of light
+    tail = 2,                  -- cells of tail behind the head
+    back_ms = 3000,            -- how long the light flows back after an agent finishes
+    max_paths = 40,            -- at most this many lit lines at once
+  },
+  steer = {                    -- false = { enabled = false }
+    enabled = true,            -- false: no delivery hook is registered; s says it is off
+    mode = "deny",             -- "deny": stop the next tool call, the reason is your text | "context": let it run, add the text
+    at_stop = true,            -- also deliver when the agent tries to finish (stops it once)
+    root_via = "terminal",     -- main agent: "terminal" | "hook"
+    no_terminal = "hook",      -- no Claude terminal found: "hook" | "clipboard" | "none"
+    submit_delay_ms = 0,       -- 0: text and Enter in one write; > 0: Enter after this many ms
+    input = "window",          -- "window" (floating editor) | "line" (vim.ui.input)
+    text_max = 4000,           -- characters
+  },
 })
 ```
+
+`steer.mode` and `steer.at_stop` are written into the hook command: run `:AgentMapInstallHooks`
+again after changing them (`:checkhealth agentmap` warns when they differ).
 
 The default record folder is named `agentflow` (not `agentmap`) on purpose: it keeps records
 from the earlier private version readable. `$AGENTFLOW_DIR` is still read as an old name for
@@ -231,6 +320,9 @@ write it inside the message in this form:
 - Why: why that approach
 - Open issues: "none" if there are none
 
+If you received a steering instruction from the user while working, say in Approach or Why
+which instruction it was and what you changed because of it.
+
 **Child: when a human decision is needed.** A sub-agent cannot ask the user directly.
 Stop, and instead of the report write this and finish:
 
@@ -250,6 +342,12 @@ Stop, and instead of the report write this and finish:
   "-> if chosen: <what happens next>"
 - when asking on your own initiative, use the same form without the "<description>:" part
 - after the answer, continue accordingly; when restarting the child, say in [Goal] that "<answer>" was chosen
+
+**Child: step list (read as progress).** Before starting work, write `## Steps` followed by a
+numbered list (3–8 steps) in your first reply. After finishing a step, write a line `Step N done`.
+The main agent keeps its own list with TaskCreate / TaskUpdate (sub-agents cannot use those tools
+in Claude Code 2.1.288). agentmap.nvim counts finished steps as fact and marks everything between
+two steps as an estimate (`~`).
 ```
 
 The exact parsing rules are in [docs/writing-convention.md](docs/writing-convention.md).
@@ -264,6 +362,52 @@ agent that asked. The box is purple `[WAITING]` until you answer in the terminal
 `[DONE]` with your answer, or grey `[UNANSWERED]` if the turn ended without an answer.
 `Enter` on the box shows the question, each option with what happens next, and the child's
 `Needs confirmation` report.
+
+## Steering a running agent
+
+Press `s` on a box (or run `:AgentMapSteer {n|id} [text]`) and write what the agent should change.
+A small window opens; `<C-s>`, `:w` or `Enter` in normal mode sends, `q` cancels. How it is
+delivered depends on the box:
+
+| Box | Route |
+|---|---|
+| A running sub-agent (child, grandchild, reviewer) | **Hooks.** The text waits in the run's folder. At the agent's next tool call the `PreToolUse` hook stops that call and returns your text as the reason. If the agent finishes without another tool call, `SubagentStop` stops it once and hands it the text (`steer.at_stop`). |
+| The main agent (ROOT) | **Terminal.** The text is typed into the `:terminal` running `claude` in this Neovim, as `[AgentMap] <text>` followed by Enter. Claude Code reads text typed while it works at its next step; if it is idle, the text starts a new turn. |
+| A finished agent (`DONE` / `REWORK` / `FAILED`) | **Redo request** to the main agent's terminal: `[AgentMap] Please redo agent [3] "<name>" (id …, finished 10:31): <text>. Use the same delegation; report what changed.` The agent itself cannot be reached any more. Nothing is marked as rework automatically; the main agent decides. |
+
+When an instruction reaches a sub-agent, its parent is told as well, once, by the same route as
+any instruction for that parent (the main agent: its terminal, else hooks; a sub-agent parent:
+hooks): `[AgentMap] The user sent this instruction directly to your sub-agent [2] "<name>": <text>.
+If it also affects other sub-agents or your plan, update them.` Nothing is sent when the parent
+has already finished. The sub-agent is asked to mention the instruction in its report.
+
+What to know:
+
+- A sub-agent sees your text as one line: `PreToolUse:Write hook error: [AgentMap] Steering
+  instruction from the user, typed in Neovim while you were working (this is not a tool error): …`.
+  "hook error" is added by Claude Code and cannot be removed. The stopped tool call is not run;
+  the agent calls it again (or something else) after reading the text. With
+  `steer.mode = "context"` the tool call runs and the text is added as context instead.
+- Stopping an agent at its end shows `Stop hook error occurred` in Claude Code's terminal. Claude
+  Code ends the turn after 8 stops in a row (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`), so it never loops.
+- An agent usually follows the instruction, but this is not guaranteed. In tests the main agent
+  on Haiku ignored hook-delivered instructions (0 of 6) while Opus and Sonnet followed them;
+  that is why the main agent gets it through its terminal.
+- No Claude terminal (for example Claude Code runs in another terminal window): the text is
+  delivered through the hooks at the main agent's next tool call (`steer.no_terminal = "hook"`),
+  copied to the clipboard (`"clipboard"`), or not sent (`"none"`). With several Claude terminals,
+  the one in the run's folder is used; otherwise you pick one, once per run.
+  Glance at the terminal after sending: agentmap.nvim cannot see whether Claude Code is waiting at
+  a different prompt (for example the folder trust question).
+- The box shows ` ✎1` (purple) while an instruction waits, ` ✎` (green) for a minute after it was
+  delivered, and ` ✎!` (red) if the agent finished before it could be delivered (you also get a
+  notice). The detail view lists every instruction with its full text (`Enter` on a line opens
+  it); `s` → "Cancel pending" withdraws one that has not been delivered. Exports have a
+  "Steering instructions" section.
+- Files: undelivered text is in `<root>/projects/<project>/runs/<session>/steer/<agent>-<ms>.json`
+  (mode 0600) and `<root>/steer.pending` is the flag the shell check looks at. Delivered ones are
+  renamed to `*.delivered.json`. Any process running as your user can write these files (an
+  agent's Bash included), so read the delivered text in the detail view if something looks odd.
 
 ## Review and verdict providers
 
@@ -326,6 +470,11 @@ Stored, per event:
 - tool name and its target: the file path for Write / Edit, the first line of a Bash command (up to 120 characters)
 - AskUserQuestion questions, options and answers (clipped)
 - the child's final report (up to 2000 characters) and the first 200 characters of the last message
+- step lists: TaskCreate subjects and `## Steps` items (up to 60 characters each) and their
+  status changes; TaskCreate descriptions are not stored
+- **steering instructions as you wrote them** (not redacted; up to 4000 characters), in
+  `events.jsonl` and `steer/*.delivered.json`
+- `progress_log.jsonl` (estimates and actual durations, no text) and `stats.json` (median durations)
 
 Not stored:
 
@@ -353,19 +502,26 @@ real hook payloads (see `tests/fixtures/`).
 | Claude Code | Checked | Notes |
 |---|---|---|
 | 2.1.283 – 2.1.286 | 2026-10-01 | The real hook payloads in `tests/fixtures/` were captured from 2.1.283 |
+| 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList payloads; steering (deny wording, `stop_hook_active`, typing into a running `claude`) |
 
-Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion),
-`PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit, NotebookEdit, Bash, EnterWorktree,
-ExitWorktree), `PostToolUseFailure` (Agent, AskUserQuestion), `SubagentStart`, `SubagentStop`,
-`Stop`, `SessionEnd`. Unknown events are ignored, so new hook types do not break it.
-`PermissionRequest` is not used, so agentmap.nvim can never approve or deny anything.
+Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion; and every
+tool for steering, synchronous), `PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit,
+NotebookEdit, Bash, EnterWorktree, ExitWorktree, TaskCreate, TaskUpdate, TaskList),
+`PostToolUseFailure` (Agent, AskUserQuestion), `SubagentStart`, `SubagentStop`, `Stop`,
+`SessionEnd`. Unknown events are ignored, so new hook types do not break it.
+`PermissionRequest` is not used, so agentmap.nvim never approves anything. It denies a tool call
+only to deliver a steering instruction you wrote (`steer.enabled = false` removes that hook).
+
+Notes for 2.1.288: sub-agents cannot use TaskCreate, so they use the `## Steps` convention.
+A denied tool call reaches the model as `PreToolUse:<Tool> hook error: <reason>`. The main agent
+may not follow instructions delivered through hooks, depending on the model.
 
 The record format is versioned (`_v`). Records written by older versions stay readable.
 
 ## Status and roadmap
 
-v0.1.0 is the first public release of a tool I built for my own work. I answer issues a few
-times a week, without promises.
+v0.1.0 is the first public release of a tool I built for my own work; v0.2.0 adds progress,
+the light and steering. I answer issues a few times a week, without promises.
 
 Planned:
 
@@ -373,6 +529,7 @@ Planned:
 - **Custom markers** for the writing convention (`brief.markers`, reserved now)
 - Automatic cleanup of old records
 - Windows-native Neovim: leave experimental after fixes
+- Per-step typical times improve as records accumulate (v0.2.0 starts recording them)
 
 Bug reports are most useful with `:checkhealth agentmap` output and a few lines of `hooks.jsonl`
 (check them for anything private first). See [CONTRIBUTING.md](CONTRIBUTING.md).

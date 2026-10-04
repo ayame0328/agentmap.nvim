@@ -4,6 +4,54 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 The minor version goes up when the record format (`_v` in `hooks.jsonl`, the state cache version)
 changes; records written by older versions stay readable.
 
+## [0.2.0] - unreleased
+
+### Added
+
+- Progress per box: finished steps ÷ all steps as fact; the running step is estimated from the
+  typical time of similar past agents (median of your own records per agent type and model) and
+  marked `~` (`[RUNNING] ~62.4%`). Boxes without a step list are estimated from elapsed time only
+  (at most 95.0%). The detail view lists the steps; exports show the value at export time.
+- Step lists: the main agent's TaskCreate / TaskUpdate / TaskList are recorded; sub-agents write
+  `## Steps` and `Step N done` (`## 手順` / `手順 N 完了`), read from their transcript.
+  The writing convention has a new paragraph for it.
+- The map is redrawn once a second while something runs (progress and elapsed time move);
+  it stops while the map is hidden or in another tab page.
+- A light flows along the line into each running agent (parent → child), back to the parent for
+  3 seconds when the agent finishes, and in purple into a HUMAN CHECK that waits for an answer.
+  Highlight-only (`AgentMapFlow*`, `AgentMapFlowBack*`, `AgentMapFlowWait*`); no timer runs when
+  nothing is lit.
+- Steering: `s` on a box or `:AgentMapSteer {n|id} [text]`. Running sub-agents get the text at
+  their next tool call (a synchronous `PreToolUse` hook denies it with the text as the reason) or
+  when they try to finish (`SubagentStop`); the main agent gets it typed into its `:terminal`;
+  a finished agent becomes a redo request to the main agent. When an instruction reaches a
+  sub-agent, its parent is told once by the same route. Marks `✎n` / `✎` / `✎!` in the
+  box, a steering section in the detail view and in exports.
+- Settings `progress`, `animation` and `steer` (each also accepts `false`).
+- `:checkhealth agentmap`: progress history, estimate check, light, steering hook, pending
+  steering flag and Claude terminal rows.
+- `<root>/progress_log.jsonl` (estimate vs. actual duration, for checking the estimate) and
+  `<root>/stats.json` (cached medians).
+
+### Changed
+
+- The `~50%` in a box (finished children ÷ children) is replaced by the new progress value.
+- State cache version `SV` 9 (the cache is rebuilt; records are unchanged, `_v` stays 1).
+- Hooks: new PostToolUse matcher (TaskCreate, TaskUpdate, TaskList), a second synchronous
+  `PreToolUse` registration (a shell guard that returns in about 2 ms when nothing is pending),
+  and `SubagentStop` is now synchronous. Existing registrations show as outdated: run
+  `:AgentMapInstallHooks` again.
+- Verified with Claude Code 2.1.288.
+
+### Notes
+
+- In Claude Code 2.1.288 sub-agents cannot use TaskCreate / TaskUpdate; they use the
+  `## Steps` convention.
+- Steering through hooks is shown to the model as `PreToolUse:<Tool> hook error: …`; stopping an
+  agent at its end shows `Stop hook error occurred` in Claude Code's terminal. The main agent may
+  ignore hook-delivered instructions depending on the model, so it is steered through its terminal.
+- Steering text is stored as written (not redacted).
+
 ## [0.1.0] - unreleased
 
 First public release.

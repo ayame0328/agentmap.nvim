@@ -267,6 +267,212 @@ do
   util.is_wsl = real
 end
 
+-- ---------- 10) 手順表（tasks / steps）と進み具合の事実（DESIGN-v0.2 §2.2） ----------
+print("[10] tasks / steps / progress_facts")
+do
+  local P1, P2 = "p1000000-0000-4000-8000-000000000001", "p2000000-0000-4000-8000-000000000002"
+  local function E(event, ts, f)
+    local e = { v = 1, event = event, ts = "2026-10-04T09:" .. ts .. ".000Z", src = "hook" }
+    for k, v in pairs(f or {}) do e[k] = v end
+    return e
+  end
+  -- 実物の hooks（2.1.288 の手順表の session）から
+  local trecs = util.json_lines(here .. "/fixtures/hooks_tasks.jsonl", 0)
+  eq(#trecs, 11, "hooks_tasks fixture has 11 records")
+  local tevs = {}
+  for _, r in ipairs(trecs) do vim.list_extend(tevs, claude.normalize_hook(r)) end
+  local nc, nu, nl = 0, 0, 0
+  for _, e in ipairs(tevs) do
+    if e.event == "task_created" then nc = nc + 1 end
+    if e.event == "task_updated" then nu = nu + 1 end
+    if e.event == "task_listed" then nl = nl + 1 end
+  end
+  eq(nc, 2, "normalize: 2 task_created")
+  eq(nu, 3, "normalize: 3 task_updated (the description-only TaskUpdate adds nothing)")
+  eq(nl, 1, "normalize: 1 task_listed")
+  local ts = state.reduce(tevs)
+  local T = ts.agents.ROOT.tasks
+  ok(T ~= nil, "ROOT has tasks")
+  eq(T and table.concat(T.order, ","), "1,2", "tasks order")
+  eq(T and T.items["1"].status, "completed", "task 1 completed")
+  eq(T and T.items["1"].active_form, "Doing alpha", "task 1 active_form")
+  eq(T and T.items["1"].started_at, "2026-10-04T09:00:05.000Z", "task 1 started_at = in_progress time")
+  eq(T and T.items["1"].done_at, "2026-10-04T09:00:20.000Z", "task 1 done_at")
+  eq(T and T.items["2"].status, "in_progress", "task 2 in_progress")
+  eq((ts.agents.ROOT.tool_counts or {}).TaskCreate, 2, "Task tools also count as tool_used")
+  local pf = state.progress_facts(ts, "ROOT")
+  eq(pf and pf.source, "tasks", "facts: source tasks")
+  eq(pf and pf.n, 2, "facts: n = 2")
+  eq(pf and pf.k, 1, "facts: k = 1")
+  eq(pf and pf.cur and pf.cur.started_at, "2026-10-04T09:00:21.000Z", "facts: cur.started_at = in_progress time of task 2")
+  eq(pf and pf.cur and pf.cur.text, "beta", "facts: cur.text = subject (no activeForm)")
+  eq(pf and pf.all_done_at, nil, "facts: not all done")
+
+  -- 手で作った記録
+  local s = state.new("r10")
+  local A = "afeed100000000001"
+  state.apply(s, E("run_prompt", "00:00", { prompt_id = P1, prompt_head = "first" }))
+  state.apply(s, E("task_created", "00:01", { agent_id = nil, task_id = "1", subject = "alpha", prompt_id = P1 }))
+  eq(s.agents.ROOT.tasks.items["1"].status, "pending", "task_created → pending")
+  eq(s.agents.ROOT.tasks.items["1"].created_at, "2026-10-04T09:00:01.000Z", "task_created → created_at")
+  state.apply(s, E("task_updated", "00:02", { task_id = "1", status_from = "pending", status_to = "in_progress", prompt_id = P1 }))
+  eq(s.agents.ROOT.tasks.items["1"].started_at, "2026-10-04T09:00:02.000Z", "in_progress → started_at")
+  state.apply(s, E("task_updated", "00:09", { task_id = "1", status_from = "in_progress", status_to = "completed", prompt_id = P1 }))
+  eq(s.agents.ROOT.tasks.items["1"].done_at, "2026-10-04T09:00:09.000Z", "completed → done_at")
+  state.apply(s, E("task_listed", "00:10", { prompt_id = P1, tasks = { { id = "1", subject = "alpha", status = "completed" },
+    { id = "7", subject = "seen only in the list", status = "pending" } } }))
+  eq(table.concat(s.agents.ROOT.tasks.order, ","), "1,7", "task_listed: unknown id appended to order")
+  eq(s.agents.ROOT.tasks.items["7"].subject, "seen only in the list", "task_listed: subject filled")
+  state.apply(s, E("task_updated", "00:11", { task_id = "9", status_to = "in_progress", prompt_id = P1 }))
+  eq(s.agents.ROOT.tasks.items["9"] and s.agents.ROOT.tasks.items["9"].status, "in_progress", "task_updated for an unknown id creates it")
+  -- 2 つ目の流れ（同じセッションで id は通し番号）
+  state.apply(s, E("run_prompt", "01:00", { prompt_id = P2, prompt_head = "second" }))
+  state.apply(s, E("agent_spawn_requested", "01:01", { tool_use_id = "tu1", parent_id = "ROOT", task = "child", prompt_id = P2 }))
+  state.apply(s, E("agent_started", "01:02", { agent_id = A, meta_tool_use_id = "tu1", prompt_id = P2 }))
+  state.apply(s, E("task_created", "01:03", { task_id = "10", subject = "second flow", prompt_id = P2 }))
+  local v1, v2 = state.flow_view(s, P1), state.flow_view(s, P2)
+  eq(v1 and v1.agents.ROOT.tasks and table.concat(v1.agents.ROOT.tasks.order, ","), "1,7,9", "flow_view: ROOT tasks of flow 1 only")
+  eq(v2 and v2.agents.ROOT.tasks and table.concat(v2.agents.ROOT.tasks.order, ","), "10", "flow_view: ROOT tasks of flow 2 only")
+  eq(#s.agents.ROOT.tasks.order, 4, "flow_view does not change the original")
+
+  -- 目印（## Steps）：丸ごと置き換え
+  local steps = { source = "transcript", listed_at = "2026-10-04T09:01:05.000Z", items = {
+    { n = 1, text = "read", done_at = "2026-10-04T09:01:30.000Z" },
+    { n = 2, text = "write" },
+    { n = 3, text = "test" } } }
+  state.apply(s, E("steps_updated", "01:31", { agent_id = A, steps = steps, src = "system" }))
+  eq(s.agents[A].steps and #s.agents[A].steps.items, 3, "steps_updated sets a.steps")
+  local f2 = state.progress_facts(s, A)
+  eq(f2 and f2.source, "steps", "facts: source steps")
+  eq(f2 and f2.n .. "/" .. f2.k, "3/1", "facts: 1 of 3 done")
+  eq(f2 and f2.cur and f2.cur.started_at, "2026-10-04T09:01:30.000Z", "facts: cur.started_at = previous done mark")
+  eq(f2 and f2.cur and f2.cur.text, "write", "facts: cur.text")
+  state.apply(s, E("steps_updated", "01:40", { agent_id = A, src = "system", steps = { source = "transcript",
+    listed_at = "2026-10-04T09:01:39.000Z", items = { { n = 1, text = "only", started_at = "2026-10-04T09:01:39.500Z" } } } }))
+  eq(#s.agents[A].steps.items, 1, "steps_updated replaces the whole list")
+  eq(state.progress_facts(s, A).cur.started_at, "2026-10-04T09:01:39.500Z", "facts: an explicit start mark wins")
+  state.apply(s, E("steps_updated", "01:41", { agent_id = A, src = "system", steps = { source = "transcript",
+    listed_at = "2026-10-04T09:01:39.000Z", items = { { n = 1, text = "only" } } } }))
+  eq(state.progress_facts(s, A).cur.started_at, "2026-10-04T09:01:39.000Z", "facts: no mark → listed_at")
+  state.apply(s, E("steps_updated", "01:50", { agent_id = A, src = "system", steps = { source = "transcript",
+    listed_at = "2026-10-04T09:01:39.000Z", items = { { n = 1, text = "only", done_at = "2026-10-04T09:01:49.000Z" } } } }))
+  local f3 = state.progress_facts(s, A)
+  eq(f3.k == f3.n and f3.all_done_at, "2026-10-04T09:01:49.000Z", "facts: all_done_at when k == n")
+  eq(f3.cur, nil, "facts: no running step when all are done")
+  -- tasks が steps に勝つ
+  state.apply(s, E("task_created", "01:51", { agent_id = A, task_id = "1", subject = "via tool", prompt_id = P2 }))
+  eq(state.progress_facts(s, A).source, "tasks", "facts: tasks win over steps")
+  eq(state.progress_facts(s, A).cur.started_at, "2026-10-04T09:01:51.000Z", "facts: no in_progress → first open task, from created_at")
+  eq(state.progress_facts(s, "nobody"), nil, "facts: unknown id → nil")
+  eq(state.progress_facts(state.new("x"), "ROOT"), nil, "facts: no step list → nil")
+  -- ROOT の目印は、一覧を書いた時刻の流れにだけ出る
+  state.apply(s, E("steps_updated", "01:52", { agent_id = "ROOT", src = "system", steps = { source = "transcript",
+    listed_at = "2026-10-04T09:00:30.000Z", items = { { n = 1, text = "root step" } } } }))
+  ok(state.flow_view(s, P1).agents.ROOT.steps ~= nil, "flow_view: ROOT steps listed in flow 1 shown in flow 1")
+  eq(state.flow_view(s, P2).agents.ROOT.steps, nil, "flow_view: … and not in flow 2")
+  eq(state.SV, 9, "SV = 9")
+end
+
+-- ---------- 11) 修正指示（steer。DESIGN-v0.2-steer §5.2） ----------
+print("[11] steers")
+do
+  local P1, P2 = "p1100000-0000-4000-8000-000000000001", "p1200000-0000-4000-8000-000000000002"
+  local A, B = "afeed110000000001", "afeed110000000002"
+  local function E(event, ts, f)
+    local e = { v = 1, event = event, ts = "2026-10-04T10:" .. ts .. ".000Z", src = "user" }
+    for k, v in pairs(f or {}) do e[k] = v end
+    return e
+  end
+  local s = state.new("r11")
+  state.apply(s, E("run_prompt", "00:00", { prompt_id = P1, prompt_head = "first", src = "hook" }))
+  state.apply(s, E("agent_spawn_requested", "00:01", { tool_use_id = "tA", parent_id = "ROOT", task = "child A", prompt_id = P1, src = "hook" }))
+  state.apply(s, E("agent_started", "00:02", { agent_id = A, meta_tool_use_id = "tA", prompt_id = P1, src = "hook" }))
+  state.apply(s, E("steer_requested", "00:10", { steer_id = A .. "-1", agent_id = A, text = "use v3", via = "hook", prompt_id = P1, kind = "steer" }))
+  local st = s.steers[A .. "-1"]
+  eq(st and st.status, "PENDING", "steer_requested → PENDING")
+  eq(s.agents[A].steers and s.agents[A].steers[1], A .. "-1", "a.steers has the id")
+  eq(s.counts.steers .. "/" .. s.counts.steers_pending, "1/1", "counts.steers / steers_pending")
+  eq(state.pending_steers(s, A), 1, "pending_steers = 1")
+  -- hook の配達（provider の形から）
+  local dev = claude.normalize_hook({ session_id = "r11", hook_event_name = "PreToolUse", tool_name = "Write", tool_use_id = "tw",
+    agent_id = A, prompt_id = P1, steer = { ids = { A .. "-1" }, mode = "deny", target = A }, _ts = "2026-10-04T10:00:20.000Z" })
+  eq(#dev, 1, "steer line → 1 event")
+  eq(dev[1].event, "steer_delivered", "steer line → steer_delivered")
+  for _, e in ipairs(dev) do state.apply(s, e) end
+  eq(st.status, "DELIVERED", "steer_delivered → DELIVERED")
+  eq(st.delivered_via, "PreToolUse:Write", "delivered_via = PreToolUse:Write")
+  eq(st.delivered_at, "2026-10-04T10:00:20.000Z", "delivered_at")
+  eq(st.tool_use_id, "tw", "tool_use_id")
+  state.apply(s, E("steer_cancelled", "00:21", { steer_id = A .. "-1" }))
+  eq(st.status, "DELIVERED", "cancel after delivery is ignored")
+  state.apply(s, E("steer_expired", "00:22", { steer_id = A .. "-1", reason = "agent_finished" }))
+  eq(st.status, "DELIVERED", "expire after delivery is ignored")
+  -- 取り消し・期限切れ
+  state.apply(s, E("steer_requested", "00:30", { steer_id = A .. "-2", agent_id = A, text = "x", via = "hook", prompt_id = P1 }))
+  state.apply(s, E("steer_cancelled", "00:31", { steer_id = A .. "-2" }))
+  eq(s.steers[A .. "-2"].status, "CANCELLED", "steer_cancelled → CANCELLED")
+  eq(s.steers[A .. "-2"].ended_at, "2026-10-04T10:00:31.000Z", "cancel ended_at")
+  state.apply(s, E("steer_requested", "00:40", { steer_id = A .. "-3", agent_id = A, text = "y", via = "hook", prompt_id = P1 }))
+  state.apply(s, E("steer_expired", "00:41", { steer_id = A .. "-3", reason = "agent_finished" }))
+  eq(s.steers[A .. "-3"].status, "EXPIRED", "steer_expired → EXPIRED")
+  eq(s.steers[A .. "-3"].end_reason, "agent_finished", "end_reason")
+  -- 配達の記録が先に届いた（hook が先）→ 作ってから、後の requested で本文が埋まる。取り消しより配達が勝つ
+  state.apply(s, E("steer_delivered", "00:50", { steer_id = A .. "-4", agent_id = A, via = "SubagentStop", src = "hook" }))
+  eq(s.steers[A .. "-4"].status, "DELIVERED", "delivered before requested: created as DELIVERED")
+  state.apply(s, E("steer_requested", "00:49", { steer_id = A .. "-4", agent_id = A, text = "late", via = "hook", prompt_id = P1 }))
+  eq(s.steers[A .. "-4"].text, "late", "requested after delivered fills the text")
+  eq(s.steers[A .. "-4"].status, "DELIVERED", "… and keeps DELIVERED")
+  state.apply(s, E("steer_requested", "00:55", { steer_id = A .. "-5", agent_id = A, text = "z", via = "hook", prompt_id = P1 }))
+  state.apply(s, E("steer_cancelled", "00:56", { steer_id = A .. "-5" }))
+  state.apply(s, E("steer_delivered", "00:57", { steer_id = A .. "-5", agent_id = A, via = "PreToolUse:Bash", src = "hook" }))
+  eq(s.steers[A .. "-5"].status, "DELIVERED", "DELIVERED beats CANCELLED")
+  eq(s.steers[A .. "-5"].ended_at, nil, "… and clears ended_at")
+  eq(table.concat(state.steers_of(s, A), ","), table.concat({ A .. "-1", A .. "-2", A .. "-3", A .. "-4", A .. "-5" }, ","),
+    "steers_of: in requested order")
+  eq(s.steers[A .. "-4"].n, 4, "n: numbered by requested_at within the flow")
+  -- 知らない宛先：s.steers にだけ置く
+  state.apply(s, E("steer_requested", "00:58", { steer_id = "ghost-1", agent_id = "ghost", text = "?", via = "hook", prompt_id = P1 }))
+  eq(s.agents.ghost, nil, "unknown target: no agent created")
+  eq(state.steers_of(s, "ghost")[1], "ghost-1", "unknown target: steers_of still finds it")
+  -- 端末へ送った ROOT 宛ての指示：送った → Claude Code が受け取った（同じ prompt_id の UserPromptSubmit）
+  state.apply(s, E("steer_requested", "01:00", { steer_id = "ROOT-1", agent_id = "ROOT", text = "stop and summarize", via = "terminal", prompt_id = P1 }))
+  state.apply(s, E("steer_delivered", "01:01", { steer_id = "ROOT-1", agent_id = "ROOT", via = "terminal" }))
+  eq(s.steers["ROOT-1"].delivered_via, "terminal", "terminal: delivered_via = terminal (sent)")
+  local nflows = #s.flows
+  state.apply(s, E("run_prompt", "01:07", { prompt_id = P1, prompt_head = "[AgentMap] stop and   summarize", src = "hook" }))
+  eq(s.steers["ROOT-1"].delivered_via, "UserPromptSubmit", "terminal: confirmed by the [AgentMap] prompt")
+  eq(s.steers["ROOT-1"].confirmed_at, "2026-10-04T10:01:07.000Z", "terminal: confirmed_at")
+  eq(#s.flows, nflows, "[AgentMap] prompt in the same turn: no new flow")
+  -- 止まっている ROOT への やり直し依頼：新しい prompt_id でも前の流れの続き
+  state.apply(s, E("turn_ended", "01:10", { prompt_id = P1, src = "hook" }))
+  state.apply(s, E("steer_requested", "01:20", { steer_id = "ROOT-2", agent_id = "ROOT", text = "add tests", via = "terminal",
+    kind = "redo", redo_of = A, prompt_id = P1 }))
+  state.apply(s, E("steer_delivered", "01:21", { steer_id = "ROOT-2", agent_id = "ROOT", via = "terminal" }))
+  state.apply(s, E("run_prompt", "01:22", { prompt_id = P2, prompt_head = "[AgentMap] Please redo agent [1] \"child A\" (id x, finished 10:00): add tests. Use the same delegation; report what changed.", src = "hook" }))
+  eq(#s.flows, nflows, "[AgentMap] prompt with a new prompt_id: no new flow")
+  eq(s.prompt_alias[P2], P1, "… it is aliased to the previous flow")
+  eq(s.steers["ROOT-2"].delivered_via, "UserPromptSubmit", "redo text contains the body → confirmed")
+  state.apply(s, E("agent_spawn_requested", "01:23", { tool_use_id = "tB", parent_id = "ROOT", task = "child A again", prompt_id = P2, src = "hook" }))
+  state.apply(s, E("agent_started", "01:24", { agent_id = B, meta_tool_use_id = "tB", prompt_id = P2, src = "hook" }))
+  eq(s.agents[B].prompt_id, P1, "the redo agent joins the previous flow")
+  -- 一致しない [AgentMap] の指示は何も付けない
+  state.apply(s, E("steer_requested", "01:30", { steer_id = "ROOT-3", agent_id = "ROOT", text = "something else", via = "terminal", prompt_id = P1 }))
+  state.apply(s, E("steer_delivered", "01:31", { steer_id = "ROOT-3", agent_id = "ROOT", via = "terminal" }))
+  state.apply(s, E("run_prompt", "01:32", { prompt_id = P1, prompt_head = "[AgentMap] unrelated", src = "hook" }))
+  eq(s.steers["ROOT-3"].delivered_via, "terminal", "no match → not confirmed (no guessing)")
+  -- 流れごとの写し
+  local P3 = "p1300000-0000-4000-8000-000000000003"
+  state.apply(s, E("run_prompt", "02:00", { prompt_id = P3, prompt_head = "third", src = "hook" }))
+  state.apply(s, E("steer_requested", "02:01", { steer_id = A .. "-9", agent_id = A, text = "A is outside flow 3", via = "hook", prompt_id = P3 }))
+  local v1, v3 = state.flow_view(s, P1), state.flow_view(s, P3)
+  ok(v1.steers[A .. "-1"] ~= nil and v1.steers[A .. "-9"] == nil, "flow_view: only the steers of the flow")
+  eq(v3.steer_order[1], A .. "-9", "flow_view: flow 3 has its steer")
+  eq(v3.steers[A .. "-9"].owner_id, "ROOT", "flow_view: target outside the flow → shown on ROOT")
+  eq(state.steers_of(v3, "ROOT")[1], A .. "-9", "steers_of on the view follows owner_id")
+  eq(v1.counts.steers, #v1.steer_order, "flow_view: counts per flow")
+  eq(s.steers[A .. "-9"].owner_id, nil, "flow_view does not change the original")
+end
+
 vim.fn.delete(TMP, "rf")
 print(string.format("%d passed, %d failed", passes, fails))
 print(fails == 0 and "PASS test_reducer.lua" or "FAIL test_reducer.lua")

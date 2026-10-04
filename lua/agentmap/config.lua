@@ -35,7 +35,50 @@ M.defaults = {
     pdf_command = nil,       -- argv。%{html} %{out} %{title} を置き換える（S13）。nil → PDF は無効
   },
   brief = { markers = nil }, -- 予約のみ。v0.1.0 では効果なし（S7）
+  -- 箱ごとの進み具合（%）。DESIGN-v0.2 §4.1。false を渡すと { enabled = false }
+  progress = {
+    enabled = true,          -- 箱に % を出す（false: 箱だけ消す。詳細・書き出しには出る）
+    tick_ms = 1000,          -- 動いているものがある間、図を描き直す間隔（% と経過時間が動く）
+    default_ms = 600000,     -- 過去の記録が無いときの Agent 1 件の目安（10 分）
+    min_samples = 3,         -- 種類・モデルごとの中央値を使うのに要る件数
+    no_steps = "time",       -- 手順表の無い RUNNING の箱: "time" = 経過時間÷目安の推定（上限 95.0）| "none" = 出さない
+    log = true,              -- <root>/progress_log.jsonl に推定の記録を残す（答え合わせ用）
+  },
+  -- 矢印の上を流れる光。false を渡すと { enabled = false }
+  animation = {
+    enabled = true,
+    frame_ms = 100,          -- 1 フレームの長さ
+    period = 6,              -- 光の点の間隔（セル）
+    tail = 2,                -- 頭の後ろの尾の長さ（セル）
+    back_ms = 3000,          -- 子が終わったあと、子→親へ流す時間
+    max_paths = 40,          -- 同時に光らせる線の上限
+  },
+  -- 動いている Agent への修正指示（DESIGN-v0.2-steer §8.1）。false を渡すと { enabled = false }
+  steer = {
+    enabled = true,          -- false: hooks に配達の登録を足さない。s は「無効」と知らせる
+    mode = "deny",           -- "deny": 次の道具を止めて理由として届ける | "context": 道具は進めて文脈として渡す
+    at_stop = true,          -- SubagentStop / Stop でも届ける（終わりを 1 回止めて続けさせる）
+    root_via = "terminal",   -- ROOT への経路 "terminal" | "hook"
+    no_terminal = "hook",    -- 端末が無いとき "hook" | "clipboard" | "none"
+    submit_delay_ms = 0,     -- 0: 本文と Enter を 1 回で送る。>0: 本文の後にこの ms だけ待って Enter
+    input = "window",        -- "window" | "line"
+    text_max = 4000,
+  },
 }
+
+-- setup({ progress = false }) / { progress = true } を表に直す（animation / steer も同じ）
+local SWITCHABLE = { "progress", "animation", "steer" }
+local function normalize(opts)
+  local out = vim.deepcopy(opts)
+  for _, k in ipairs(SWITCHABLE) do
+    if out[k] == false then
+      out[k] = { enabled = false }
+    elseif out[k] == true then
+      out[k] = { enabled = true }
+    end
+  end
+  return out
+end
 
 local current = vim.deepcopy(M.defaults)
 local lang_given = false
@@ -51,12 +94,13 @@ local function env(name)
 end
 
 --- Apply user options over the defaults. May be called any number of times;
---- each call starts again from the defaults.
+--- each call starts again from the defaults. `progress`, `animation` and `steer` also accept
+--- false / true, normalized to { enabled = false } / { enabled = true }.
 ---@param opts? table see M.defaults
 ---@return table the effective configuration
 function M.setup(opts)
   opts = opts or {}
-  current = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)
+  current = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), normalize(opts))
   lang_given = opts.lang ~= nil
   if not lang_given and nonempty(vim.g.agentmap_lang) then
     current.lang = vim.g.agentmap_lang

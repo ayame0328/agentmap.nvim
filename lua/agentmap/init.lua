@@ -12,6 +12,7 @@
 --    :AgentMapReview <index|id> <PASS|RETRY|ESCALATE|SUBMIT> [reason]
 --    :AgentMapInstallHooks [path]        register the recording hooks in Claude Code's settings.json
 --    :AgentMapImport [session_id]        import a run that has no records from Claude's transcript
+--    :AgentMapSteer <index|id> [text]    send a steering instruction to an agent (no text: editor)
 -- ============================================================
 local M = {}
 
@@ -194,11 +195,22 @@ local function start_watch(run)
   watch_run = w.start(run.dir, function()
     local ui, events = try("agentmap.ui"), try("agentmap.events")
     if not ui or not events or not ui.run then return end
-    local changed = events.poll(ui.run)
+    -- 子の手順の目印（## Steps / Step N done）を transcript から読む（無ければ何もしない）
+    local steps_changed = false
+    if events.poll_steps then
+      local ok, r = pcall(events.poll_steps, ui.run)
+      steps_changed = ok and r == true
+    end
+    local changed = events.poll(ui.run) or steps_changed
     -- ROOT のモデル名など、hooks に無い情報を Claude のファイルから補う（見つかったときだけ記録）
     if events.enrich then
       local ok, more = pcall(events.enrich, ui.run)
       changed = changed or (ok and more)
+    end
+    -- 宛先が終わって届かなかった修正指示を片付ける（知らせるのは ui 側）
+    if ui.sweep_steers then
+      local ok, r = pcall(ui.sweep_steers)
+      changed = changed or (ok and r)
     end
     if changed then
       pcall(check_new_flow, ui)
@@ -276,7 +288,28 @@ local function watch_buffer(buf)
   vim.api.nvim_create_autocmd({ "BufWipeout", "BufHidden" }, {
     group = group,
     buffer = buf,
-    callback = function() stop_watch() end,
+    callback = function()
+      stop_watch()
+      -- 見えていない図は毎秒描き直さず、光も流さない（また表示されたら refresh で動き出す）
+      local ui, anim = try("agentmap.ui"), try("agentmap.anim")
+      if ui and ui.stop_ticker then pcall(ui.stop_ticker) end
+      if anim then pcall(anim.stop) end
+    end,
+  })
+  -- 図のあるタブに戻ったら描き直す（毎秒の描き直しと光は、別のタブにいる間は止まっている）
+  local tabgrp = vim.api.nvim_create_augroup("agentmap_tab", { clear = true })
+  vim.api.nvim_create_autocmd("TabEnter", {
+    group = tabgrp,
+    callback = function()
+      local ui = try("agentmap.ui")
+      if not ui or not ui.run or not ui.buf or not vim.api.nvim_buf_is_valid(ui.buf) then return end
+      for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if vim.api.nvim_win_get_buf(w) == ui.buf then
+          pcall(ui.refresh, { aux = false })
+          return
+        end
+      end
+    end,
   })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = group,
@@ -559,6 +592,28 @@ function M.review(arg, verdict, ...)
   }))
 end
 
+--- Send a steering instruction to an agent (index or id). Without text the editor opens.
+--- Running agents get it at their next tool call (hooks); the main agent and finished agents go
+--- through the Claude terminal (see :h agentmap-steer).
+---@param arg string|number agent index, "ROOT" or id
+---@param ... string words of the instruction
+function M.steer(arg, ...)
+  ensure_setup()
+  local ui = ensure_open()
+  if not ui then return end
+  local id = M.resolve(ui.display_state(), arg)
+  if not id and ui.run and ui.run.state then id = M.resolve(ui.run.state, arg) end
+  if not id then
+    notify(tr("init.agent_not_found", { arg = tostring(arg) }), vim.log.levels.WARN)
+    return
+  end
+  local text = vim.trim(table.concat({ ... }, " "))
+  if text == "" then
+    return ui.steer_input(id)
+  end
+  return ui.steer_send(id, text)
+end
+
 --- Register the recording hooks in Claude Code's settings.json (shows a diff and asks first).
 ---@param path? string settings.json to edit (default: config.settings_path())
 ---@return boolean ok, table info see hooks.install
@@ -623,7 +678,7 @@ local function complete_review(arglead, cmdline)
   return {}
 end
 
---- Register the 8 user commands (also called from plugin/agentmap.lua). Re-registering is harmless.
+--- Register the 9 user commands (also called from plugin/agentmap.lua). Re-registering is harmless.
 --- Descriptions are translated at the moment of registration (setup() registers them again).
 function M.commands()
   if not did_setup then
@@ -647,6 +702,13 @@ function M.commands()
     { nargs = "?", complete = "file", desc = tr("init.cmd_install_hooks") })
   cmd("AgentMapImport", guard(function(o) M.import(o.args) end),
     { nargs = "?", desc = tr("init.cmd_import") })
+  cmd("AgentMapSteer", guard(function(o)
+    if not o.fargs[1] then
+      notify(tr("init.steer_usage"), vim.log.levels.WARN)
+      return
+    end
+    M.steer(unpack(o.fargs))
+  end), { nargs = "*", desc = tr("init.cmd_steer") })
 end
 
 local function keymaps()
@@ -676,6 +738,8 @@ function M.setup(opts)
   end
   hl()
   vim.api.nvim_create_autocmd("ColorScheme", { group = group, callback = hl })
+  -- 矢印の光は背景の明暗で色を変える
+  vim.api.nvim_create_autocmd("OptionSet", { group = group, pattern = "background", callback = hl })
   return M
 end
 

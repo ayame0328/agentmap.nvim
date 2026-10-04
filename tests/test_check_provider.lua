@@ -262,4 +262,35 @@ t.run("enrich: 子の transcript から brief", function()
 end)
 
 vim.fn.delete(TMP, "rf")
+-- ---------- 手順表（Task ツール）と修正指示の配達の記録（v0.2.0） ----------
+do
+  local base = { session_id = SID, prompt_id = "pv2", _ts = "2026-10-04T09:00:00.000Z", _src = "claude_hook", _v = 1 }
+  local function rec(t2) return vim.tbl_extend("force", base, t2) end
+  local tc = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "TaskCreate", tool_use_id = "tc",
+    tool_input = { subject = "alpha", activeForm = "Doing alpha" }, tool_response = { task = { id = "1", subject = "alpha" } } }))
+  t.eq(#tc, 2, "TaskCreate → tool_used + task_created")
+  t.eq(tc[1].event, "tool_used", "TaskCreate is also counted as a tool")
+  t.eq({ tc[2].event, tc[2].agent_id, tc[2].task_id, tc[2].subject, tc[2].active_form, tc[2].prompt_id },
+    { "task_created", "ROOT", "1", "alpha", "Doing alpha", "pv2" }, "task_created fields (ROOT when no agent_id)")
+  local nid = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "TaskCreate", tool_use_id = "tc2",
+    tool_input = { subject = "x" } }))
+  t.eq(#nid, 1, "TaskCreate without task.id → tool_used only")
+  local tu = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "TaskUpdate", agent_id = "akid", tool_use_id = "tu",
+    tool_input = { taskId = "1", status = "completed" }, tool_response = { taskId = "1", statusChange = { from = "in_progress", to = "completed" } } }))
+  t.eq({ tu[2] and tu[2].event, tu[2] and tu[2].agent_id, tu[2] and tu[2].status_from, tu[2] and tu[2].status_to },
+    { "task_updated", "akid", "in_progress", "completed" }, "task_updated (agent_id of a sub-agent kept)")
+  t.eq(#claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "TaskUpdate", tool_use_id = "tu2",
+    tool_input = { taskId = "2" } })), 1, "TaskUpdate without statusChange → tool_used only")
+  local tl = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "TaskList", tool_use_id = "tl",
+    tool_input = {}, tool_response = { tasks = { { id = "1", subject = "alpha", status = "completed" }, { id = 2, status = "pending" } } } }))
+  t.eq(tl[2] and tl[2].tasks, { { id = "1", subject = "alpha", status = "completed" }, { id = "2", status = "pending" } }, "task_listed tasks (ids as strings)")
+  local sv = claude.normalize_hook(rec({ hook_event_name = "PreToolUse", tool_name = "Write", tool_use_id = "tw", agent_id = "akid",
+    steer = { ids = { "akid-1", "akid-2" }, mode = "deny", target = "akid" } }))
+  t.eq(#sv, 2, "steer line → one steer_delivered per id, nothing else")
+  t.eq({ sv[1].event, sv[1].steer_id, sv[1].agent_id, sv[1].via, sv[1].tool_use_id, sv[1].mode, sv[1].src },
+    { "steer_delivered", "akid-1", "akid", "PreToolUse:Write", "tw", "deny", "hook" }, "steer_delivered fields")
+  local ss = claude.normalize_hook(rec({ hook_event_name = "SubagentStop", agent_id = "akid", steer = { ids = { "akid-3" }, mode = "block", target = "akid" } }))
+  t.eq({ #ss, ss[1].event, ss[1].via }, { 1, "steer_delivered", "SubagentStop" }, "steer line on SubagentStop is not an agent_finished")
+end
+
 t.done()

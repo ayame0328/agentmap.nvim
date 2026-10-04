@@ -8,6 +8,8 @@
 --      (Working on / Blocked at / Question / Options) / "## 要確認" (今の作業 / 止まっている所 /
 --      確認したいこと / 選択肢) with numbered options
 --    - HUMAN CHECK (AskUserQuestion) option descriptions: "... -> if chosen: next" / "… → 選んだら: next"
+--    - step lists for progress: "## Steps" / "## 手順" with numbered items, and the marks
+--      "Step N done" / "手順 N 完了" (and "Step N start" / "手順 N 開始")
 --
 --  Rules
 --    - Pure functions only (plain Lua, no vim.*), so state / views / export / providers and the
@@ -35,6 +37,8 @@ M.LIMITS = {
   description = 240, -- option の description
   options = 6,       -- 1 問あたりの option の数
   questions = 4,     -- 1 回あたりの question の数
+  step_text = 60,    -- 手順表（## Steps）の 1 項目の本文
+  steps = 20,        -- 手順表の項目の数の上限（超えた塊は無視）
 }
 
 -- 報告・要確認の項目名 → フィールド名。名前は決まり（§2 の 6-2・6-3）の文字そのもの
@@ -295,6 +299,132 @@ function M.parse_report(text)
   for k, v in pairs(f) do res[k] = v end
   if h.kind == "ask" and not res.options then res.options = {} end
   return res
+end
+
+-- ---------- 手順表：## Steps / ## 手順 と Step N done / 手順 N 完了（DESIGN-v0.2 §2.1 B） ----------
+
+-- 全角数字（UTF-8 で 3 バイト。"０" = EF BC 90 … "９" = EF BC 99）を半角にする
+local function ascii_digits(s)
+  return (s:gsub("\239\188([\144-\153])", function(b) return string.char(b:byte() - 144 + 48) end))
+end
+
+--- 手順表の見出しか。"##"/"###" と "Steps"（大小無視）/"手順"。後ろは空か ":" "：" "(" "（" で始まるものだけ
+local function steps_heading(line)
+  local hashes, rest = line:match("^%s*(#+)%s*(.-)%s*$")
+  if not hashes or #hashes < 2 or #hashes > 3 then return false end
+  local after
+  if rest:sub(1, 5):lower() == "steps" then
+    after = rest:sub(6)
+  elseif rest:sub(1, 6) == "手順" then
+    after = rest:sub(7)
+  else
+    return false
+  end
+  after = trim(after)
+  return after == "" or after:sub(1, 1) == ":" or after:sub(1, 3) == "："
+    or after:sub(1, 1) == "(" or after:sub(1, 3) == "（"
+end
+
+--- 手順の項目の行なら 番号, 本文。"1. 本文" / "1) 本文" / "１．本文"（番号は 1〜2 桁）
+local function step_item(line)
+  local s = ascii_digits(trim(line))
+  local n, body = s:match("^(%d%d?)%.%s+(.*)$")
+  if not n then n, body = s:match("^(%d%d?)%)%s*(.*)$") end
+  if not n then n, body = s:match("^(%d%d?)．%s*(.*)$") end
+  if not n then return nil end
+  body = nonempty(body)
+  if not body then return nil end
+  return tonumber(n), body
+end
+
+--- 済んだ印・始めた印の行なら 番号, "done"|"start"
+--   行頭（"- " "* " "・" "**" は可）に "Step"/"手順"、番号、"done"/"完了"/"start"/"開始"。大小無視
+local function step_mark(line)
+  local s = trim((line:gsub("%*%*", "")))
+  if s:sub(1, 1) == "-" or s:sub(1, 1) == "*" then
+    s = trim(s:sub(2))
+  elseif s:sub(1, 3) == "・" then
+    s = trim(s:sub(4))
+  end
+  s = ascii_digits(s)
+  local rest
+  if s:sub(1, 4):lower() == "step" then
+    rest = s:sub(5)
+  elseif s:sub(1, 6) == "手順" then
+    rest = s:sub(7)
+  else
+    return nil
+  end
+  local n, word = rest:match("^%s*(%d%d?)%s*(.*)$")
+  if not n then return nil end
+  local lw = word:lower()
+  local kind
+  for w, k in pairs({ done = "done", start = "start" }) do
+    -- 英語の語の直後が英字なら別の語（"doneness" など）
+    if lw:sub(1, #w) == w and not lw:sub(#w + 1, #w + 1):match("%a") then kind = k end
+  end
+  if word:sub(1, 6) == "完了" then kind = "done" elseif word:sub(1, 6) == "開始" then kind = "start" end
+  if not kind then return nil end
+  return tonumber(n), kind
+end
+
+--- Scan one text for step lists and step marks, in the order they appear.
+---   Returns { { kind = "list", items = { { n, text }, … } } | { kind = "mark", n, mark = "done"|"start" }, … }.
+---   A list is a "## Steps" / "## 手順" heading followed by numbered items 1, 2, 3, … (blank lines before the
+---   first item are allowed; a blank or any other line ends the list). A block whose numbers do not go up by
+---   one, or that has more than LIMITS.steps items, is ignored. Item text is clipped to LIMITS.step_text.
+---@param text string|nil
+---@return table[]
+function M.step_events(text)
+  local out = {}
+  if type(text) ~= "string" or text == "" then return out end
+  local lines = {}
+  for line in (text:gsub("\r\n", "\n") .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
+  local i = 1
+  while i <= #lines do
+    local line = lines[i]
+    if steps_heading(line) then
+      local items, ok = {}, true
+      local j = i + 1
+      while j <= #lines and trim(lines[j]) == "" do j = j + 1 end -- 見出しの直後の空行は飛ばす
+      while j <= #lines do
+        local n, body = step_item(lines[j])
+        if not n then break end
+        if n ~= #items + 1 then ok = false end
+        items[#items + 1] = { n = n, text = M.clip(body, M.LIMITS.step_text) }
+        j = j + 1
+      end
+      if ok and #items > 0 and #items <= M.LIMITS.steps then out[#out + 1] = { kind = "list", items = items } end
+      i = j
+    else
+      local n, kind = step_mark(line)
+      if n then out[#out + 1] = { kind = "mark", n = n, mark = kind } end
+      i = i + 1
+    end
+  end
+  return out
+end
+
+--- The last valid step list in a text, or nil.
+---@param text string|nil
+---@return table|nil  { items = { { n, text }, … } }
+function M.parse_steps(text)
+  local last
+  for _, e in ipairs(M.step_events(text)) do
+    if e.kind == "list" then last = e end
+  end
+  return last and { items = last.items } or nil
+end
+
+--- Step marks in a text, in order: { { n, kind = "done"|"start" }, … }.
+---@param text string|nil
+---@return table[]
+function M.parse_step_marks(text)
+  local out = {}
+  for _, e in ipairs(M.step_events(text)) do
+    if e.kind == "mark" then out[#out + 1] = { n = e.n, kind = e.mark } end
+  end
+  return out
 end
 
 -- ---------- HUMAN CHECK：選択肢と答え ----------

@@ -7,19 +7,25 @@
 --
 --  状態の名前：PENDING（依頼だけ出た）/ RUNNING / REVIEW / DONE / REWORK（差し戻し）/ FAILED
 --  親が分からない Agent は parent_id = nil のまま（推測で埋めない）。
---  進み具合（~NN%）は「子の完了数 / 子の数」だけ。文章からは読まない。
+--  進み具合の事実は手順表だけ（a.tasks = TaskCreate/TaskUpdate/TaskList、a.steps = "## Steps" の目印）。
+--  % の数字は state に保存しない（progress.lua が毎回計算する。progress_facts がその材料）。
+--  修正指示（steer）は s.steers に持つ（DESIGN-v0.2-steer §5.2）。
 -- ============================================================
 local util = require("agentmap.util")
 local brief = require("agentmap.brief")
 
 local M = {}
 
-M.SV = 8 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告が増えた
+M.SV = 9 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示が増えた
 
 M.STATUSES = { "PENDING", "RUNNING", "REVIEW", "DONE", "REWORK", "FAILED" }
 -- HUMAN CHECK（AskUserQuestion）の状態。Agent の状態とは別の箱で持つ（Agent の STATUSES は変えない）
 --   WAITING = 質問を出して答え待ち / ANSWERED = 答えが出た / ABANDONED = 答えが無いまま終わった
 M.CHECK_STATUSES = { "WAITING", "ANSWERED", "ABANDONED" }
+-- 修正指示（steer）の状態。PENDING = 未配達 / DELIVERED = 配達した（端末へ送った）/ CANCELLED = 取り消した / EXPIRED = 届かないまま終わった
+M.STEER_STATUSES = { "PENDING", "DELIVERED", "CANCELLED", "EXPIRED" }
+-- 端末へ送る修正指示の先頭の印（固定。DESIGN-v0.2-steer §4.2）。この印で始まる指示は新しい流れを作らない
+M.STEER_PREFIX = "[AgentMap] "
 local LINK_GRACE = 1.0 -- 子の終了と質問の時刻の比べに許すずれ（秒）。hooks の到着順のずれ（ACTIVITY_GRACE と同じ考え）
 local CLOSED = { DONE = true, REWORK = true, FAILED = true }
 local ACTIVE = { PENDING = true, RUNNING = true, REVIEW = true }
@@ -499,14 +505,46 @@ function H.run_started(s, ev)
   fill(s.agents.ROOT, "transcript_path", ev.transcript_path)
 end
 
---- 人の指示ではない入力（裏の Agent の終わりのお知らせ・Agent からの伝言 <agent-message>）
+--- AgentMap が端末へ送った修正指示（先頭が "[AgentMap] "）か
+local function is_steer_prompt(ev)
+  return type(ev.prompt_head) == "string" and ev.prompt_head:sub(1, #M.STEER_PREFIX) == M.STEER_PREFIX
+end
+
+--- 人の指示ではない入力（裏の Agent の終わりのお知らせ・Agent からの伝言 <agent-message>・AgentMap からの修正指示）
 local function is_notice(ev)
   if ev.kind == "task_notification" then return true end
+  if is_steer_prompt(ev) then return true end
   local h = type(ev.prompt_head) == "string" and ev.prompt_head or ""
   return h:match("^%s*<agent%-message[%s>]") ~= nil
 end
 
+--- 空白をまとめて前後を落とす（端末へ送った文と、記録の prompt_head を比べるため）
+local function squash(str)
+  return (brief.trim((str:gsub("%s+", " "))))
+end
+
+--- 端末へ送った修正指示が Claude Code に受け取られた（UserPromptSubmit が来た）印を付ける。
+---   本文の先頭 60 文字が "[AgentMap] " の後ろにあるものだけ（無ければ何もしない＝推測しない）
+local function confirm_terminal_steer(s, ev)
+  local rest = squash(ev.prompt_head:sub(#M.STEER_PREFIX + 1))
+  if rest == "" then return end
+  for i = #(s.steer_order or {}), 1, -1 do
+    local st = s.steers[s.steer_order[i]]
+    if st and st.via == "terminal" and st.status == "DELIVERED" and st.delivered_via == "terminal"
+        and not st.confirmed_at and type(st.text) == "string" then
+      local h = squash(brief.clip(st.text, 60))
+      -- 先頭が一致（ROOT への指示）か、やり直し依頼の文の中に本文がある（終わった箱のやり直し）
+      if h ~= "" and (rest:sub(1, #h) == h or rest:find(h, 1, true)) then
+        st.delivered_via = "UserPromptSubmit"
+        st.confirmed_at = ev.ts
+        return
+      end
+    end
+  end
+end
+
 function H.run_prompt(s, ev)
+  if is_steer_prompt(ev) then confirm_terminal_steer(s, ev) end
   if is_notice(ev) then
     -- 裏で動いた Agent の終わりのお知らせ・伝言：新しい流れは作らず、直前の本物の指示の続きとして扱う
     s.flows = s.flows or {}
@@ -540,7 +578,7 @@ function H.run_prompt(s, ev)
       s.flows[#s.flows + 1] = shell -- まとめる先が無い：そのまま残す
     end
     sort_flows(s)
-    if ev.kind == "task_notification" then return end
+    if ev.kind == "task_notification" or is_steer_prompt(ev) then return end
     ev = { prompt_head = ev.prompt_head } -- 伝言は題名の扱いだけ今までどおり
   end
   if ev.prompt_id then
@@ -819,6 +857,156 @@ function H.agent_updated(s, ev)
   if a.report == nil then put_report(s, a, ev) end
 end
 
+-- ---------- 手順表（進み具合の事実。DESIGN-v0.2 §2.2）----------
+
+--- その Agent の手順表（Task ツール）。無ければ作る
+local function task_item(s, a, tid, pid)
+  a.tasks = a.tasks or { order = {}, items = {} }
+  local T = a.tasks
+  local it = T.items[tid]
+  local created = false
+  if not it then
+    it = { id = tid, status = "pending", prompts = {} }
+    T.items[tid] = it
+    T.order[#T.order + 1] = tid
+    created = true
+  end
+  it.prompts = it.prompts or {}
+  if pid then it.prompts[resolve_pid(s, pid)] = true end
+  return it, created
+end
+
+local function task_owner(s, ev)
+  local id = ev.agent_id or "ROOT"
+  local a = get_or_create(s, id, "RUNNING")
+  if id ~= "ROOT" then tag(s, a, ev.prompt_id, ev.ts) end
+  return a
+end
+
+function H.task_created(s, ev)
+  if ev.task_id == nil then return end
+  local a = task_owner(s, ev)
+  local it = task_item(s, a, tostring(ev.task_id), ev.prompt_id)
+  fill(it, "subject", ev.subject)
+  fill(it, "active_form", ev.active_form)
+  fill(it, "created_at", ev.ts)
+end
+
+function H.task_updated(s, ev)
+  if ev.task_id == nil or type(ev.status_to) ~= "string" then return end
+  local a = task_owner(s, ev)
+  local it = task_item(s, a, tostring(ev.task_id), ev.prompt_id)
+  local was = it.status
+  it.status = ev.status_to
+  if ev.status_to == "in_progress" then
+    it.started_at = it.started_at or ev.ts
+    it.done_at = nil
+  elseif ev.status_to == "completed" then
+    if not (was == "completed" and it.done_at) then it.done_at = ev.ts end
+    it.started_at = it.started_at or it.created_at
+  else
+    it.done_at = nil
+  end
+end
+
+function H.task_listed(s, ev)
+  if type(ev.tasks) ~= "table" then return end
+  local a = task_owner(s, ev)
+  for _, x in ipairs(ev.tasks) do
+    if type(x) == "table" and x.id ~= nil then
+      -- 一覧で初めて知った id は後ろに足す。状態は一覧の値に合わせる（時刻は変えない）。一覧に無い id は消さない
+      local it, created = task_item(s, a, tostring(x.id), nil)
+      fill(it, "subject", x.subject)
+      if type(x.status) == "string" and x.status ~= it.status then
+        it.status = x.status
+        created = true
+      end
+      if created and ev.prompt_id then it.prompts[resolve_pid(s, ev.prompt_id)] = true end
+    end
+  end
+end
+
+function H.steps_updated(s, ev)
+  local a = ev.agent_id and s.agents[ev.agent_id]
+  if not a or type(ev.steps) ~= "table" then return end
+  a.steps = ev.steps -- 丸ごと置き換え（空欄埋めはしない）
+end
+
+-- ---------- 修正指示（steer。DESIGN-v0.2-steer §5.2）----------
+
+local function get_steer(s, id)
+  s.steers = s.steers or {}
+  s.steer_order = s.steer_order or {}
+  local st = s.steers[id]
+  if not st then
+    st = { id = id, status = "PENDING" }
+    s.steers[id] = st
+    s.steer_order[#s.steer_order + 1] = id
+  end
+  return st
+end
+
+--- 宛先の箱の a.steers に足す（知らない宛先なら s.steers にだけ置く）
+local function attach_steer(s, st)
+  local a = st.agent_id and s.agents[st.agent_id]
+  if not a then return end
+  a.steers = a.steers or {}
+  if not contains(a.steers, st.id) then a.steers[#a.steers + 1] = st.id end
+end
+
+function H.steer_requested(s, ev)
+  if not ev.steer_id then return end
+  local st = get_steer(s, ev.steer_id)
+  for _, k in ipairs({ "agent_id", "text", "via", "kind", "redo_of", "notice_of" }) do fill(st, k, ev[k]) end
+  fill(st, "requested_at", ev.ts)
+  if st.prompt_id == nil and ev.prompt_id then st.prompt_id = resolve_pid(s, ev.prompt_id) end
+  -- 親への知らせ（kind = "notice"）：元の指示に、知らせの id を付ける（同じ指示の知らせを二重に作らないため）
+  local orig = st.notice_of and s.steers[st.notice_of]
+  if orig then fill(orig, "notice_id", st.id) end
+  if st.notice_id == nil then -- 知らせの記録が先に来ていた
+    for _, k in ipairs(s.steer_order) do
+      local o = s.steers[k]
+      if o and o.notice_of == st.id then st.notice_id = k break end
+    end
+  end
+  attach_steer(s, st)
+end
+
+function H.steer_delivered(s, ev)
+  if not ev.steer_id then return end
+  local st = get_steer(s, ev.steer_id)
+  fill(st, "agent_id", ev.agent_id)
+  if st.prompt_id == nil and ev.prompt_id then st.prompt_id = resolve_pid(s, ev.prompt_id) end
+  if st.status ~= "DELIVERED" then
+    -- 配達は他の全部に勝つ（取り消しと配達が同時に起きたら配達が事実）
+    st.status = "DELIVERED"
+    st.delivered_at = ev.ts
+    st.delivered_via = ev.via
+    st.tool_use_id = ev.tool_use_id
+    st.mode = ev.mode
+    st.ended_at, st.end_reason = nil, nil
+  else
+    fill(st, "delivered_at", ev.ts)
+    fill(st, "delivered_via", ev.via)
+  end
+  attach_steer(s, st)
+end
+
+function H.steer_cancelled(s, ev)
+  local st = ev.steer_id and s.steers and s.steers[ev.steer_id]
+  if not st or st.status ~= "PENDING" then return end
+  st.status = "CANCELLED"
+  st.ended_at = ev.ts
+end
+
+function H.steer_expired(s, ev)
+  local st = ev.steer_id and s.steers and s.steers[ev.steer_id]
+  if not st or st.status ~= "PENDING" then return end
+  st.status = "EXPIRED"
+  st.ended_at = ev.ts
+  st.end_reason = ev.reason
+end
+
 -- ---------- HUMAN CHECK（AskUserQuestion）----------
 
 function H.check_asked(s, ev)
@@ -985,6 +1173,29 @@ local function recount(s)
     for n, x in ipairs(g) do x.c.n = n end
   end
   for _, f in ipairs(type(s.flows) == "table" and s.flows or {}) do f.waiting = fw[f.id] or 0 end
+  -- 修正指示：総数・未配達の数と、流れの中での通し番号 n（頼んだ順）
+  c.steers, c.steers_pending = 0, 0
+  local sgroups, sorder = {}, {}
+  for i, sid in ipairs(s.steer_order or {}) do
+    local st = s.steers and s.steers[sid]
+    if st then
+      c.steers = c.steers + 1
+      if st.status == "PENDING" then c.steers_pending = c.steers_pending + 1 end
+      local key = st.prompt_id or ""
+      if not sgroups[key] then sgroups[key] = {}; sorder[#sorder + 1] = key end
+      local g = sgroups[key]
+      g[#g + 1] = { st = st, t = secs(st.requested_at), i = i }
+    end
+  end
+  for _, key in ipairs(sorder) do
+    local g = sgroups[key]
+    table.sort(g, function(x, y)
+      if x.t and y.t and x.t ~= y.t then return x.t < y.t end
+      if (x.t == nil) ~= (y.t == nil) then return x.t ~= nil end
+      return x.i < y.i
+    end)
+    for n, x in ipairs(g) do x.st.n = n end
+  end
   -- Workflow のまとめ役：状態と時刻は中の Agent から決める
   for _, w in ipairs(wfs) do
     local kids = {}
@@ -1164,8 +1375,60 @@ function M.flow_view(s, flow_id)
   for _, id in ipairs(members) do
     if v.agents[id].checks then v.agents[id].checks = flow_checks(id) end
   end
+  -- 修正指示：この流れのもの（流れの分からないものも）だけ写す。宛先が流れの外なら ROOT に付けた写し
+  v.steers, v.steer_order = {}, {}
+  for _, sid in ipairs(s.steer_order or {}) do
+    local st = s.steers and s.steers[sid]
+    if st and (st.prompt_id == nil or resolve_pid(s, st.prompt_id) == flow_id) then
+      local sc = {}
+      for k, val in pairs(st) do sc[k] = val end
+      local target = sc.agent_id
+      sc.owner_id = (target == "ROOT" or is_member[target]) and target or "ROOT"
+      v.steers[sid] = sc
+      v.steer_order[#v.steer_order + 1] = sid
+    end
+  end
+  local function flow_steers(id)
+    local out = {}
+    for _, sid in ipairs(v.steer_order) do
+      if v.steers[sid].owner_id == id then out[#out + 1] = sid end
+    end
+    return out
+  end
+  for _, id in ipairs(members) do
+    local list = flow_steers(id)
+    v.agents[id].steers = #list > 0 and list or nil
+  end
   local r = copy(s.agents.ROOT)
   r.checks = flow_checks("ROOT")
+  local rs = flow_steers("ROOT")
+  r.steers = #rs > 0 and rs or nil
+  -- ROOT の手順表（Task ツール）は、この流れで作った・状態を変えた項目だけ（id はセッション通しなので流れをまたいで残る）
+  if type(r.tasks) == "table" then
+    local T = { order = {}, items = {} }
+    for _, tid in ipairs(r.tasks.order or {}) do
+      local it = r.tasks.items and r.tasks.items[tid]
+      local hit = false
+      for pid in pairs(it and it.prompts or {}) do
+        if resolve_pid(s, pid) == flow_id then hit = true end
+      end
+      if hit then
+        T.order[#T.order + 1] = tid
+        T.items[tid] = it
+      end
+    end
+    r.tasks = #T.order > 0 and T or nil
+  end
+  -- ROOT の手順の目印（## Steps）は、一覧を書いた時刻がこの流れの間にあるものだけ
+  if type(r.steps) == "table" then
+    local lt = secs(r.steps.listed_at)
+    local owner
+    for _, fl in ipairs(s.flows) do
+      local st0 = secs(fl.started_at)
+      if lt and st0 and st0 <= lt and (not owner or st0 >= secs(owner.started_at)) then owner = fl end
+    end
+    if not owner or owner.id ~= flow_id then r.steps = nil end
+  end
   if f.prompt_head then
     r.task, r.prompt_head = f.prompt_head, f.prompt_head
   end
@@ -1346,6 +1609,102 @@ function M.checks_of(s, id)
     return (pos[x] or 0) < (pos[y] or 0)
   end)
   return out
+end
+
+--- Progress facts of a box: its step list (Task tools first, then "## Steps" marks), or nil when it has none.
+---   { source = "tasks"|"steps", n = all steps, k = finished steps,
+---     cur = { started_at = ts|nil, text = "…" }|nil  -- the running step (in_progress, else the first unfinished)
+---     all_done_at = ts|nil }                          -- when every step was finished (k == n)
+--- 進み具合の事実（DESIGN-v0.2 §2.2）。数字は計算しない（progress.lua が使う材料）
+function M.progress_facts(s, id)
+  local a = s and s.agents and s.agents[id]
+  if not a then return nil end
+  local T = type(a.tasks) == "table" and a.tasks or nil
+  if T and #(T.order or {}) > 0 then
+    local n, k, cur, last_done = 0, 0, nil, nil
+    local first_open
+    for _, tid in ipairs(T.order) do
+      local it = T.items and T.items[tid]
+      if it then
+        n = n + 1
+        if it.status == "completed" then
+          k = k + 1
+          local d = it.done_at
+          if d and (not last_done or (secs(d) or 0) > (secs(last_done) or 0)) then last_done = d end
+        else
+          if it.status == "in_progress" then
+            local st0 = it.started_at or it.created_at
+            if not cur or (secs(st0) or math.huge) < (secs(cur.started_at) or math.huge) then
+              cur = { started_at = st0, text = it.active_form or it.subject }
+            end
+          end
+          first_open = first_open or it
+        end
+      end
+    end
+    if n == 0 then return nil end
+    if not cur and first_open then
+      -- 実行中の印が無い：済んでいない最初の項目。始まりは直前に済んだ時刻（無ければ作られた時刻）
+      cur = { started_at = first_open.started_at or last_done or first_open.created_at,
+        text = first_open.active_form or first_open.subject }
+    end
+    return { source = "tasks", n = n, k = k, cur = cur, all_done_at = (k == n) and last_done or nil }
+  end
+  local S = type(a.steps) == "table" and a.steps or nil
+  if S and #(S.items or {}) > 0 then
+    local n, k, cur, last_done = #S.items, 0, nil, nil
+    for _, it in ipairs(S.items) do
+      if it.done_at then
+        k = k + 1
+        if not last_done or (secs(it.done_at) or 0) > (secs(last_done) or 0) then last_done = it.done_at end
+      end
+    end
+    for _, it in ipairs(S.items) do
+      if not it.done_at then
+        cur = { started_at = it.started_at or last_done or S.listed_at, text = it.text }
+        break
+      end
+    end
+    return { source = "steps", n = n, k = k, cur = cur, all_done_at = (k == n) and last_done or nil }
+  end
+  return nil
+end
+
+--- Steering instruction ids shown on a box, in the order requested (existing ones only).
+--- その箱（Agent / ROOT）宛ての修正指示の id 一覧（頼んだ順）
+function M.steers_of(s, id)
+  local out = {}
+  if not s or type(s.steers) ~= "table" then return out end
+  local pos = {}
+  for i, sid in ipairs(s.steer_order or {}) do
+    local st = s.steers[sid]
+    if st and (st.owner_id or st.agent_id) == id then
+      out[#out + 1] = sid
+      pos[sid] = i
+    end
+  end
+  table.sort(out, function(x, y)
+    local tx, ty = secs(s.steers[x].requested_at), secs(s.steers[y].requested_at)
+    if tx and ty and tx ~= ty then return tx < ty end
+    if (tx == nil) ~= (ty == nil) then return tx ~= nil end
+    return pos[x] < pos[y]
+  end)
+  return out
+end
+
+--- Number of PENDING steering instructions for a box.
+--- その箱宛ての未配達の修正指示の数
+function M.pending_steers(s, id)
+  local n = 0
+  for _, sid in ipairs(M.steers_of(s, id)) do
+    if s.steers[sid].status == "PENDING" then n = n + 1 end
+  end
+  return n
+end
+
+--- Steering instruction by id, or nil.
+function M.steer_of(s, sid)
+  return s and s.steers and s.steers[sid] or nil
 end
 
 --- HUMAN CHECK by id, or nil.

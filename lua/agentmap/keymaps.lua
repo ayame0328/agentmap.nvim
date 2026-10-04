@@ -25,6 +25,7 @@ M.MAP_KEYS = {
   { "BS", "keymaps.help_back" },
   { "z", "keymaps.help_zoom" },
   { "a", "keymaps.help_review" },
+  { "s", "keymaps.help_steer" },
   { "v", "keymaps.help_mode" },
   { "R", "keymaps.help_runs" },
   { "?", "keymaps.help_help" },
@@ -35,7 +36,7 @@ M.AUX_KEYS = {
   { "BS", "keymaps.help_aux_back" },
   { "q", "keymaps.help_aux_close" },
   { "Enter", "keymaps.help_aux_enter" },
-  { "t / d / w / a", "keymaps.help_aux_tdwa" },
+  { "t / d / w / a / s", "keymaps.help_aux_tdwa" },
   { "keymaps.key_check_view", "keymaps.help_aux_check" },
 }
 
@@ -55,7 +56,7 @@ function M.help_lines()
   out[#out + 1] = t("keymaps.help_aux_title")
   out[#out + 1] = ""
   for _, k in ipairs(M.AUX_KEYS) do
-    out[#out + 1] = "  " .. pad(k[1], 15) .. t(k[2])
+    out[#out + 1] = "  " .. pad(k[1], 19) .. t(k[2])
   end
   out[#out + 1] = ""
   out[#out + 1] = t("keymaps.help_close")
@@ -126,6 +127,12 @@ function M.attach_map(buf)
     local id = cur_agent()
     if id then ui().review_menu(id) end
   end, t("keymaps.desc_review"))
+  map(buf, "s", function()
+    -- 門なら元の Agent。HUMAN CHECK・まとめ役などは steer_menu が知らせて断る
+    local id = ui().current_id()
+    if not id then vim.notify(t("keymaps.no_agent_at_cursor")) return end
+    ui().steer_menu(id)
+  end, t("keymaps.desc_steer"))
   map(buf, "z", function()
     local id = ui().current_id()
     if id and id:sub(1, 5) == "gate:" then id = id:sub(6) end
@@ -138,8 +145,7 @@ end
 
 --- Attach the side-view mappings to `buf`; kind = "detail" | "check" | "transcript" | "diff".
 -- kind = "detail" | "check" | "transcript" | "diff"
---   t / d / w / a は Agent にしか意味が無いので、HUMAN CHECK の画面では箱が付いている Agent に向ける
---- Attach the side-view mappings to `buf`; kind = "detail" | "check" | "transcript" | "diff".
+--   t / d / w / a / s は Agent にしか意味が無いので、HUMAN CHECK の画面では箱が付いている Agent に向ける
 function M.attach_aux(buf, kind)
   local function target() return ui().resolve_agent(ui().current_id()) end
   map(buf, "<BS>", function() ui().back() end, t("keymaps.desc_back"))
@@ -162,6 +168,10 @@ function M.attach_aux(buf, kind)
     local id = target()
     if id then ui().review_menu(id) end
   end, t("keymaps.desc_review"))
+  map(buf, "s", function()
+    local id = target()
+    if id then ui().steer_menu(id) end
+  end, t("keymaps.desc_steer"))
   map(buf, "?", function() ui().help() end, t("keymaps.desc_help"))
   if kind == "detail" or kind == "check" then
     map(buf, "<CR>", function() ui().follow_link() end, t("keymaps.desc_follow"))

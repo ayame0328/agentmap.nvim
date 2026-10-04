@@ -10,6 +10,9 @@
 --    open_run(sid)      … session_id から run を開く（無ければ transcript から取り込む）
 --    import_transcript  … hooks が無い session を transcript から取り込む
 --    list_runs()        … run の一覧（hooks あり・取り込み済み・履歴のみ）
+--    poll_steps(run)    … 動いている Agent の transcript から手順表（## Steps）を読み足す（DESIGN-v0.2 §2.1）
+--    request_steer / mark_steer_sent / cancel_steer / sweep_steers
+--                       … 修正指示（steer）の未配達ファイルと記録（DESIGN-v0.2-steer §5.3）
 -- ============================================================
 local config = require("agentmap.config")
 local util = require("agentmap.util")
@@ -19,6 +22,8 @@ local providers = require("agentmap.providers")
 
 local M = {}
 local uv = vim.uv or vim.loop
+
+local brief = require("agentmap.brief")
 
 local ROOT_MODEL_RETRY = 3 -- 秒。ROOT のモデル名が取れないとき、次に試すまでの最短の間（記録が増えたときだけ試す）
 
@@ -130,6 +135,8 @@ function M.poll(run)
   run.off = { hooks = hoff, events = eoff }
   if hoff > 0 then run.source = "hooks" elseif eoff > 0 and run.source == "empty" then run.source = "transcript" end
   save(run)
+  -- 宛先が終わった未配達の修正指示を片付ける（記録が増えたときだけ。sweep の中の emit から戻ってきたときは呼ばない）
+  if #new > 0 and not run._sweeping then pcall(M.sweep_steers, run) end
   return #new > 0
 end
 
@@ -329,6 +336,253 @@ function M.enrich(run)
       end
     end
   end
+  return changed
+end
+
+-- ---------- 手順表（## Steps の目印）を読む ----------
+
+local STEPS_PATH_RETRY = 10 -- 秒。transcript の場所が分からなかった Agent を次に探すまでの間
+
+--- Read new step lists / step marks from the transcripts of running agents and record changes.
+--- 動いている Agent（RUNNING / REVIEW。ROOT を含む）の transcript の増えた分から手順表を読み、
+--- 一覧か印が変わったときだけ steps_updated を記録する。終わった Agent は終わった直後に 1 回だけ読んで打ち切る。
+--- 大きさが前回と同じ transcript は読まない。enrich の中からは呼ばない（二重読みを避ける）
+---@return boolean changed
+function M.poll_steps(run)
+  if not run or not run.state then return false end
+  local prov = provider_of(run)
+  if not prov.agent_steps or not prov.steps_of then return false end
+  local s = run.state
+  run._steps = run._steps or {}
+  local now = uv.now() / 1000
+  local changed = false
+  for _, id in ipairs(vim.deepcopy(s.order)) do
+    local a = s.agents[id]
+    if a and a.kind ~= "workflow" and not a.placeholder then
+      local memo = run._steps[id]
+      local live = a.status == "RUNNING" or a.status == "REVIEW"
+      local last = (not live) and memo and not memo.final -- 終わった直後の 1 回
+      if live or last then
+        memo = memo or {}
+        run._steps[id] = memo
+        local path = (id == "ROOT" and s.root_transcript) or a.transcript_path
+        if not path and (not memo.miss_at or now - memo.miss_at >= STEPS_PATH_RETRY) then
+          local ok, p = pcall(prov.agent_transcript_path, run, a)
+          path = ok and p or nil
+          if not (path and uv.fs_stat(path)) then memo.miss_at, path = now, nil end
+        end
+        path = path or memo.path
+        local st = path and uv.fs_stat(path)
+        if st then
+          if memo.path ~= path then memo.path, memo.idx, memo.size = path, nil, nil end
+          if st.size ~= memo.size then
+            memo.size = st.size
+            local ok, idx = pcall(prov.agent_steps, path, memo.idx)
+            if ok and type(idx) == "table" then
+              memo.idx = idx
+              local steps = prov.steps_of(idx)
+              if steps and not vim.deep_equal(steps, a.steps) then
+                M.emit(run, { event = "steps_updated", agent_id = id, src = "system", steps = steps })
+                changed = true
+              end
+            end
+          end
+        end
+        if last then memo.final = true end
+      end
+    end
+  end
+  return changed
+end
+
+-- ---------- 修正指示（steer）----------
+--   <root>/projects/<slug>/runs/<sid>/steer/<agent_id|ROOT>-<ms>.json … 未配達（Neovim が書く。0600）
+--   <root>/steer.pending                                              … どこかに未配達がある印（Neovim が作って消す）
+
+local STEER_EXPIRE_GRACE = 3 -- 秒。宛先が終わってからこれだけ待って期限切れにする（終わりの hook が配達する間を空ける）
+
+--- run のフォルダから記録の保存先（<root>）を逆算する
+local function root_of(run)
+  local r = run and run.dir and run.dir:match("^(.*)/projects/[^/]+/runs/[^/]+/?$")
+  return r or config.root()
+end
+
+local function flag_path(run) return root_of(run) .. "/steer.pending" end
+local function steer_dir(run) return run.dir .. "/steer" end
+
+local last_ms = 0
+--- 未配達ファイルの名前の <ms>（壁時計のミリ秒。同じ Neovim の中では必ず増える）
+local function new_ms()
+  local sec, usec = uv.gettimeofday()
+  local ms = sec and (sec * 1000 + math.floor(usec / 1000)) or os.time() * 1000
+  if ms <= last_ms then ms = last_ms + 1 end
+  last_ms = ms
+  return ms
+end
+
+--- 0600 で書いてから名前を付ける（途中の内容を hook に読ませない）
+local function write_private(path, text)
+  vim.fn.mkdir(util.dirname(path), "p")
+  local tmp = path .. ".tmp." .. tostring(uv.os_getpid())
+  local fd, err = uv.fs_open(tmp, "w", 384) -- 0600
+  if not fd then return false, err end
+  uv.fs_write(fd, text, -1)
+  uv.fs_close(fd)
+  uv.fs_chmod(tmp, 384)
+  local ok, rerr = uv.fs_rename(tmp, path)
+  if not ok then
+    os.remove(tmp)
+    return false, rerr
+  end
+  return true
+end
+
+local function touch_flag(run)
+  local p = flag_path(run)
+  if uv.fs_stat(p) then return true end
+  local fd = uv.fs_open(p, "a", 384)
+  if not fd then return false end
+  uv.fs_close(fd)
+  return true
+end
+
+--- 未配達ファイルの名前（<target>-<ms>.json。.delivered.json などは含まない）か
+local function is_pending_name(name)
+  return name:match("^[%w_%-]+%-%d+%.json$") ~= nil
+end
+
+--- どの run にも未配達ファイルが無ければ <root>/steer.pending を消す。消したら true
+local function sweep_flag(run)
+  local p = flag_path(run)
+  if not uv.fs_stat(p) then return false end
+  local root = root_of(run)
+  for _, f in ipairs(vim.fn.glob(root .. "/projects/*/runs/*/steer/*.json", false, true)) do
+    if is_pending_name(util.basename(f)) then return false end
+  end
+  os.remove(p)
+  return true
+end
+M._sweep_flag = sweep_flag
+
+--- Queue a steering instruction for an agent.
+---   via = "hook": writes <run>/steer/<agent_id>-<ms>.json (0600), touches <root>/steer.pending and records
+---   steer_requested. via = "terminal": records steer_requested only (the caller sends it, then mark_steer_sent).
+---@param run table
+---@param agent_id string "ROOT" or an agent id
+---@param text string the instruction (clipped to steer.text_max characters)
+---@param opts? { via?: "hook"|"terminal", kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string }
+---   kind = "notice" with notice_of = <steer_id>: a notice to the parent about an instruction delivered to its
+---   sub-agent (DESIGN-v0.2-steer appendix E; created by the UI). The state links them both ways
+---   (s.steers[id].notice_of and s.steers[notice_of].notice_id), so a second notice can be avoided.
+---@return string|nil steer_id, string|nil err  err: "no_run" | "bad_target" | "empty" | write error
+function M.request_steer(run, agent_id, text, opts)
+  opts = opts or {}
+  if not run or not run.dir or not run.state then return nil, "no_run" end
+  if type(agent_id) ~= "string" or not agent_id:match("^[%w_%-]+$") then return nil, "bad_target" end
+  if type(text) ~= "string" or not text:find("%S") then return nil, "empty" end
+  local scfg = config.get().steer or {}
+  text = brief.clip(text, tonumber(scfg.text_max) or 4000)
+  local via = opts.via == "terminal" and "terminal" or "hook"
+  local id = agent_id .. "-" .. tostring(new_ms())
+  if via == "hook" then
+    local body = util.json_encode({ id = id, agent_id = agent_id, text = text, created_at = util.iso_now(),
+      by = "nvim", lang = config.get().lang })
+    local ok, err = write_private(steer_dir(run) .. "/" .. id .. ".json", body or "")
+    if not ok then return nil, tostring(err) end
+    touch_flag(run)
+  end
+  M.emit(run, {
+    event = "steer_requested", steer_id = id, agent_id = agent_id, text = text, via = via,
+    prompt_id = opts.prompt_id or state_mod.latest_flow_id(run.state),
+    kind = opts.kind or "steer", redo_of = opts.redo_of, notice_of = opts.notice_of,
+  })
+  return id
+end
+
+--- Record that a terminal instruction was sent (steer_delivered, via = "terminal").
+---@return boolean
+function M.mark_steer_sent(run, steer_id)
+  local st = run and run.state and state_mod.steer_of(run.state, steer_id)
+  if not st then return false end
+  M.emit(run, { event = "steer_delivered", steer_id = steer_id, agent_id = st.agent_id, via = "terminal" })
+  return true
+end
+
+--- Cancel a pending instruction. Removes its file; if the file is gone, a hook already took it and
+--- nothing is recorded (returns false, "delivered").
+---@return boolean ok, string|nil err
+function M.cancel_steer(run, steer_id)
+  local st = run and run.state and state_mod.steer_of(run.state, steer_id)
+  if not st then return false, "unknown" end
+  if st.status ~= "PENDING" then return false, st.status:lower() end
+  if st.via ~= "terminal" then
+    local ok = os.remove(steer_dir(run) .. "/" .. steer_id .. ".json")
+    if not ok then return false, "delivered" end
+  end
+  M.emit(run, { event = "steer_cancelled", steer_id = steer_id })
+  pcall(sweep_flag, run)
+  return true
+end
+
+--- 宛先が終わったか（終わってから STEER_EXPIRE_GRACE 秒たったか）。理由の符号か nil
+local function expire_reason(s, st, now)
+  if s.ended_at then return "session_ended" end
+  if st.agent_id == "ROOT" then
+    -- ROOT は指示の番が終わって、その流れに動いているものが無ければ（止まっている ROOT には hooks で届かない）
+    local f = st.prompt_id and state_mod.flow_of(s, st.prompt_id)
+    local t = f and f.ended_at and util.parse_iso(f.ended_at)
+    if f and f.status == "DONE" and t and now - t >= STEER_EXPIRE_GRACE then return "agent_finished" end
+    return nil
+  end
+  local a = s.agents[st.agent_id]
+  if a and (a.status == "DONE" or a.status == "REWORK" or a.status == "FAILED") then
+    local t = util.parse_iso(a.finished_at)
+    if not t or now - t >= STEER_EXPIRE_GRACE then return "agent_finished" end
+  end
+  return nil
+end
+
+--- Expire pending instructions whose target finished (or whose session ended): remove the file and
+--- record steer_expired. Also removes <root>/steer.pending when no pending file is left anywhere.
+---@return boolean changed
+function M.sweep_steers(run, now)
+  if not run or not run.state or not run.dir then return false end
+  local s = run.state
+  now = now or os.time()
+  local changed = false
+  run._sweeping = true
+  local ok, err = pcall(function()
+    for _, sid in ipairs(vim.deepcopy(s.steer_order or {})) do
+      local st = s.steers[sid]
+      local reason = st and st.status == "PENDING" and expire_reason(s, st, now)
+      if reason then
+        local gone = true
+        if st.via ~= "terminal" then
+          local p = steer_dir(run) .. "/" .. sid .. ".json"
+          if uv.fs_stat(p) then
+            gone = os.remove(p) ~= nil
+          else
+            -- ファイルが無い：hook が取った（配達の記録が後から来る）なら何もしない
+            local taken = uv.fs_stat(steer_dir(run) .. "/" .. sid .. ".delivered.json")
+              or #vim.fn.glob(steer_dir(run) .. "/" .. sid .. ".delivering.*", false, true) > 0
+            gone = not taken
+          end
+        end
+        if gone then
+          M.emit(run, { event = "steer_expired", steer_id = sid, reason = reason })
+          changed = true
+        end
+      end
+    end
+  end)
+  run._sweeping = nil
+  if not ok then error(err) end
+  -- 印の掃除：何かが変わったとき、未配達が 0 になったとき、開いて最初の 1 回
+  local pending = (s.counts and s.counts.steers_pending) or 0
+  if changed or (pending == 0 and (run._steer_pending == nil or run._steer_pending > 0)) then
+    pcall(sweep_flag, run)
+  end
+  run._steer_pending = pending
   return changed
 end
 

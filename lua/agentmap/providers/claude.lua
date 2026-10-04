@@ -163,6 +163,21 @@ function M.normalize_hook(rec)
   end
   local who = rec.agent_id or "ROOT"
 
+  -- 修正指示の配達の記録（collector --steer が書いた行）。記録係の行ではないので、ほかの記録は作らない
+  if type(rec.steer) == "table" then
+    local st = rec.steer
+    local via = tostring(ev or "") .. (rec.tool_name and (":" .. rec.tool_name) or "")
+    for _, sid in ipairs(type(st.ids) == "table" and st.ids or {}) do
+      if type(sid) == "string" and sid ~= "" then
+        add("steer_delivered", {
+          steer_id = sid, agent_id = type(st.target) == "string" and st.target or who,
+          via = via, tool_use_id = rec.tool_use_id, mode = st.mode,
+        })
+      end
+    end
+    return out
+  end
+
   if ev == "SessionStart" then
     add("run_started", { cwd = rec.cwd, transcript_path = rec.transcript_path, source = rec.source })
     add("agent_started", { agent_id = "ROOT", cwd = rec.cwd })
@@ -222,6 +237,31 @@ function M.normalize_hook(rec)
         agent_id = who, tool_name = rec.tool_name, target = rec.target,
         tool_use_id = rec.tool_use_id, duration_ms = rec.duration_ms, cwd = rec.cwd,
       })
+      -- 手順表（TaskCreate / TaskUpdate / TaskList）。進み具合の事実（DESIGN-v0.2 §2.2）
+      local ti = rec.tool_input or {}
+      if rec.tool_name == "TaskCreate" then
+        local task = type(tr.task) == "table" and tr.task or {}
+        if task.id ~= nil then
+          add("task_created", {
+            agent_id = who, task_id = tostring(task.id), subject = task.subject or ti.subject,
+            active_form = ti.activeForm,
+          })
+        end
+      elseif rec.tool_name == "TaskUpdate" then
+        local sc = type(tr.statusChange) == "table" and tr.statusChange or nil
+        local tid = tr.taskId or ti.taskId
+        if sc and tid ~= nil and type(sc.to) == "string" then
+          add("task_updated", { agent_id = who, task_id = tostring(tid), status_from = sc.from, status_to = sc.to })
+        end
+      elseif rec.tool_name == "TaskList" and type(tr.tasks) == "table" then
+        local tasks = {}
+        for _, x in ipairs(tr.tasks) do
+          if type(x) == "table" and x.id ~= nil then
+            tasks[#tasks + 1] = { id = tostring(x.id), subject = x.subject, status = x.status }
+          end
+        end
+        add("task_listed", { agent_id = who, tasks = tasks })
+      end
     end
   elseif ev == "PostToolUseFailure" then
     if rec.tool_name == "Agent" then
@@ -375,6 +415,110 @@ function M.agent_batches(path, idx)
   end
   idx.off = idx.off + pos - 1
   return idx
+end
+
+local STEPS_MAX_BYTES = 20 * 1024 * 1024 -- 手順の目印を読む transcript の上限（これより先は読まない）
+
+--- 手順表を items にする：一覧（n, text）に、今までの印（done / start）を番号で当てる。一覧の数を超える印は捨てる
+local function build_steps(list, marks)
+  local items = {}
+  for i, it in ipairs(list) do items[i] = { n = it.n, text = it.text } end
+  for _, m in ipairs(marks) do
+    local it = items[m.n]
+    if it then
+      if m.kind == "done" then
+        it.done_at = it.done_at or m.ts
+      elseif m.kind == "start" then
+        it.started_at = it.started_at or m.ts
+      end
+    end
+  end
+  return items
+end
+
+--- Incrementally read the step list ("## Steps" / "## 手順") and step marks ("Step N done" / "手順 N 完了")
+--- from one agent's own transcript (assistant text blocks only).
+--- 手順表と済んだ印を、その Agent 自身の transcript の増えた分だけ読む（DESIGN-v0.2 §2.1 B）
+---   idx = { off = 読んだ位置, list = 最後の一覧 { {n, text} } | nil, marks = { {n, kind, ts} }（最後の一覧より後）,
+---           items = { {n, text, started_at?, done_at?} }（list に marks を当てたもの）, listed_at = ts, truncated = bool|nil }
+---   読むのは type == "assistant" の行の text ブロックだけ（tool_use の中身・tool_result・user 行は読まない）。
+---   一覧が 2 回以上出たら後の一覧が勝つ（済んだ印は番号で持ち越す）。一覧より前の印は捨てる。
+---   20 MB を超えたら、それより先は読まない（idx.truncated = true）
+---@return table idx
+function M.agent_steps(path, idx)
+  idx = idx or { off = 0 }
+  idx.off = idx.off or 0
+  idx.marks = idx.marks or {}
+  idx.items = idx.items or {}
+  local st = type(path) == "string" and uv.fs_stat(path)
+  if not st then return idx end
+  if st.size < idx.off then -- 作り直された
+    idx.off, idx.list, idx.marks, idx.items, idx.listed_at, idx.truncated = 0, nil, {}, {}, nil, nil
+  end
+  if idx.off >= STEPS_MAX_BYTES then
+    if st.size > idx.off then idx.truncated = true end
+    return idx
+  end
+  if st.size == idx.off then return idx end
+  local upto = math.min(st.size, STEPS_MAX_BYTES)
+  local f = io.open(path, "rb")
+  if not f then return idx end
+  f:seek("set", idx.off)
+  local data = f:read(upto - idx.off) or ""
+  f:close()
+  local changed = false
+  local pos = 1
+  while true do
+    local nl = data:find("\n", pos, true)
+    if not nl then break end -- 書きかけの最後の行は次回
+    if nl > pos then
+      local line = data:sub(pos, nl - 1)
+      -- 目印の語（Step / 手順）を含む assistant の text の行だけ decode する（大きな transcript でも軽く）
+      if line:find('"type":"assistant"', 1, true) and line:find('"type":"text"', 1, true)
+          and (line:find("[Ss][Tt][Ee][Pp]") or line:find("手順", 1, true)) then
+        local t = decode(line)
+        local msg = t and t.message
+        if t and t.type == "assistant" and type(msg) == "table" and type(msg.content) == "table" then
+          for _, b in ipairs(msg.content) do
+            if type(b) == "table" and b.type == "text" and type(b.text) == "string" then
+              for _, e in ipairs(brief.step_events(b.text)) do
+                if e.kind == "list" then
+                  idx.list = e.items
+                  idx.listed_at = t.timestamp
+                  -- 済んだ印は番号で持ち越す（新しい一覧の数を超えるものは捨てる）
+                  local keep = {}
+                  for _, m in ipairs(idx.marks) do
+                    if m.n <= #e.items then keep[#keep + 1] = m end
+                  end
+                  idx.marks = keep
+                  changed = true
+                elseif idx.list then -- 一覧より前の印は捨てる
+                  idx.marks[#idx.marks + 1] = { n = e.n, kind = e.mark, ts = t.timestamp }
+                  changed = true
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    pos = nl + 1
+  end
+  idx.off = idx.off + pos - 1
+  if upto < st.size then idx.truncated = true end -- 上限より先は読まない
+  if changed and idx.list then idx.items = build_steps(idx.list, idx.marks) end
+  return idx
+end
+
+--- The steps table for the state (a.steps) from an agent_steps index, or nil when there is no list.
+---@return table|nil { source = "transcript", listed_at, truncated?, items = { {n, text, started_at?, done_at?} } }
+function M.steps_of(idx)
+  if type(idx) ~= "table" or not idx.list or #(idx.items or {}) == 0 then return nil end
+  local items = {}
+  for i, it in ipairs(idx.items) do
+    items[i] = { n = it.n, text = it.text, started_at = it.started_at, done_at = it.done_at }
+  end
+  return { source = "transcript", listed_at = idx.listed_at, truncated = idx.truncated or nil, items = items }
 end
 
 --- The report from the last 64 KB of a child's transcript.
@@ -670,6 +814,7 @@ local function scan_transcript(path, agent_id, sid, out)
   local pending = {} -- tool_use_id → Agent 呼び出しの input
   local wfcall = {} -- tool_use_id → Workflow 呼び出しの input
   local asks = {} -- tool_use_id → AskUserQuestion 呼び出しの input
+  local tcreate, tlist, task_ord = {}, {}, 0 -- 手順表：TaskCreate 呼び出し（結果の id を待つ）・TaskList 呼び出し
   local cur -- 今読んでいる返事 { id = message.id, text = その返事の最後の text }（親の直前の発言を取るため）
   local function add(event, ts, fields) out[#out + 1] = mk(event, ts, sid, "transcript", fields) end
 
@@ -716,6 +861,16 @@ local function scan_transcript(path, agent_id, sid, out)
                   })
                 elseif b.name == "Workflow" then
                   wfcall[b.id] = input
+                elseif b.name == "TaskCreate" then
+                  -- id は結果（toolUseResult.task.id）から。無ければこの transcript 内で出た順に仮に振る
+                  task_ord = task_ord + 1
+                  tcreate[b.id] = { input = input, ts = ts, ord = task_ord }
+                elseif b.name == "TaskUpdate" then
+                  if input.taskId ~= nil and type(input.status) == "string" then
+                    add("task_updated", ts, { agent_id = agent_id, task_id = tostring(input.taskId), status_to = input.status })
+                  end
+                elseif b.name == "TaskList" then
+                  tlist[b.id] = true
                 elseif WRITE_TOOLS[b.name] or b.name == "Bash" then
                   add("tool_used", ts, {
                     agent_id = agent_id, tool_name = b.name, target = tool_target(b.name, input),
@@ -761,6 +916,30 @@ local function scan_transcript(path, agent_id, sid, out)
                   add("check_abandoned", ts, { tool_use_id = b.tool_use_id, reason = head(result_text(b.content)) })
                 end
                 asks[b.tool_use_id] = nil
+              elseif type(b) == "table" and b.type == "tool_result" and tcreate[b.tool_use_id] then
+                local c = tcreate[b.tool_use_id]
+                local tur = type(t.toolUseResult) == "table" and t.toolUseResult or {}
+                local task = type(tur.task) == "table" and tur.task or {}
+                if not b.is_error then
+                  add("task_created", c.ts, {
+                    agent_id = agent_id, task_id = tostring(task.id or c.ord),
+                    subject = brief.clip(type(task.subject) == "string" and task.subject or c.input.subject, brief.LIMITS.step_text),
+                    active_form = brief.clip(c.input.activeForm, brief.LIMITS.step_text),
+                  })
+                end
+                tcreate[b.tool_use_id] = nil
+              elseif type(b) == "table" and b.type == "tool_result" and tlist[b.tool_use_id] then
+                local tur = type(t.toolUseResult) == "table" and t.toolUseResult or {}
+                if type(tur.tasks) == "table" then
+                  local tasks = {}
+                  for _, x in ipairs(tur.tasks) do
+                    if type(x) == "table" and x.id ~= nil then
+                      tasks[#tasks + 1] = { id = tostring(x.id), subject = brief.clip(x.subject, brief.LIMITS.step_text), status = x.status }
+                    end
+                  end
+                  add("task_listed", ts, { agent_id = agent_id, tasks = tasks })
+                end
+                tlist[b.tool_use_id] = nil
               elseif type(b) == "table" and b.type == "tool_result" and pending[b.tool_use_id] then
                 local input = pending[b.tool_use_id].input
                 local lead = pending[b.tool_use_id].lead
@@ -791,7 +970,24 @@ local function scan_transcript(path, agent_id, sid, out)
     end
   end
   f:close()
+  -- 結果の行が無いまま終わった TaskCreate（途中で切れた transcript）は、出た順の仮の id で作る
+  local rest = {}
+  for _, c in pairs(tcreate) do rest[#rest + 1] = c end
+  table.sort(rest, function(x, y) return x.ord < y.ord end)
+  for _, c in ipairs(rest) do
+    add("task_created", c.ts, {
+      agent_id = agent_id, task_id = tostring(c.ord),
+      subject = brief.clip(c.input.subject, brief.LIMITS.step_text), active_form = brief.clip(c.input.activeForm, brief.LIMITS.step_text),
+    })
+  end
   return info
+end
+
+--- 手順の目印（## Steps）を transcript の全文に当てて、steps_updated を 1 件足す（無ければ足さない）
+local function backfill_steps(path, agent_id, ts, add)
+  local ok, idx = pcall(M.agent_steps, path, nil)
+  local steps = ok and M.steps_of(idx) or nil
+  if steps then add("steps_updated", ts, { agent_id = agent_id, steps = steps }) end
 end
 
 --- Rebuild a session without hooks from its transcript.
@@ -817,6 +1013,7 @@ function M.backfill(session_id, slug)
     if info.model then add("agent_updated", tl, { agent_id = "ROOT", model = info.model }) end
     if info.branch then add("agent_updated", tl, { agent_id = "ROOT", branch = info.branch }) end
     if info.last_text then add("turn_ended", tl, { last_head = head(info.last_text) }) end
+    backfill_steps(main, "ROOT", tl, add)
 
     -- 子・孫（subagents/**/agent-*.jsonl）
     local run_end = tl
@@ -840,6 +1037,7 @@ function M.backfill(session_id, slug)
         local tse = si.last_ts or ts0
         if si.model then add("agent_updated", tse, { agent_id = id, model = si.model }) end
         if si.branch then add("agent_updated", tse, { agent_id = id, branch = si.branch }) end
+        backfill_steps(p, id, tse, add)
         add("agent_finished", tse, {
           agent_id = id, transcript_path = p, last_head = head(si.last_text),
           report = (M.agent_report(p)),

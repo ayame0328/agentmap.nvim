@@ -421,4 +421,45 @@ do
   t.ok(r2.done and r2.direction and r2.reason, "agent_report_text_en.jsonl: 4 項目そろう")
 end
 
+-- ---------- 手順表：parse_steps / parse_step_marks（DESIGN-v0.2 §2.1 B） ----------
+t.eq(brief.parse_steps("了解。\n\n## Steps\n1. Read the current code\n2. Write the design\n3. Run the tests\n\n本文"),
+  { items = { { n = 1, text = "Read the current code" }, { n = 2, text = "Write the design" }, { n = 3, text = "Run the tests" } } },
+  "## Steps と番号付きの一覧")
+t.eq(brief.parse_steps("### 手順\n1) 読む\n2) 書く"), { items = { { n = 1, text = "読む" }, { n = 2, text = "書く" } } }, "### 手順 と 1)")
+t.eq(brief.parse_steps("## 手順（案）\n１．読む\n２．書く"), { items = { { n = 1, text = "読む" }, { n = 2, text = "書く" } } }, "全角の番号 １．と 見出しの後ろの（")
+t.eq(brief.parse_steps("## STEPS:\n\n  1. a\n  2. b"), { items = { { n = 1, text = "a" }, { n = 2, text = "b" } } },
+  "見出しは大小無視・後ろの : 可・見出し直後の空行と行頭の空白は可")
+t.eq(brief.parse_steps("## Steps to reproduce\n1. a"), nil, "見出しの後ろに別の語（Steps to …）は見出しではない")
+t.eq(brief.parse_steps("# Steps\n1. a"), nil, "# 1 つは見出しにしない")
+t.eq(brief.parse_steps("## Steps\n1. a\n3. b"), nil, "番号が飛ぶ塊は無視")
+t.eq(brief.parse_steps("## Steps\n2. a\n3. b"), nil, "1 から始まらない塊は無視")
+local many = { "## Steps" }
+for i = 1, 21 do many[#many + 1] = i .. ". s" .. i end
+t.eq(brief.parse_steps(table.concat(many, "\n")), nil, "21 個以上は無視")
+many[#many] = nil
+t.eq(#brief.parse_steps(table.concat(many, "\n")).items, 20, "20 個までは読む")
+local long = brief.parse_steps("## Steps\n1. " .. string.rep("あ", 80))
+t.eq(chars(long.items[1].text), 60, "本文は 60 文字で切る")
+t.eq(brief.parse_steps("## Steps\n1. a\n2. b\n本文が続く\n3. c"), { items = { { n = 1, text = "a" }, { n = 2, text = "b" } } },
+  "項目でない行で一覧は終わる")
+t.eq(brief.parse_steps("## Steps\n1. a\n\n## 手順\n1. x\n2. y"), { items = { { n = 1, text = "x" }, { n = 2, text = "y" } } },
+  "2 回出たら後の一覧が勝つ")
+t.eq(brief.parse_steps("## Steps\n1. a\n\n## Steps\n1. x\n3. y"), { items = { { n = 1, text = "a" } } },
+  "後の一覧が壊れていれば前の一覧のまま")
+t.eq(brief.parse_steps("ただの文"), nil, "一覧が無ければ nil")
+t.eq(brief.parse_steps(nil), nil, "nil → nil")
+
+t.eq(brief.parse_step_marks("Step 2 done"), { { n = 2, kind = "done" } }, "Step 2 done")
+t.eq(brief.parse_step_marks("- **手順 2 完了**"), { { n = 2, kind = "done" } }, "- **手順 2 完了**")
+t.eq(brief.parse_step_marks("step 2 DONE: tests pass"), { { n = 2, kind = "done" } }, "大小無視・後ろに文が続いてよい")
+t.eq(brief.parse_step_marks("Step 3 start"), { { n = 3, kind = "start" } }, "Step 3 start")
+t.eq(brief.parse_step_marks("・手順３開始"), { { n = 3, kind = "start" } }, "・と全角の番号、空白なし")
+t.eq(brief.parse_step_marks("* Step 1 done\nfoo\nStep 2 done"), { { n = 1, kind = "done" }, { n = 2, kind = "done" } }, "複数の印は出た順")
+t.eq(brief.parse_step_marks("Step 2 doneness"), {}, "done の後ろに英字が続けば別の語")
+t.eq(brief.parse_step_marks("I finished Step 2 done"), {}, "行頭でなければ印ではない")
+t.eq(brief.parse_step_marks("Step two done"), {}, "番号が無ければ印ではない")
+t.eq(brief.step_events("Step 1 done\n## Steps\n1. a\nStep 1 done"),
+  { { kind = "mark", n = 1, mark = "done" }, { kind = "list", items = { { n = 1, text = "a" } } }, { kind = "mark", n = 1, mark = "done" } },
+  "step_events は一覧と印を出た順に返す")
+
 t.done()

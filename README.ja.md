@@ -28,6 +28,11 @@ agentmap.nvim はその流れを、`START` から段を順にたどって `END` 
   理由と一緒に記録できます。記録は上書きせず履歴として残り、やり直しは同じエージェントの 2 回目として表示されます。
 - **書き出し。** 1 回の指示ぶんの図を Markdown・HTML・PDF に保存できます（Mermaid の図と文字の木を含む）。
   報告書やプルリクエストに貼るときに使えます。
+- **箱ごとの進み具合（%）。** 手順表の「済んだ数 ÷ 全部の数」を事実として出し、手順と手順の間だけを
+  過去の自分の記録から推定します。推定の数字には `~` が付きます。動いているエージェントへ入る線の上を
+  光の点が親から子へ流れ、エージェントが終わると数秒だけ子から親へ戻ります（下の「進み具合と光」）。
+- **動いているエージェントへの修正指示。** 動いている箱で `s` を押して直してほしいことを書くと、
+  子には次に道具を使う瞬間に、親（メインの Claude）には端末に打ち込む形で届きます（下の「動いているエージェントへの修正指示」）。
 
 ### 似た道具との違い
 
@@ -48,9 +53,12 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <保存先>/pr
 
 - Claude Code には「hooks」という、決まったときに外のプログラムを呼ぶ仕組みがあります。
   agentmap.nvim はこれで小さな記録係を呼び、出来事ごとに短い 1 行を書き足します。
-  記録係は何も表示せず、失敗しても Claude Code に影響を出さず、Claude Code の動きを変えることもありません。
+  記録係は失敗しても Claude Code に影響を出さず、Claude Code の動きを変えることもありません。
+  例外は 1 つだけで、あなたが書いた修正指示を届けるときは、そのエージェントの次の道具の呼び出しを止めて、指示を理由として渡します。
 - ほとんどの hooks は「待たせない」形で登録するので、Claude Code は記録を待ちません。
-  `Stop` と `SessionEnd` の 2 つだけは待たせる形です（数ミリ秒）。待たせない形だと、Claude Code の終了と同時に消えてしまったためです。
+  `Stop`・`SubagentStop`・`SessionEnd` は待たせる形です（数ミリ秒）。待たせない形だと Claude Code の終了と同時に消えてしまったためと、
+  終わり際にも修正指示を届けるためです。修正指示を届けるために、待たせる形の `PreToolUse` をもう 1 つ登録します。
+  中身は「未配達の印のファイルがあるか」を見るだけの 1 行のシェルで、届けるものが無ければ約 2 ミリ秒で抜けます。
 - Neovim はその記録を読むだけです。Claude Code が動いている間に Neovim を開いている必要はなく、あとから見られます。
 
 ## 必要なもの
@@ -59,7 +67,7 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <保存先>/pr
 |---|---|
 | Neovim | 0.10 以上 |
 | Python | 3（標準部品だけ）。`python3` → `python` → `py -3` の順に探します |
-| Claude Code | 2.1.283 〜 2.1.286 で確かめました（下の「対応している版」を参照） |
+| Claude Code | 2.1.283 〜 2.1.288 で確かめました（下の「対応している版」を参照） |
 | OS | Linux・macOS・WSL。Windows で直接動かす Neovim は**試験的な対応**です |
 
 なくても動くもの：`git`（差分の画面に使う）、[oil.nvim](https://github.com/stevearc/oil.nvim)（`w` キーでエージェントの作業フォルダを開く）、
@@ -100,6 +108,13 @@ snacks.nvim・telescope・fzf-lua・mini.pick のどれかをそのために設�
 
 hooks を入れる前のセッションも、Claude Code が残している会話の記録から `:AgentMapRuns` または `:AgentMapImport` で取り込めます。
 
+### 0.1.0 から上げたとき
+
+0.1.0 から上げたら、`:AgentMapInstallHooks` をもう一度実行してください。0.2.0 では、
+TaskCreate / TaskUpdate / TaskList（親の手順表）を記録し、修正指示を届ける待たせる形の `PreToolUse` を足し、
+`SubagentStop` を待たせる形に変えます。実行するまで `:checkhealth agentmap` は「古い」と出します。
+`steer.mode` か `steer.at_stop` を変えたときも、hooks のコマンドに書き込まれる値なので、もう一度実行してください。
+
 ### Claude Code を使わずに試す
 
 ```sh
@@ -126,6 +141,7 @@ sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 | `:AgentMapReview {番号\|ID} {PASS\|RETRY\|ESCALATE\|SUBMIT} [理由]` | レビューを記録する |
 | `:AgentMapInstallHooks [settings.json]` | Claude Code に記録用の hooks を登録する |
 | `:AgentMapImport [session_id]` | 会話の記録から実行を取り込む |
+| `:AgentMapSteer {番号\|ID} [本文]` | エージェントに修正指示を送る（本文が無ければ書く窓を開く） |
 
 ### 図の画面のキー
 
@@ -143,6 +159,7 @@ sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 | `d` | そのエージェントの変更の差分（git diff） |
 | `w` | そのエージェントの作業フォルダへ移動 |
 | `a` | レビュー（提出 / PASS / RETRY / ESCALATE / 再実行の記録 / 名前を付ける） |
+| `s` | 修正指示を書く（下の「動いているエージェントへの修正指示」） |
 | `e` | 書き出し |
 | `r` | 読み直し |
 | `R` | 過去の実行の一覧 |
@@ -151,9 +168,44 @@ sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 | `q` | 閉じる |
 
 詳細・会話の記録・差分の画面では、`BS` で 1 つ前の画面に戻り、`q` で閉じ、`Enter` でその行の
-エージェント・親・HUMAN CHECK を開きます。`t` / `d` / `w` / `a` は図の画面と同じです。
+エージェント・親・HUMAN CHECK を開きます。`t` / `d` / `w` / `a` / `s` は図の画面と同じです。
 
 図が画面の幅に入らないときは、一覧（木の形）で開きます。`v` で切り替えられます。
+
+### 進み具合と光
+
+箱には、経過時間の隣に進み具合が出ます。
+
+```
+[RUNNING] ~62.4% 12:34      推定：先頭に "~"
+[REVIEW] 66.6% 12:34        事実だけ（3 つの手順のうち 2 つが済んだ）
+[DONE] 100.0% 15:02
+```
+
+- **事実として数えるもの。** そのエージェントの手順表の「済んだ手順の数 ÷ 全部の手順の数」です。
+  親（メインの Claude）は自分の手順表を TaskCreate / TaskUpdate で作り、hooks がそれを記録します。
+  子はこの道具を使えない（Claude Code 2.1.288）ので、文章で `## 手順` と `手順 N 完了` を書きます（下の「書き方の決まり」）。
+  詳細画面に手順の一覧が出ます。
+- **推定するもの（`~`）。** いま実行中の手順の中だけです。「経過時間 ÷ 似た作業の典型的な時間」で埋めます。
+  典型的な時間は、あなた自身の過去の記録の中央値です（エージェントの種類とモデルごと。手順ごとの記録がまだ無い間は、
+  1 件ぶんの時間を手順の数で割ったもの）。親の実行中の手順は、動いている子の進み具合の平均で埋めます。
+  数字は切り捨てで、エージェントが終わるまで 100 にはなりません。実際より進んで見えないようにするためです。
+  エージェントが手順表を書き直すと、数字が下がることがあります。
+- **手順表の無い箱**は、経過時間だけから推定します（経過時間 ÷ 典型的な時間、上限 95.0%）。これにも `~` が付きます。
+  数字を出したくなければ `progress.no_steps = "none"` にします。
+- **典型的な時間**は、終わったエージェントの記録から作ります（`:checkhealth agentmap` に件数が出ます）。
+  記録が無い間は 1 件 10 分（`progress.default_ms`）とみなします。記録が増えるほど当たるようになり、
+  手順ごとの時間は 0.2.0 で手順の記録が十分に溜まってから使われます。
+- **毎秒の描き直し。** 動いているものがある間は、図を 1 秒ごとに描き直します（変わった行だけ）。
+  典型的な時間が長いと、小数点以下は数秒に 1 回しか変わりません。図が隠れているときや別のタブにいる間は止まります。
+  書き出しには、書き出した時点の値が入ります。
+- **光。** 図（箱の形）では、`[RUNNING]` のエージェントへ入る線の上を、光の点が親から子の向きに流れ続けます。
+  そのエージェントが終わった瞬間に、同じ線を子から親の向きに 3 秒だけ流れて止まります（`animation.back_ms`）。
+  あなたの答えを待っている HUMAN CHECK へ入る線には、紫の光が流れます。動くのは色だけで、文字は書き換えません。
+  光る線が無いときはタイマーも止まります。一覧（木の形）では光りません。色が 16 色より少ない端末では、光の頭を太字と反転で描きます。
+- `progress = false` で箱の中の数字を消します（詳細画面と書き出しには出ます）。`animation = false` で光を完全に止めます。
+- あとで推定の当たり外れを確かめるため、動いている箱ごとに 30 秒に 1 行と、終わったときに 1 行を
+  `<保存先>/progress_log.jsonl` に書きます（`progress.log = false` で止まります）。誤差の中央値は `:checkhealth agentmap` に出ます。
 
 ### 画面の言葉
 
@@ -190,8 +242,37 @@ require("agentmap").setup({
     pdf_command = nil,         -- PDF にするコマンド（%{html} %{out} %{title} を置き換える）。nil → PDF は使えない
   },
   brief = { markers = nil },   -- 予約のみ（目印の言葉を変える機能は今後の予定）
+  progress = {                 -- false を渡すと { enabled = false }
+    enabled = true,            -- 箱に % を出す（false: 箱だけ消す。詳細画面と書き出しには出る）
+    tick_ms = 1000,            -- 動いているものがある間、図を描き直す間隔（% と経過時間が動く）
+    default_ms = 600000,       -- 過去の記録が無いときの、エージェント 1 件の典型的な時間（10 分）
+    min_samples = 3,           -- 種類・モデルごとの中央値を使うのに要る件数
+    no_steps = "time",         -- 手順表の無い箱："time" = 経過時間から推定（上限 95.0）| "none" = 出さない
+    log = true,                -- 推定の答え合わせ用に <保存先>/progress_log.jsonl を書く
+  },
+  animation = {                -- false を渡すと { enabled = false }
+    enabled = true,
+    frame_ms = 100,            -- 1 コマの長さ
+    period = 6,                -- 光の点と点の間隔（文字数）
+    tail = 2,                  -- 光の頭の後ろの尾の長さ（文字数）
+    back_ms = 3000,            -- エージェントが終わったあと、子から親へ流す時間
+    max_paths = 40,            -- 同時に光らせる線の上限
+  },
+  steer = {                    -- false を渡すと { enabled = false }
+    enabled = true,            -- false: 配達用の hooks を登録しない。s を押すと「無効」と知らせる
+    mode = "deny",             -- "deny": 次の道具を止めて理由として届ける | "context": 道具はそのまま動かし、文として添える
+    at_stop = true,            -- 終わろうとした瞬間にも届ける（1 回だけ止めて続けさせる）
+    root_via = "terminal",     -- 親への届け方 "terminal" | "hook"
+    no_terminal = "hook",      -- Claude の端末が見つからないとき "hook" | "clipboard" | "none"
+    submit_delay_ms = 0,       -- 0: 本文と Enter を 1 回で送る。> 0: 本文のあと、この ms 待って Enter
+    input = "window",          -- "window"（浮かせた小さな窓）| "line"（1 行の入力）
+    text_max = 4000,           -- 文字数の上限
+  },
 })
 ```
+
+`steer.mode` と `steer.at_stop` は hooks のコマンドに書き込まれます。変えたら `:AgentMapInstallHooks` をもう一度実行してください
+（登録と設定が違うと `:checkhealth agentmap` が知らせます）。
 
 保存先のフォルダ名が `agentmap` ではなく `agentflow` なのはわざとです。公開前の版の記録をそのまま読めるようにしています。
 環境変数も、`$AGENTMAP_DIR` の古い名前 `$AGENTFLOW_DIR` をまだ読みます。
@@ -222,6 +303,8 @@ agentmap.nvim は次の見出しと項目名を機械的に読んで Neovim の�
 - 理由: なぜその方針にしたか
 - 残った課題: 無ければ「なし」
 
+作業中に利用者から修正指示を受けたときは、「方向」か「理由」に、受けた指示とそれで変えたことを書く。
+
 **子：人の確認が要るとき**。子は利用者に直接は聞けない。作業を止め、報告の代わりにこれを書いて終わる。
 
 ## 要確認
@@ -239,6 +322,11 @@ agentmap.nvim は次の見出しと項目名を機械的に読んで Neovim の�
 - 各 option の label は子の選択肢の名前をそのまま。description の末尾に「→ 選んだら: <進め方>」を入れる
 - 自分の判断で直接聞くときも同じ形（「〜について：」の部分は不要）
 - 答えが出たら、その答えに沿って続ける。子を起動し直すときは【目的】に「<答え> を選んだため」と書く
+
+**子：手順表（進み具合として読まれる）**。作業を始める前の最初の返答に `## 手順` と番号付きの手順
+（3〜8 個）を書き、1 つ終えるたびに `手順 N 完了` の行を書く。親（メインループ）は自分の手順表を
+TaskCreate / TaskUpdate で作る（Claude Code 2.1.288 では子はこの道具を使えない）。agentmap.nvim は
+済んだ手順の数を事実として数え、手順と手順の間は推定（`~`）として出す。
 ```
 
 読み取りの細かい規則は [docs/writing-convention.ja.md](docs/writing-convention.ja.md) にあります。
@@ -251,6 +339,46 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
 入っていなければ、質問した側の箱につながります。あなたがターミナルで答えるまでは紫の `[WAITING]`、
 答えると緑の `[DONE]` と答えが出ます。答えないまま終わったときは灰色の `[UNANSWERED]` です。
 箱の上で `Enter` を押すと、質問、選択肢ごとの「選んだらどう進むか」、子の「要確認」の中身が出ます。
+
+## 動いているエージェントへの修正指示
+
+箱の上で `s` を押すか、`:AgentMapSteer {番号|ID} [本文]` を実行して、エージェントに直してほしいことを書きます。
+小さな窓が開くので、書いたら `<C-s>`・`:w`・ノーマルモードの `Enter` のどれかで送ります。`q` で取り消します。
+届け方は箱によって変わります。
+
+| 箱 | 届け方 |
+|---|---|
+| 動いている子・孫・レビュー係 | **hooks で届ける。** 指示はその実行のフォルダに置かれ、そのエージェントが次に道具を使おうとした瞬間に、`PreToolUse` の hook がその道具を止めて、指示を理由として返します。道具を使わずに終わろうとしたときは、`SubagentStop` で 1 回だけ止めて指示を渡します（`steer.at_stop`）。 |
+| 親（ROOT、メインの Claude） | **端末に打ち込む。** この Neovim の中の `:terminal` で動いている `claude` に、`[AgentMap] <本文>` と Enter を送ります。Claude Code は作業中に打たれた文字を次の切れ目で読みます。止まっていれば新しい指示として始まります。 |
+| 終わった箱（`DONE` / `REWORK` / `FAILED`） | **親の端末へ、やり直しの依頼を送る。** 文面は `[AgentMap] エージェント [3]「<名前>」（id …、10:31 終了）をやり直してください：<本文>。同じ任せ方で、何が変わったかを報告してください。` です（英語の画面なら英語）。終わったエージェント自身にはもう届きません。差し戻し（REWORK）は自動では記録しません。やり直すかは親が決めます。 |
+
+子に指示が届くと、その親にも 1 回だけ知らせが届きます。届け方は、その親への普通の指示と同じです
+（親がメインの Claude なら端末、無ければ hooks。親が子エージェントなら hooks）。文面は
+`[AgentMap] The user sent this instruction directly to your sub-agent [2] "<名前>": <本文>. If it also affects other sub-agents or your plan, update them.`
+のような形です（モデル向けの文なので、画面の言葉によらず英語です）。親がもう終わっていれば送りません。子には、報告の中で受けた指示に触れるよう頼みます。
+
+知っておくこと：
+
+- 子には、指示が `PreToolUse:Write hook error: [AgentMap] Steering instruction from the user, typed in Neovim while you
+  were working (this is not a tool error): …` という 1 行で見えます。「hook error」の語は Claude Code が付けるもので消せません。
+  止めた道具の呼び出しは実行されず、子は指示を読んでから呼び直します（または別の道具を使います）。
+  `steer.mode = "context"` にすると、道具は止めずに、指示を文として添えます。
+- 終わり際に止めると、Claude Code の端末に `Stop hook error occurred` と出ます。止めるのが 8 回続くと
+  Claude Code が強制的に終わらせる（`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`）ので、止まり続けることはありません。
+- エージェントはたいてい指示に従いますが、必ずではありません。試したところ、親を Haiku で動かすと hooks で届けた指示に
+  6 回中 1 回も従わず、Opus と Sonnet は従いました。親には端末から届けるのはこのためです。
+- Claude の端末が見つからないとき（別の端末の窓で Claude Code を動かしているときなど）は、親が次に道具を使う瞬間に
+  hooks で届けます（`steer.no_terminal = "hook"`）。クリップボードにコピーする（`"clipboard"`）、送らない（`"none"`）も選べます。
+  Claude の端末が複数あれば、その実行のフォルダで動いているものを使い、決まらなければ 1 回だけ選んでもらいます。
+  送ったあとは端末を一度見てください。Claude Code が別の質問（フォルダを信頼するかの確認など）で止まっていても、agentmap.nvim には分かりません。
+- 箱の 4 行目に、届く前の指示があれば ` ✎1`（紫）、届けてから 1 分の間は ` ✎`（緑）、
+  届く前にエージェントが終わってしまったら ` ✎!`（赤）が出ます（そのときは知らせも出ます）。
+  詳細画面に指示の一覧と全文が出ます（行の上で `Enter` を押すと全文を開きます）。まだ届いていない指示は
+  `s` →「未配達を取り消す」で取り下げられます。書き出しには「修正指示」の節が入ります。
+- 置き場所：届く前の指示は `<保存先>/projects/<プロジェクト>/runs/<セッション>/steer/<エージェント>-<時刻>.json`
+  （自分だけが読み書きできる 0600）、`<保存先>/steer.pending` は hooks のシェルが見る印です。届けたものは
+  `*.delivered.json` に名前が変わります。同じユーザーで動くプログラム（エージェントの Bash を含む）はこのファイルを書けるので、
+  覚えのない指示が届いていないか、詳細画面の全文で確かめられます。
 
 ## レビューと判定係
 
@@ -311,6 +439,9 @@ export = { pdf_command = { "/mnt/c/Program Files/Google/Chrome/Application/chrom
 - 道具の名前と対象：Write / Edit ならファイルの場所、Bash ならコマンドの 1 行目（120 文字まで）
 - AskUserQuestion の質問・選択肢・答え（長いものは切る）
 - 子の最後の報告（2000 文字まで）と、最後の発言の先頭 200 文字
+- 手順表：TaskCreate の件名と `## 手順` の各項目（各 60 文字まで）と、その状態の変化。TaskCreate の説明文（description）は保存しない
+- **修正指示の本文はあなたが書いたまま**（伏せ字にしない。4000 文字まで）。`events.jsonl` と `steer/*.delivered.json` に残る
+- `progress_log.jsonl`（推定の値と実際にかかった時間。文章は入らない）と `stats.json`（かかった時間の中央値）
 
 保存しないもの：
 
@@ -337,18 +468,24 @@ Claude Code が hooks に渡す中身には版の番号が入っていません�
 | Claude Code | 確かめた日 | 備考 |
 |---|---|---|
 | 2.1.283 〜 2.1.286 | 2026-10-01 | `tests/fixtures/` の実物の hooks の中身は 2.1.283 から採取 |
+| 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList の中身。修正指示（止めたときの文言、`stop_hook_active`、動いている `claude` への打ち込み） |
 
-使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion）、
-`PostToolUse`（Agent・AskUserQuestion・Write・Edit・MultiEdit・NotebookEdit・Bash・EnterWorktree・ExitWorktree）、
+使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion。修正指示用に全部の道具・待たせる形でもう 1 つ）、
+`PostToolUse`（Agent・AskUserQuestion・Write・Edit・MultiEdit・NotebookEdit・Bash・EnterWorktree・ExitWorktree・TaskCreate・TaskUpdate・TaskList）、
 `PostToolUseFailure`（Agent・AskUserQuestion）、`SubagentStart`、`SubagentStop`、`Stop`、`SessionEnd`。
 知らない種類の出来事は無視するので、Claude Code に hooks の種類が増えても壊れません。
-許可の判断を返せる `PermissionRequest` は使わないので、agentmap.nvim が何かを許可したり止めたりすることはありません。
+許可の判断を返せる `PermissionRequest` は使わないので、agentmap.nvim が何かを許可することはありません。
+道具の呼び出しを止めるのは、あなたが書いた修正指示を届けるときだけです（`steer.enabled = false` でその hook を外せます）。
+
+2.1.288 での注意：子は TaskCreate を使えないので、`## 手順` の書き方で手順表を作ります。止めた道具の呼び出しは、
+モデルには `PreToolUse:<道具> hook error: <理由>` と見えます。hooks で届けた指示に親が従うかは、モデルによって違います。
 
 記録の形式には版の番号（`_v`）があり、古い版で書いた記録も読めます。
 
 ## いまの状態と今後
 
-v0.1.0 は、作者が自分の仕事のために作った道具を公開した最初の版です。Issue への返事は週に数回で、約束はできません。
+v0.1.0 は、作者が自分の仕事のために作った道具を公開した最初の版です。v0.2.0 で進み具合・光・修正指示を足しました。
+Issue への返事は週に数回で、約束はできません。
 
 予定していること：
 
@@ -356,6 +493,7 @@ v0.1.0 は、作者が自分の仕事のために作った道具を公開した�
 - 書き方の決まりの**目印の言葉を自分で決める**設定（`brief.markers`。いまは予約だけ）
 - 古い記録の自動の片付け
 - Windows で直接動かす Neovim：不具合を直して、試験的な対応を外す
+- 手順ごとの典型的な時間は、記録が溜まるほど当たるようになる（0.2.0 から記録を始める）
 
 不具合の報告には、`:checkhealth agentmap` の結果と `hooks.jsonl` の数行があると助かります（個人の情報が入っていないか先に確かめてください）。
 [CONTRIBUTING.md](CONTRIBUTING.md)（英語）も見てください。

@@ -337,4 +337,110 @@ t.run("review fixes: question prefix and label spacing", function()
   t.ok(text(cq2):find("%(child's report%)%S") == nil, "名札と値がくっつかない")
 end)
 
+
+-- ------------------------------------------------------------
+-- v0.2.0：進み具合・手順の節（DESIGN-v0.2 §2.6）と修正指示の節（DESIGN-v0.2-steer §6.4）。担当 W2
+-- ------------------------------------------------------------
+t.run("v0.2 detail: progress, steps, steering", function()
+  local NOW = 1790600000
+  local function iso(sec) return os.date("!%Y-%m-%dT%H:%M:%S.000Z", sec) end
+  local STATS = { agents = { ["general-purpose|opus"] = { n = 10, median_ms = 360000 } }, steps = {},
+    all = { agents = { n = 10, median_ms = 360000 }, steps = { n = 0 } } }
+  local sp = fixture()
+  local a = sp.agents.a1
+  a.status, a.finished_at, a.elapsed_ms, a.agent_type, a.model = "RUNNING", nil, nil, "general-purpose", "claude-opus-5-5"
+  a.steps = { source = "transcript", listed_at = iso(NOW - 600), items = {
+    { n = 1, text = "Read the current code", done_at = iso(NOW - 400) },
+    { n = 2, text = "Write the design", done_at = iso(NOW - 70) },
+    { n = 3, text = "Run the tests", started_at = iso(NOW - 60) },
+  } }
+  local dp = detail.build(sp, a, { width = 120, now = NOW, stats = STATS })
+  t.matches(text(dp), "status   %[RUNNING%]  progress ~83%.3%% %(estimated%)", "状態の行に推定の %")
+  t.matches(text(dp), "\n  progress 2/3 steps done · step 3 running 1:00 %(typical 2:00%) · typical time: median of 10 past agents of the same type and model\n",
+    "2 行目：済んだ数と実行中の手順")
+  has(dp, "■ Steps (2/3)  source: \"## Steps\" in the transcript", "手順の見出し")
+  t.matches(text(dp), "\n  ✓ 1%. Read the current code%s+%d%d:%d%d → %d%d:%d%d\n", "済んだ手順")
+  t.matches(text(dp), "\n  ▶ 3%. Run the tests%s+%d%d:%d%d →  %(running 1:00, typical 2:00%)\n", "実行中の手順")
+  -- 目安を超えた
+  a.steps.items[3].started_at = iso(NOW - 500)
+  local dov = detail.build(sp, a, { width = 120, now = NOW, stats = STATS })
+  t.matches(text(dov), "step 3 running 8:20 %(longer than typical 2:00%)", "目安超え")
+  -- 事実だけ（REVIEW）
+  a.status = "REVIEW"
+  local df = detail.build(sp, a, { width = 120, now = NOW, stats = STATS })
+  t.matches(text(df), "status   %[REVIEW%]  progress 66%.6%%   ", "事実だけなら (estimated) が無い")
+  t.matches(text(df), "\n  progress 2/3 steps done\n", "2 行目は済んだ数だけ")
+  -- 手順表なし・時間だけ（付録 D）
+  local st = fixture()
+  local b = st.agents.a1
+  b.status, b.finished_at, b.elapsed_ms, b.started_at = "RUNNING", nil, nil, iso(NOW - 120)
+  b.agent_type, b.model = "general-purpose", "claude-opus-5-5"
+  local dt = detail.build(st, b, { width = 120, now = NOW, stats = STATS })
+  t.matches(text(dt), "progress ~33%.3%% %(estimated%)", "時間だけの推定")
+  t.matches(text(dt), "\n  progress no step list · estimated from elapsed time %(typical 6:00%)", "手順表なしと分かる文言")
+  hasnt(dt, "■ Steps", "手順表が無ければ節を出さない")
+  -- 手順表なし・推定もしない（DONE 以外で事実が無い）
+  local dn = detail.build(fixture(), fixture().agents.a2, { width = 120, now = NOW, stats = STATS })
+  t.ok(text(dn):find("status   %[DONE%]  progress 100%.0%%") ~= nil, "DONE は 100.0%")
+  -- 子の平均（ROOT）
+  local dr = detail.build(sp, sp.agents.ROOT, { width = 120, now = NOW, stats = STATS })
+  t.matches(text(dr), "\n  progress estimated from %d+ child agents", "子の平均から推定")
+
+  -- 修正指示の節
+  local ss = fixture()
+  ss.steers = {
+    ["a1-1"] = { id = "a1-1", agent_id = "a1", text = "資料は docs/v3 を読むこと", via = "hook", status = "DELIVERED",
+      requested_at = iso(NOW - 120), delivered_at = iso(NOW - 100), delivered_via = "PreToolUse:Write", n = 1 },
+    ["a1-2"] = { id = "a1-2", agent_id = "a1", text = "急いで", via = "hook", status = "PENDING", requested_at = iso(NOW - 10), n = 2 },
+    ["a1-3"] = { id = "a1-3", agent_id = "a1", text = "x", via = "hook", status = "EXPIRED", requested_at = iso(NOW - 5),
+      end_reason = "agent_finished", n = 3 },
+  }
+  ss.steer_order = { "a1-1", "a1-2", "a1-3" }
+  ss.agents.a1.steers = { "a1-1", "a1-2", "a1-3" }
+  ss.agents.a1.tools = { { ts = iso(NOW - 95), name = "Read", target = "docs/v3/a.md" } }
+  local ds = detail.build(ss, ss.agents.a1, { width = 140, now = NOW, stats = STATS })
+  local mk = require("agentmap.graph").steer_mark()
+  has(ds, "■ Steering (3)", "修正指示の見出し")
+  t.matches(text(ds), mk .. " #1 %d%d:%d%d:%d%d  DELIVERED %d%d:%d%d:%d%d at PreToolUse:Write  \"資料は docs/v3 を読むこと\"", "配達済み")
+  t.matches(text(ds), "→ next tool %d%d:%d%d:%d%d Read docs/v3/a%.md", "配達のあとの最初の道具")
+  has(ds, "PENDING (delivered at the next tool call)", "未配達")
+  has(ds, "NOT DELIVERED (the agent finished before its next tool call)", "届かないまま終了")
+  local hi = row_of(ds, "■ History")
+  local si = row_of(ds, "■ Steering (3)")
+  local ci = row_of(ds, "■ Human checks")
+  t.ok(hi and si and hi < si and (not ci or si < ci), "History の後・Human checks の前")
+  local li = row_of(ds, "急いで")
+  t.eq(ds.links[li], "steer:a1-2", "行に steer:<id> の印")
+  has(ds, "s steer", "footer に s steer")
+  hasnt(detail.build(fixture(), fixture().agents.a1, { width = 120, now = NOW, stats = STATS }), "■ Steering", "0 件なら節を出さない")
+  -- 親への知らせ（付録 E）：元の指示の下に「親に知らせた（届いた／未配達）」。知らせ自体は独立の行・印にしない
+  local sn = fixture()
+  sn.steers = {
+    ["a1-1"] = { id = "a1-1", agent_id = "a1", text = "docs/v3 を読む", via = "hook", status = "DELIVERED",
+      requested_at = iso(NOW - 120), delivered_at = iso(NOW - 100), delivered_via = "PreToolUse:Write", n = 1 },
+    ["ROOT-1"] = { id = "ROOT-1", agent_id = "ROOT", kind = "notice", notice_of = "a1-1", text = "[AgentMap] …",
+      via = "terminal", status = "DELIVERED", requested_at = iso(NOW - 99), delivered_at = iso(NOW - 99), delivered_via = "terminal" },
+    ["a1-2"] = { id = "a1-2", agent_id = "a1", text = "急いで", via = "hook", status = "DELIVERED",
+      requested_at = iso(NOW - 50), delivered_at = iso(NOW - 40), delivered_via = "PreToolUse:Bash", n = 2 },
+    ["ROOT-2"] = { id = "ROOT-2", agent_id = "ROOT", kind = "notice", notice_of = "a1-2", text = "[AgentMap] …",
+      via = "hook", status = "PENDING", requested_at = iso(NOW - 39) },
+  }
+  sn.steer_order = { "a1-1", "ROOT-1", "a1-2", "ROOT-2" }
+  sn.agents.a1.steers = { "a1-1", "a1-2" }
+  sn.agents.ROOT.steers = { "ROOT-1", "ROOT-2" }
+  local dn2 = detail.build(sn, sn.agents.a1, { width = 140, now = NOW, stats = STATS })
+  has(dn2, "■ Steering (2)", "知らせは数えない")
+  t.matches(text(dn2), "\n      → told the parent ROOT: SENT to the terminal %d%d:%d%d:%d%d", "親に知らせた（端末へ送信）")
+  t.matches(text(dn2), "\n      → told the parent ROOT: PENDING %(delivered at the next tool call%)", "親への知らせが未配達")
+  hasnt(detail.build(sn, sn.agents.ROOT, { width = 140, now = NOW, stats = STATS }), "■ Steering", "親の詳細に知らせを独立の指示として出さない")
+  local graph = require("agentmap.graph")
+  t.eq(graph.steer_marks(sn, sn.agents.ROOT, NOW), {}, "知らせで親の箱に印を増やさない")
+  require("agentmap.i18n").setup("ja")
+  t.matches(text(detail.build(sn, sn.agents.a1, { width = 140, now = NOW, stats = STATS })), "→ 親 ROOT に知らせた: 未配達", "日本語")
+  t.matches(require("agentmap.i18n").t("steer.notice_to_parent", { index = 2, name = "調査係", text = "v3 を読む" }),
+    "^%[AgentMap%] The user sent this instruction directly to your sub%-agent %[2%] \"調査係\": v3 を読む%. If it also affects",
+    "親への知らせの文（モデル向け。日本語の表でも英文）")
+  require("agentmap.i18n").setup("en")
+end)
+
 t.done()

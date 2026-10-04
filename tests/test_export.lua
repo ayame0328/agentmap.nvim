@@ -49,7 +49,7 @@ local function hand_state()
   }
 end
 
-local HEADINGS = { "## Run overview", "## Map", "## Agents", "## Reviews and rework",
+local HEADINGS = { "## Run overview", "## Map", "## Agents", "## Reviews and rework", "## Steering instructions",
   "## Final outputs", "## Changed files", "## Tool calls" }
 
 local function check_markdown(md, label)
@@ -86,12 +86,12 @@ t.matches(mer, "#quot;child#quot;", "ラベルの \" は #quot; に")
 t.matches(mer, "#91;1#93;", "ラベルの [ ] は文字コードに")
 t.matches(mer, "classDef done", "色の定義がある")
 t.matches(mer, "class n_a3 review", "REVIEW の色")
-t.matches(mer, 'n_a1%["[^"]*<br/>DONE ~100%%"%]', "Agent の箱に状態と進み具合（子 1 人中 1 人 DONE）")
-t.matches(mer, 'n_a3%["[^"]*<br/>REVIEW ~0%%"%]', "子のいる Agent には進み具合")
+t.matches(mer, 'n_a1%["[^"]*<br/>DONE 100%.0%%"%]', "DONE の Agent は 100.0%（事実なので ~ なし）")
+t.matches(mer, 'n_a3%["[^"]*<br/>REVIEW"%]', "手順表の無い REVIEW には % を出さない")
 t.matches(mer, "ROOT c0ffee01", "ROOT に run の短い ID")
-t.matches(mer, "DONE ~50%%", "ROOT の進み具合は子 2 人中 1 人 DONE で ~50%")
+t.matches(mer, 'n_ROOT%["[^"]*<br/>DONE 100%.0%%"%]', "終わった ROOT は 100.0%")
 t.matches(mer, 'n_x_y_z%["[^"]*<br/>FAILED"%]', "子の無い Agent に % は出さない")
-t.matches(md, "```text\nROOT  fable%-5%-1  %[DONE%] ~50%%", "文字の木の先頭")
+t.matches(md, "```text\nROOT  fable%-5%-1  %[DONE%] 100%.0%%", "文字の木の先頭")
 -- ROOT の子は時刻で 2 段（[1] 04:23–04:25 → [3] 04:26〜）に分かれる
 t.matches(md, "\n├─ Stage 1\n│  └─ %[1%] probe", "文字の木に Stage 1 と [1]")
 t.matches(md, "│     └─ %[2%] grand", "文字の木に孫（段の下で 1 段深い）")
@@ -153,6 +153,87 @@ if okb and type(small) == "table" then
 else
   t.skip("fixtures/state_small.lua が無い")
 end
+
+
+-- 6. 進み具合と手順（DESIGN-v0.2 §2.6）・修正指示（DESIGN-v0.2-steer §6.5）。時計と過去の記録は固定
+local NOW = 1790600000
+local function iso(sec) return os.date("!%Y-%m-%dT%H:%M:%S.000Z", sec) end
+local STATS = { agents = { ["general-purpose|opus"] = { n = 10, median_ms = 360000 } }, steps = {},
+  all = { agents = { n = 10, median_ms = 360000 }, steps = { n = 0 } } }
+local function prog_state()
+  return {
+    v = 1, run_id = "feed0001-0000-4000-8000-000000000001", cwd = "/tmp/proj/work", started_at = iso(NOW - 900),
+    order = { "ROOT", "a1", "a2" },
+    agents = {
+      ROOT = { id = "ROOT", status = "RUNNING", model = "claude-fable-5-1", children = { "a1", "a2" },
+        attempts = { { n = 1 } }, started_at = iso(NOW - 900) },
+      a1 = { id = "a1", index = 1, name = "調査係", agent_type = "general-purpose", model = "claude-opus-5-5",
+        parent_id = "ROOT", children = {}, status = "RUNNING", started_at = iso(NOW - 600), attempts = { { n = 1 } },
+        tools = { { ts = iso(NOW - 100), name = "Bash", target = "ls" } },
+        steps = { source = "transcript", listed_at = iso(NOW - 600), items = {
+          { n = 1, text = "Read the current code", done_at = iso(NOW - 400) },
+          { n = 2, text = "Write the design", done_at = iso(NOW - 70) },
+          { n = 3, text = "Run the tests", started_at = iso(NOW - 60) },
+        } } },
+      a2 = { id = "a2", index = 2, name = "レビュー係", agent_type = "general-purpose", model = "claude-opus-5-5",
+        parent_id = "ROOT", children = {}, status = "DONE", started_at = iso(NOW - 500), finished_at = iso(NOW - 300),
+        attempts = { { n = 1 } }, last_head = "OK" },
+    },
+    steers = {
+      ["a1-1"] = { id = "a1-1", agent_id = "a1", text = "資料は docs/v3 を読むこと。", via = "hook", status = "DELIVERED",
+        requested_at = iso(NOW - 120), delivered_at = iso(NOW - 100), delivered_via = "PreToolUse:Write" },
+      ["ROOT-1"] = { id = "ROOT-1", agent_id = "ROOT", text = "急いで", via = "terminal", status = "DELIVERED",
+        requested_at = iso(NOW - 90), delivered_at = iso(NOW - 90), delivered_via = "terminal" },
+      ["a2-1"] = { id = "a2-1", agent_id = "a2", text = "テストも", via = "hook", status = "EXPIRED",
+        requested_at = iso(NOW - 310), ended_at = iso(NOW - 300), end_reason = "agent_finished" },
+      ["a1-2"] = { id = "a1-2", agent_id = "a1", text = "まだ", via = "hook", status = "PENDING", requested_at = iso(NOW - 10) },
+    },
+    steer_order = { "a2-1", "a1-1", "ROOT-1", "a1-2" },
+  }
+end
+local mdp = export.to_markdown(prog_state(), { now = NOW, stats = STATS })
+check_markdown(mdp, "進み具合")
+t.matches(mdp, "| %[RUNNING%] ~83%.3%% |", "Agents 表の status に推定の %（2/3 ＋ 60 s / 120 s）")
+t.matches(mdp, "| %[DONE%] 100%.0%% |", "DONE は 100.0%")
+-- ROOT：手順表なし・子 a1 83.3 と a2 100 の平均 → 91.6
+t.matches(mdp, "| ROOT | ROOT | ROOT | main | fable%-5%-1 | %- | %[RUNNING%] ~91%.6%% |", "ROOT は子の平均")
+t.matches(mdp, 'n_a1%["[^"]*<br/>RUNNING ~83%.3%%"%]', "Mermaid の札にも同じ値")
+t.matches(mdp, "\n> Steps: 2/3 done · Progress: ~83%.3%%\n> ✓ 1%. Read the current code\n> ✓ 2%. Write the design\n> ▶ 3%. Run the tests\n",
+  "最終成果物に手順の行")
+t.matches(mdp, "\"~\" marks an estimate", "progress_note の新しい文")
+t.matches(mdp, "\n## Steering instructions\n", "修正指示の見出し")
+t.matches(mdp, "\n%- %[2%] レビュー係 — %d%d:%d%d:%d%d \"テストも\" → not delivered: the agent finished before its next tool call\n", "届かないまま終了")
+t.matches(mdp, "\n%- %[1%] 調査係 — %d%d:%d%d:%d%d \"資料は docs/v3 を読むこと。\" → delivered %d%d:%d%d:%d%d at PreToolUse:Write\n", "hook で配達")
+t.matches(mdp, "\n%- ROOT — %d%d:%d%d:%d%d \"急いで\" → sent to the terminal %d%d:%d%d:%d%d\n", "端末へ送信")
+t.matches(mdp, "→ pending at export time\n", "未配達")
+t.matches(mdp, "| Steering | 4 %(1 pending%) |", "概要の行")
+-- 親への知らせ（付録 E）：元の指示の下に 1 行。知らせは件数にも独立の行にも入れない
+local pn = prog_state()
+pn.steers["ROOT-n1"] = { id = "ROOT-n1", agent_id = "ROOT", kind = "notice", notice_of = "a1-1", text = "[AgentMap] notice",
+  via = "terminal", status = "DELIVERED", requested_at = iso(NOW - 99), delivered_at = iso(NOW - 99), delivered_via = "terminal" }
+table.insert(pn.steer_order, "ROOT-n1")
+local mdn = export.to_markdown(pn, { now = NOW, stats = STATS })
+t.matches(mdn, "→ delivered %d%d:%d%d:%d%d at PreToolUse:Write\n  %- told the parent ROOT: sent to the terminal %d%d:%d%d:%d%d\n", "親に知らせた行")
+t.ok(not mdn:find("[AgentMap] notice", 1, true), "知らせは独立の行にしない")
+t.matches(mdn, "| Steering | 4 %(1 pending%) |", "知らせは件数に入れない")
+-- 修正指示が 0 件
+t.matches(md, "\n## Steering instructions\n\n%(no steering instructions%)\n", "0 件の文")
+t.matches(md, "| Steering | 0 %(0 pending%) |", "0 件の概要")
+-- ROOT の手順表（TaskCreate）は ROOT の最終成果物に
+local ps = prog_state()
+ps.agents.ROOT.tasks = { order = { "1", "2" }, items = {
+  ["1"] = { id = "1", subject = "Plan", status = "completed" },
+  ["2"] = { id = "2", subject = "Delegate", status = "in_progress", started_at = iso(NOW - 700) },
+} }
+local mdr = export.to_markdown(ps, { now = NOW, stats = STATS })
+t.matches(mdr, "\n%*%*ROOT%*%*\n\n> Steps: 1/2 done · Progress: ~91%.6%%\n> ✓ 1%. Plan\n> ▶ 2%. Delegate\n", "ROOT の手順（1/2 ＋ 動いている子 83.3）")
+-- 日本語
+require("agentmap.i18n").setup("ja")
+local mdpj = export.to_markdown(prog_state(), { now = NOW, stats = STATS })
+t.matches(mdpj, "\n> 手順: 2/3 済 · 進み具合: ~83%.3%%\n", "日本語: 手順の行")
+t.matches(mdpj, "\n## 修正指示\n", "日本語: 修正指示の見出し")
+t.matches(mdpj, "| 修正指示 | 4 件（未配達 1） |", "日本語: 概要の行")
+require("agentmap.i18n").setup("en")
 
 -- 5. ファイルに書き出す（markdown / html / pdf）
 local dir = vim.fn.tempname()

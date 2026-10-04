@@ -1,5 +1,7 @@
 *agentmap.txt*    Live map of Claude Code agents inside Neovim
 
+Version: 0.2.0 (unreleased)
+
 Author:  ayame0328
 License: MIT
 Home:    https://github.com/ayame0328/agentmap.nvim
@@ -17,6 +19,8 @@ CONTENTS                                                    *agentmap-contents*
   8. Review ................................... |agentmap-review|
   9. Export ................................... |agentmap-export|
  10. Records and privacy ...................... |agentmap-privacy|
+ 11. Progress and the light ................... |agentmap-progress|
+ 12. Steering ................................. |agentmap-steer|
 
 ==============================================================================
 1. INTRODUCTION                                                *agentmap-intro*
@@ -27,11 +31,12 @@ The map updates while Claude Code works; runs are kept for later.
 
 Claude Code calls a small recorder (`bin/agentmap-collect`, Python 3) through
 its hooks. The recorder appends one short line per event to a file in the
-record folder; Neovim reads that file. The recorder never prints, never fails
-and never changes what Claude Code does.
+record folder; Neovim reads that file. The recorder never fails and never
+changes what Claude Code does, except to deliver a steering instruction you
+wrote (|agentmap-steer|).
 
 Requirements: Neovim 0.10+, Python 3, Claude Code (verified with 2.1.283 to
-2.1.286). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
+2.1.288). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
 Windows-native Neovim is experimental.
 
 ==============================================================================
@@ -46,6 +51,12 @@ Install with your plugin manager. `setup()` is optional. Then once:
 4. Paste the writing convention into your CLAUDE.md (|agentmap-convention|).
 
 Claude Code in a container: see `docs/containers.md` in the plugin folder.
+
+After upgrading from 0.1.0, run |:AgentMapInstallHooks| again: 0.2.0 records
+TaskCreate / TaskUpdate / TaskList, adds a synchronous PreToolUse hook that
+delivers steering, and makes SubagentStop synchronous. `:checkhealth agentmap`
+says "outdated" until then. Run it again after changing `steer.mode` or
+`steer.at_stop`.
 
 ==============================================================================
 3. COMMANDS                                                 *agentmap-commands*
@@ -78,6 +89,11 @@ Claude Code in a container: see `docs/containers.md` in the plugin folder.
         Import a run from Claude Code's transcript (default: the newest
         session of the current folder).
 
+:AgentMapSteer {n|id} [{text}]                                *:AgentMapSteer*
+        Send a steering instruction to agent number {n} (or ROOT, or the
+        agent {id}). Without {text} the editor window opens. See
+        |agentmap-steer|.
+
 ==============================================================================
 4. KEYS                                                         *agentmap-keys*
 
@@ -93,12 +109,13 @@ Map:
   t          transcript          d    git diff        w    working folder
   a          review              e    export          r    reload
   R          past runs           v    map / list      ?    key list
-  q          close
+  s          steer (|agentmap-steer|)                 q    close
 
 Detail, transcript and diff views:
   <BS>       back               q     close
-  <CR>       open the agent / parent / HUMAN CHECK on the line
-  t d w a    as in the map
+  <CR>       open the agent / parent / HUMAN CHECK on the line; on a
+             steering line, show or hide its full text
+  t d w a s  as in the map
 
 ==============================================================================
 5. CONFIGURATION                                              *agentmap-config*
@@ -114,9 +131,34 @@ Detail, transcript and diff views:
     keymaps = { global = false },
     review = { provider = "auto", rubric = nil },
     export = { html_command = nil, pdf_command = nil },
+    progress = {              -- false: { enabled = false }
+      enabled = true,         -- % in the boxes (details/exports keep it)
+      tick_ms = 1000,         -- redraw interval while something runs
+      default_ms = 600000,    -- typical agent time without history
+      min_samples = 3,        -- agents needed for a type+model median
+      no_steps = "time",      -- no step list: "time" (max 95.0) | "none"
+      log = true,             -- <root>/progress_log.jsonl
+    },
+    animation = {             -- false: { enabled = false }
+      enabled = true, frame_ms = 100, period = 6, tail = 2,
+      back_ms = 3000,         -- light flowing back after an agent finishes
+      max_paths = 40,
+    },
+    steer = {                 -- false: { enabled = false }
+      enabled = true,
+      mode = "deny",          -- "deny" | "context"
+      at_stop = true,         -- also deliver when the agent tries to finish
+      root_via = "terminal",  -- "terminal" | "hook"
+      no_terminal = "hook",   -- "hook" | "clipboard" | "none"
+      submit_delay_ms = 0,
+      input = "window",       -- "window" | "line"
+      text_max = 4000,
+    },
   })
 <
-The full list with defaults is in the README.
+The full list with defaults is in the README. `steer.mode` and `steer.at_stop`
+are written into the hook command; run |:AgentMapInstallHooks| after changing
+them.
 
 ==============================================================================
 6. WRITING CONVENTION                                     *agentmap-convention*
@@ -134,6 +176,12 @@ or, when it needs a decision, `## Needs confirmation` (`Working on:`,
 `Blocked at:`, `Question:`, `Options:`). Japanese markers (【目的】, ## 報告, ...)
 are always accepted too. The text to paste into CLAUDE.md is in
 `docs/writing-convention.md`.
+
+Step list (read as progress, |agentmap-progress|): the child writes `## Steps`
+and a numbered list (3-8 steps) in its first reply, then a line `Step N done`
+after each step (Japanese: `## 手順`, `手順 N 完了`). The main agent keeps its
+list with TaskCreate / TaskUpdate; sub-agents cannot use those tools in Claude
+Code 2.1.288.
 
 ==============================================================================
 7. HUMAN CHECK                                            *agentmap-human-check*
@@ -173,5 +221,71 @@ tool names and file names, the first 200 characters of prompts, the three
 convention lines, questions and answers, and the child's report (up to 2000
 characters). Full prompts, tool output and file contents are not stored.
 Strings that look like keys or passwords are replaced with `***`.
+Step lists keep up to 60 characters per step (TaskCreate descriptions are not
+stored). Steering instructions are stored as you wrote them (not redacted).
+
+==============================================================================
+11. PROGRESS AND THE LIGHT                                 *agentmap-progress*
+
+Each box shows a percentage next to its elapsed time:
+>
+  [RUNNING] ~62.4% 12:34      "~" = estimate
+  [REVIEW] 66.6% 12:34        fact only
+<
+Fact: finished steps / all steps of the agent's step list (TaskCreate /
+TaskUpdate for the main agent, `## Steps` in a sub-agent's transcript).
+Estimate (`~`): only the running step, filled in with elapsed time / the
+typical time of similar past agents (the median of your own records per
+agent type and model; 10 minutes without history). A parent's running step
+uses the average of its running children. Values are rounded down and stay
+below 100 until the agent finishes. Boxes without a step list are estimated
+from elapsed time only (at most 95.0); `progress.no_steps = "none"` shows no
+number for them. The map is redrawn once a second while something runs, and
+not while it is hidden or in another tab page.
+
+The light: in the map (box) view a dot of light runs along the line into each
+[RUNNING] agent, from parent to child. When the agent finishes, the same line
+flows back to the parent for `animation.back_ms` (3 s). The line into a HUMAN
+CHECK that waits for your answer flows in purple. Only highlights move
+(namespace `agentmap_anim`, priority 4200); the text is not changed, and the
+timer stops when nothing is lit. The list (tree) view has no light.
+
+Highlight groups (set with `default = true`, light and dark variants):
+  AgentMapFlow1..3        light into a running agent (1 = head)
+  AgentMapFlowBack1..3    light flowing back after it finished
+  AgentMapFlowWait1..3    light into a HUMAN CHECK waiting for an answer
+
+`progress = false` hides the numbers in the boxes; `animation = false` turns
+the light off. Estimates are logged to `<root>/progress_log.jsonl` for later
+checking (`progress.log`); `:checkhealth agentmap` shows the median error.
+
+==============================================================================
+12. STEERING                                                  *agentmap-steer*
+
+`s` on a box (or |:AgentMapSteer|) opens a small window: write the
+instruction, send with <C-s>, `:w` or <CR> in normal mode, cancel with `q`.
+
+  Running sub-agent    delivered through hooks: the PreToolUse hook stops
+                       its next tool call and returns the text as the
+                       reason; SubagentStop stops it once if it tries to
+                       finish first (`steer.at_stop`). The model sees
+                       `PreToolUse:<Tool> hook error: [AgentMap] ...`.
+  Main agent (ROOT)    typed into the |terminal| running `claude` in this
+                       Neovim as `[AgentMap] <text>` and Enter. Without such
+                       a terminal: `steer.no_terminal` ("hook", "clipboard"
+                       or "none").
+  Finished agent       a redo request is typed into the main agent's
+                       terminal; nothing is marked as rework automatically.
+
+When an instruction reaches a sub-agent, its parent is told once, by the
+same route as any instruction for that parent (not when it has finished).
+
+The box shows ` ✎1` while instructions wait, ` ✎` after delivery and ` ✎!`
+when the agent finished first. The detail view lists every instruction with
+its full text; `s` -> "Cancel pending" withdraws one not yet delivered.
+Undelivered text waits in `<run>/steer/<agent>-<ms>.json` (mode 0600) with
+the flag `<root>/steer.pending`. An agent usually follows the instruction,
+but it is not guaranteed (the main agent on Haiku ignored hook-delivered
+instructions in tests).
 
  vim:tw=78:ts=8:ft=help:norl:

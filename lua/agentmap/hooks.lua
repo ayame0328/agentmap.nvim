@@ -3,6 +3,10 @@
 --   Idempotent (the second run reports "no change"). Shows a diff and asks before writing; keeps the
 --   original as .bak-<timestamp>. Never runs on its own at startup.
 --   Command format (DESIGN §4.2): '<python>' '<plugin>/bin/agentmap-collect' --root '<root>'
+--   Steering (DESIGN-v0.2-steer §7): a second, synchronous PreToolUse hook (no matcher) guarded by a
+--   shell test, so Python only starts while an instruction is pending:
+--     [ -e '<root>/steer.pending' ] || exit 0; exec <record command> --steer --mode <mode>
+--   SubagentStop / Stop run synchronously with "--steer --mode <mode> --at-stop --record".
 local J = require("agentmap.jsonfmt")
 local i18n = require("agentmap.i18n")
 
@@ -12,7 +16,10 @@ M.MARK = "agentmap-collect"
 -- 改名前の名前。古い登録も「自分の分」として置き換える（残すと記録が二重になる。S3）
 M.LEGACY_MARKS = { "agentflow-collect" }
 
--- 登録するイベントと、対象の道具（matcher）。DESIGN §2 のとおり
+-- 登録するイベントと、対象の道具（matcher）。DESIGN §2 のとおり。
+--   3 つ目は { sync = 同期にする, steer = 修正指示を配達する, record = 配達と一緒に記録もする }。
+--   同じイベントに自分の登録が 2 つあることがある（PreToolUse：記録用と配達用）。
+--   設定（steer.enabled / at_stop）で絞った一覧は M.events() が返す。試験も M.events() を使う
 M.EVENTS = {
   { "SessionStart" },
   { "UserPromptSubmit" },
@@ -20,13 +27,62 @@ M.EVENTS = {
   -- 「許可の判断」を返せる PermissionRequest や、時刻しか増えない Notification は登録しない（設計書 §7.1）。
   -- PostToolUseFailure(AskUserQuestion) は Esc で取り消したとき何が来るか未確認なので、保険として登録だけする
   { "PreToolUse", "Agent|AskUserQuestion" },
-  { "PostToolUse", "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree" },
+  -- 修正指示の配達（全道具・同期・シェルの門番つき。未配達が無ければ約 2 ms で抜ける）
+  { "PreToolUse", nil, { sync = true, steer = true } },
+  -- TaskCreate / TaskUpdate / TaskList は手順表（進み具合の事実。DESIGN-v0.2 §2.2）
+  { "PostToolUse", "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList" },
   { "PostToolUseFailure", "Agent|AskUserQuestion" },
   { "SubagentStart" },
-  { "SubagentStop" },
-  { "Stop" },
-  { "SessionEnd" },
+  -- 記録＋配達（終わろうとした瞬間にも届けるため同期。配達しない設定なら今までの記録だけ）
+  { "SubagentStop", nil, { sync = true, steer = true, record = true } },
+  -- Stop と SessionEnd は配達が無くても同期（async だと Claude が先に終わって記録が取りこぼされる。
+  -- claude -p で実測：Stop は 2 回中 2 回、SessionEnd は 2 回中 1 回消えた。どちらも 50ms 以内で終わる）
+  { "Stop", nil, { sync = true, steer = true, record = true } },
+  { "SessionEnd", nil, { sync = true } },
 }
+
+-- 配達をしないときの同期の要否（Stop は記録の取りこぼし防止で同期のまま。SubagentStop は元の async）
+local SYNC_WITHOUT_STEER = { Stop = true, SessionEnd = true }
+
+--- 修正指示の設定（config.steer が無い版でも動くように既定を補う）
+local function steer_cfg(scfg)
+  if scfg == nil then
+    local ok, c = pcall(function() return require("agentmap.config").get().steer end)
+    scfg = ok and c or nil
+  end
+  if scfg == false then scfg = { enabled = false } end
+  if type(scfg) ~= "table" then scfg = {} end
+  return {
+    enabled = scfg.enabled ~= false,
+    mode = scfg.mode == "context" and "context" or "deny",
+    at_stop = scfg.at_stop ~= false,
+  }
+end
+
+--- The events to register for the given steering settings (default: config.get().steer).
+---   steer.enabled = false drops the delivery hook and puts SubagentStop / Stop back to recording only;
+---   at_stop = false does the same for SubagentStop / Stop only.
+---@param scfg? table|false
+---@return table[] list of { event, matcher?, opts? }
+function M.events(scfg)
+  local c = steer_cfg(scfg)
+  local out = {}
+  for _, e in ipairs(M.EVENTS) do
+    local o = e[3] or {}
+    if not o.steer then
+      out[#out + 1] = e
+    elseif o.record then
+      if c.enabled and c.at_stop then
+        out[#out + 1] = e
+      else
+        out[#out + 1] = { e[1], e[2], { sync = SYNC_WITHOUT_STEER[e[1]] or nil } }
+      end
+    elseif c.enabled then
+      out[#out + 1] = e
+    end
+  end
+  return out
+end
 
 local function notify(msg, lvl)
   vim.notify("AgentMap: " .. msg, lvl or vim.log.levels.INFO)
@@ -88,20 +144,53 @@ function M.default_cmd(opts)
   return table.concat(words, " ")
 end
 
---- 登録したい hooks の中身（settings.json の "hooks" の値）
-function M.desired(cmd)
+--- Commands of the steering hooks, built from the recording command.
+---   guard: [ -e '<root>/steer.pending' ] || exit 0; exec <record> --steer --mode <mode>   (PreToolUse)
+---   stop:  <record> --steer --mode <mode> [--at-stop] --record                           (SubagentStop / Stop)
+---@param opts? { record?: string, root?: string|false, mode?: string, at_stop?: boolean, python?: string[] }
+---   record   the recording command (default: default_cmd({ root = opts.root, python = opts.python }))
+---   root     record root whose steer.pending flag the guard tests (nil or false → config.root())
+---   mode / at_stop  default: config.get().steer
+---@return string|nil guard, string|nil stop   nil when no Python was found
+function M.steer_cmd(opts)
+  opts = opts or {}
+  local record = opts.record
+  if not record then
+    record = M.default_cmd({ root = opts.root, python = opts.python })
+    if not record then return nil, nil end
+  end
+  local c = steer_cfg(nil)
+  local mode = opts.mode or c.mode
+  local at_stop = c.at_stop
+  if opts.at_stop ~= nil then at_stop = opts.at_stop end
+  local root = opts.root
+  if not root then root = config().root() end
+  local flag = M.quote(slashes(root) .. "/steer.pending")
+  local guard = "[ -e " .. flag .. " ] || exit 0; exec " .. record .. " --steer --mode " .. mode
+  local stop = record .. " --steer --mode " .. mode .. (at_stop and " --at-stop" or "") .. " --record"
+  return guard, stop
+end
+
+--- 登録したい hooks の中身（settings.json の "hooks" の値）。
+---   cmd は記録用の command（文字列）。配達用の command はそこから作る（M.steer_cmd）。
+---   opts = { root = 門番が見る記録の保存先（nil/false → config.root()）, steer = 設定（既定 config.get().steer） }
+---   同じイベントに組が 2 つ並ぶことがある（PreToolUse：記録用 → 配達用の順）
+function M.desired(cmd, opts)
+  opts = opts or {}
+  local c = steer_cfg(opts.steer)
+  local guard, stop = M.steer_cmd({ record = cmd, root = opts.root, mode = c.mode, at_stop = c.at_stop })
   local hooks = J.object()
-  for _, e in ipairs(M.EVENTS) do
-    -- ふだんは async（Claude を待たせない）。ただし Stop と SessionEnd だけは同期にする。
-    -- async だと Claude が先に終わってしまい、この2つの記録が取りこぼされる
-    -- （claude -p で実測：Stop は 2 回中 2 回、SessionEnd は 2 回中 1 回消えた）。
-    -- どちらも1ターン・1セッションに1回しか来ず、記録は 50ms 以内で終わる。
-    local sync = (e[1] == "Stop" or e[1] == "SessionEnd")
-    local h = J.obj({ { "type", "command" }, { "command", cmd }, { "async", not sync }, { "timeout", 10 } })
+  for _, e in ipairs(M.events(opts.steer)) do
+    local o = e[3] or {}
+    local command = cmd
+    if o.steer then command = o.record and stop or guard end
+    local h = J.obj({ { "type", "command" }, { "command", command }, { "async", not o.sync }, { "timeout", 10 } })
     local group = J.object()
     if e[2] then J.set(group, "matcher", e[2]) end
     J.set(group, "hooks", J.array({ h }))
-    J.set(hooks, e[1], J.array({ group }))
+    if hooks[e[1]] == nil then J.set(hooks, e[1], J.array()) end
+    local list = hooks[e[1]]
+    list[#list + 1] = group
   end
   return hooks
 end
@@ -165,24 +254,31 @@ function M.merge(existing, desired)
   end
 
   for _, ev in ipairs(J.keys(desired)) do
-    local want = desired[ev][1]
+    local wants = desired[ev] -- そのイベントに置きたい自分の組（1 つか 2 つ）
     local list = hooks[ev]
     if type(list) ~= "table" then
-      J.set(hooks, ev, J.array({ J.copy(want) }))
+      J.set(hooks, ev, J.copy(wants))
     else
-      -- すでに全く同じものが 1 つだけあるなら、そのまま（並びも動かさない）
-      local ours, exact = 0, false
+      -- 自分の分がちょうど #wants 個あり、どれも置きたい組と全く同じなら、そのまま（並びも動かさない）
+      local ours = 0
       for _, group in ipairs(list) do
         if type(group) == "table" and type(group.hooks) == "table" then
           for _, h in ipairs(group.hooks) do
             if is_ours(h) then ours = ours + 1 end
           end
-          if J.equal(group, want) then exact = true end
         end
       end
-      if not (ours == 1 and exact) then
+      local all = true
+      for _, want in ipairs(wants) do
+        local found = false
+        for _, group in ipairs(list) do
+          if type(group) == "table" and J.equal(group, want) then found = true break end
+        end
+        if not found then all = false break end
+      end
+      if not (ours == #wants and all) then
         local stripped = strip(list)
-        stripped[#stripped + 1] = J.copy(want)
+        for _, want in ipairs(wants) do stripped[#stripped + 1] = J.copy(want) end
         hooks[ev] = stripped
       end
     end
@@ -290,7 +386,7 @@ function M.install(opts)
     existing = J.object()
   end
 
-  local merged, changed = M.merge(existing, M.desired(cmd))
+  local merged, changed = M.merge(existing, M.desired(cmd, { root = opts.root }))
   if not changed then
     say(i18n.t("hooks.no_change", { path = path }))
     return true, { changed = false, path = path }
@@ -342,43 +438,48 @@ function M.install(opts)
 end
 
 --- Registration state of settings.json:
----   "installed" every event of EVENTS has one of ours with the expected matcher set
----   "outdated"  every event has one of ours, but the (event, matcher) pairs differ from EVENTS
+---   "installed" the (event, matcher) pairs of ours equal those of M.events()
+---   "outdated"  every event has one of ours, but the (event, matcher) pairs differ from M.events()
+---               (e.g. registered by v0.1.0: no TaskCreate matcher and no steering hook)
 ---   "partial"   some events have ours, some not
 ---   "missing"   none (or no / unreadable file)
 --- The command text is not compared.
 ---@param path? string default: default_path()
+---@param scfg? table|false steering settings (default: config.get().steer)
 ---@return string
-function M.status(path)
+function M.status(path, scfg)
   path = path or M.default_path()
   local text = read(vim.uv.fs_realpath(path) or path)
   if not text then return "missing" end
   local ok, v = pcall(J.decode, text)
   if not ok or type(v) ~= "table" or type(v.hooks) ~= "table" then return "missing" end
-  -- 登録されている自分の分の (イベント, matcher) の組
-  local have = {}
+  -- 登録されている自分の分の (イベント, matcher) の組と、自分の分があるイベント
+  local have, have_ev = {}, {}
   for ev, list in pairs(v.hooks) do
     if type(list) == "table" then
       for _, group in ipairs(list) do
         if type(group) == "table" and type(group.hooks) == "table" then
           for _, h in ipairs(group.hooks) do
             if is_ours(h) then
-              have[ev .. "\0" .. tostring(group.matcher or "")] = ev
+              have[ev .. "\0" .. tostring(group.matcher or "")] = true
+              have_ev[ev] = true
             end
           end
         end
       end
     end
   end
-  local want, found = {}, 0
-  for _, e in ipairs(M.EVENTS) do
+  local want, want_ev, n_ev, found = {}, {}, 0, 0
+  for _, e in ipairs(M.events(scfg)) do
     want[e[1] .. "\0" .. (e[2] or "")] = true
-    for _, ev in pairs(have) do
-      if ev == e[1] then found = found + 1 break end
+    if not want_ev[e[1]] then
+      want_ev[e[1]] = true
+      n_ev = n_ev + 1
+      if have_ev[e[1]] then found = found + 1 end
     end
   end
   if found == 0 then return "missing" end
-  if found < #M.EVENTS then return "partial" end
+  if found < n_ev then return "partial" end
   for k in pairs(have) do
     if not want[k] then return "outdated" end
   end

@@ -3,15 +3,21 @@
 #  agentmap-collect -- recorder called by Claude Code hooks (part of agentmap.nvim)
 #
 #  Usage   : agentmap-collect [--root DIR | --root=DIR]   (hook payload JSON on stdin)
+#            agentmap-collect --root DIR --steer [--mode deny|context] [--at-stop] [--record]
 #  Input   : one hook payload (JSON) on stdin
 #  Output  : one line appended to <root>/projects/<slug>/runs/<session_id>/hooks.jsonl
+#  --steer : deliver pending steering instructions (<run>/steer/<target>-<ms>.json, written by
+#            Neovim) to the agent that is about to use a tool (PreToolUse) or to stop
+#            (SubagentStop / Stop with --at-stop). Prints the hook's JSON answer on stdout only
+#            when something was delivered, and records the delivery as one hooks.jsonl line.
+#            Without --record it writes no ordinary record (the recording hook is separate).
 #  Root    : --root -> $AGENTMAP_DIR -> $AGENTFLOW_DIR (deprecated) ->
 #            $XDG_DATA_HOME/nvim/agentflow -> ~/.local/share/nvim/agentflow
 #            (the folder name stays "agentflow" so existing records keep working)
 #
 #  Guarantees
-#    - Always exits 0 and never prints anything (must never disturb Claude Code).
-#      Unknown arguments are ignored. Failures go to <root>/collector.log only.
+#    - Always exits 0 and never prints anything except the --steer answer (must never
+#      disturb Claude Code). Unknown arguments are ignored. Failures go to <root>/collector.log only.
 #    - Keeps only the fields it needs; full prompts and full tool inputs are not stored.
 #      Secrets that look like keys or passwords are redacted.
 #    - Python 3 standard library only; no external commands (speed).
@@ -45,6 +51,15 @@ BRIEF_KEYS = (("purpose", "【目的】", "[Goal]"), ("reason", "【任せる理
 BRIEF_EN = {k: re.compile(re.escape(en), re.IGNORECASE | re.ASCII) for k, _ja, en in BRIEF_KEYS}
 # 値の終わり：次の改行・次の「【」・次の英語のマーカー
 BRIEF_STOP = re.compile("\n|【|" + "|".join(re.escape(en) for _k, _ja, en in BRIEF_KEYS), re.IGNORECASE | re.ASCII)
+TASK_TEXT = 60           # 手順表（TaskCreate）の subject / activeForm の上限文字数（brief.lua の LIMITS.step_text と同じ）
+TASK_LIST = 50           # TaskList の一覧を何件まで残すか
+STEER_TEXT = 4000        # 修正指示の本文の上限文字数
+STEER_BYTES = 16384      # これより大きい未配達ファイルは読まない（4000 文字 × UTF-8 の最大 4 バイト）
+STEER_HEAD = ("[AgentMap] Steering instruction from the user, typed in Neovim while you were working "
+              "(this is not a tool error):")
+STEER_TAIL = "Follow it from now on, then continue your task. Do not treat this as a test."
+# 子（ROOT 以外）への文の最後に足す 1 文（親にも知らせるため、報告に書いてもらう。DESIGN-v0.2-steer 付録 E）
+STEER_TAIL_CHILD = "Mention this instruction and what you changed because of it in your final report."
 COMMON = ("session_id", "hook_event_name", "cwd", "transcript_path",
           "prompt_id", "agent_id", "agent_type")
 
@@ -369,6 +384,25 @@ def build(d):
             rec["target"] = json.dumps(ti, ensure_ascii=False, separators=(",", ":"))[:TARGET]
             if tr is not None:
                 rec["response_head"] = str(tr)[:TARGET]
+        elif tool == "TaskCreate":
+            # 手順表（進み具合の事実）。description は長く画面に要らないので保存しない
+            rec["tool_input"] = {k: clip(ti.get(k), TASK_TEXT) for k in ("subject", "activeForm")
+                                 if isinstance(ti.get(k), str)}
+            if isinstance(tr, dict) and isinstance(tr.get("task"), dict) and tr["task"].get("id") is not None:
+                rec["tool_response"] = {"task": {"id": str(tr["task"].get("id")),
+                                                 "subject": clip(tr["task"].get("subject"), TASK_TEXT)}}
+        elif tool == "TaskUpdate":
+            rec["tool_input"] = {k: (str(ti.get(k)) if k == "taskId" else ti.get(k)) for k in ("taskId", "status")
+                                 if ti.get(k) is not None and (k == "taskId" or isinstance(ti.get(k), str))}
+            if isinstance(tr, dict) and isinstance(tr.get("statusChange"), dict):
+                rec["tool_response"] = {"taskId": str(tr.get("taskId") if tr.get("taskId") is not None else ti.get("taskId")),
+                                        "statusChange": {k: tr["statusChange"].get(k) for k in ("from", "to")
+                                                         if isinstance(tr["statusChange"].get(k), str)}}
+        elif tool == "TaskList":
+            tasks = tr.get("tasks") if isinstance(tr, dict) and isinstance(tr.get("tasks"), list) else []
+            rec["tool_response"] = {"tasks": [{"id": str(t.get("id")), "subject": clip(t.get("subject"), TASK_TEXT),
+                                               "status": t.get("status") if isinstance(t.get("status"), str) else None}
+                                              for t in tasks[:TASK_LIST] if isinstance(t, dict) and t.get("id") is not None]}
     elif ev == "PostToolUseFailure":
         rec["tool_use_id"] = d.get("tool_use_id")
         rec["tool_name"] = tool
@@ -434,8 +468,13 @@ def encode(rec):
         if qs:
             del qs[1:]
 
+    def shrink_tasks():
+        tr = rec.get("tool_response")
+        if isinstance(tr, dict) and isinstance(tr.get("tasks"), list):
+            del tr["tasks"][20:]
+
     steps = [lambda: drop_key("prompt_head"), lambda: drop_key("last_head"), lambda: drop_key("target"),
-             shrink_report, lambda: rec.pop("report", None), drop_desc, drop_more_questions]
+             shrink_report, lambda: rec.pop("report", None), drop_desc, drop_more_questions, shrink_tasks]
     line = dump()
     for step in steps:
         if len(line) <= limit:
@@ -463,39 +502,161 @@ def write_project(pdir, d, slug):
     os.replace(tmp, p)
 
 
+def opt_value(argv, name):
+    """--name VALUE / --name=VALUE を読む。無ければ None"""
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a[len(name) + 1:]
+    return None
+
+
+def log_error(root, e, ev):
+    """失敗は自分用の記録（collector.log）にだけ残す"""
+    try:
+        if root:
+            os.makedirs(root, exist_ok=True)
+            line = json.dumps({"ts": now_iso(), "error": (type(e).__name__ + ": " + str(e))[:300], "event": ev},
+                              ensure_ascii=False).encode("utf-8")
+            append(os.path.join(root, "collector.log"), line)
+    except Exception:
+        pass
+
+
+def steer_message(texts, child=False):
+    """モデルに渡す文（英語固定。本文だけ作者の言語）。子への文には報告に書く頼みを足す"""
+    return STEER_HEAD + "\n" + "\n\n".join(texts) + "\n" + STEER_TAIL + (" " + STEER_TAIL_CHILD if child else "")
+
+
+def take_steers(run, target):
+    """<run>/steer/ の <target>-<ms>.json を ms 順に取る（先に rename して取り合う＝二重配達しない）。
+    戻り値: [(steer_id, 本文)]。取れたものは <id>.delivered.json に名前を変える"""
+    sdir = os.path.join(run, "steer")
+    try:
+        names = os.listdir(sdir)
+    except OSError:
+        return []
+    pat = re.compile("^" + re.escape(target) + r"-(\d+)\.json$")
+    cands = sorted((int(m.group(1)), n) for n in names for m in [pat.match(n)] if m)
+    out = []
+    for _ms, name in cands:
+        src = os.path.join(sdir, name)
+        sid = name[:-len(".json")]
+        try:
+            if os.stat(src).st_size > STEER_BYTES:
+                continue  # 大きすぎるものは読まない（Neovim の掃除で期限切れになる）
+        except OSError:
+            continue
+        tmp = os.path.join(sdir, sid + ".delivering.%d" % os.getpid())
+        try:
+            os.rename(src, tmp)
+        except OSError:
+            continue  # 同時に動いた別の hook が取った
+        try:
+            with open(tmp, "rb") as f:
+                obj = json.loads(f.read(STEER_BYTES + 1))
+            text = obj.get("text") if isinstance(obj, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("empty steer text")
+        except Exception:
+            try:
+                os.rename(tmp, os.path.join(sdir, sid + ".broken.json"))
+            except OSError:
+                pass
+            continue
+        try:
+            os.rename(tmp, os.path.join(sdir, sid + ".delivered.json"))
+        except OSError:
+            pass
+        out.append((sid, text[:STEER_TEXT]))
+    return out
+
+
+def steer(root, d, run, argv):
+    """修正指示を配達する。配達したら hook の答え（JSON 文字列）を返す。何も無ければ None"""
+    ev = d.get("hook_event_name")
+    mode = opt_value(argv, "--mode")
+    if mode not in ("deny", "context"):
+        mode = "deny"
+    if ev in ("SubagentStop", "Stop"):
+        if "--at-stop" not in argv:
+            return None
+        used = "block"
+    elif ev == "PreToolUse":
+        used = mode
+    else:
+        return None
+    target = d.get("agent_id") if isinstance(d.get("agent_id"), str) and d.get("agent_id") else "ROOT"
+    got = take_steers(run, target)
+    if not got:
+        return None
+    rec = {k: d[k] for k in ("session_id", "hook_event_name", "tool_name", "tool_use_id", "agent_id", "prompt_id")
+           if d.get(k) is not None}
+    rec["steer"] = {"ids": [i for i, _t in got], "mode": used, "target": target}
+    rec["_v"] = 1
+    rec["_ts"] = now_iso()
+    rec["_src"] = "claude_hook"
+    try:
+        append(os.path.join(run, "hooks.jsonl"), json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception as e:
+        log_error(root, e, ev)
+    msg = steer_message([t for _i, t in got], child=(target != "ROOT"))
+    if used == "block":
+        out = {"decision": "block", "reason": msg}
+    elif used == "context":
+        out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                      "additionalContext": msg}}
+    else:
+        out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                      "permissionDecisionReason": msg}}
+    return json.dumps(out, ensure_ascii=False)
+
+
 def main():
+    """記録する（ふだん）・修正指示を配達する（--steer）。標準出力に書くものを返す（無ければ None）"""
+    argv = sys.argv[1:]
+    want_steer = "--steer" in argv
+    want_record = (not want_steer) or "--record" in argv
     root = None
     ev = None
+    answer = None
     try:
-        root = root_dir()
+        root = root_dir(argv)
         raw = sys.stdin.buffer.read(4 * 1024 * 1024)
         if not raw.strip():
-            return
+            return None
         d = json.loads(raw)
         if not isinstance(d, dict):
-            return
+            return None
         ev = d.get("hook_event_name")
         slug = safe_name(slug_of(d))
         pdir = os.path.join(root, "projects", slug)
         run = os.path.join(pdir, "runs", safe_name(d.get("session_id")))
-        os.makedirs(run, exist_ok=True)
-        if ev == "SessionStart" or not os.path.exists(os.path.join(pdir, "project.json")):
-            write_project(pdir, d, slug)
-        append(os.path.join(run, "hooks.jsonl"), encode(build(d)))
-    except Exception as e:  # 失敗は自分用の記録にだけ残す
+    except Exception as e:
+        log_error(root, e, ev)
+        return None
+    if want_record:
         try:
-            if root:
-                os.makedirs(root, exist_ok=True)
-                line = json.dumps({"ts": now_iso(), "error": (type(e).__name__ + ": " + str(e))[:300], "event": ev},
-                                  ensure_ascii=False).encode("utf-8")
-                append(os.path.join(root, "collector.log"), line)
-        except Exception:
-            pass
+            os.makedirs(run, exist_ok=True)
+            if ev == "SessionStart" or not os.path.exists(os.path.join(pdir, "project.json")):
+                write_project(pdir, d, slug)
+            append(os.path.join(run, "hooks.jsonl"), encode(build(d)))
+        except Exception as e:
+            log_error(root, e, ev)
+    if want_steer:
+        try:
+            answer = steer(root, d, run, argv)
+        except Exception as e:
+            log_error(root, e, ev)
+    return answer
 
 
 if __name__ == "__main__":
     try:
-        main()
+        _answer = main()
+        if _answer:
+            sys.stdout.write(_answer)  # 配達したときだけ（print は最後。配達したのに書けない、を作らない）
     except BaseException:
         pass
     try:

@@ -102,6 +102,115 @@ local function note_mark()
   return vim.fn.strdisplaywidth("💬") == 2 and "💬" or ">"
 end
 
+-- ✓ ▶ が 2 桁で表示される端末では + > にする
+local function step_marks()
+  local done = vim.fn.strdisplaywidth("✓") == 1 and "✓" or "+"
+  local run = vim.fn.strdisplaywidth("▶") == 1 and "▶" or ">"
+  return done, run
+end
+
+-- 詳細を開いた瞬間の時刻と過去の記録（extra に無ければここで取る）
+local function now_and_stats(extra)
+  local now = extra.now or os.time()
+  local stats = extra.stats
+  if stats == nil then
+    local ok, st = pcall(function()
+      return require("agentmap.stats").load(require("agentmap.config").root())
+    end)
+    stats = ok and st or nil
+  end
+  return now, stats
+end
+
+local function stat_basis_text(r)
+  if not r or not r.stat_basis then return nil end
+  if r.stat_basis == "default" then return t("detail.stat_basis_default") end
+  local key = ({ ["type+model"] = "detail.stat_basis_type_model", type = "detail.stat_basis_type",
+    all = "detail.stat_basis_all" })[r.stat_basis]
+  if not key then return nil end
+  return t("detail.stat_basis", { n = r.samples or 0, basis = t(key) })
+end
+
+--- Progress lines of the detail view (DESIGN-v0.2 §2.6). Returns the status-line part and the
+--- second line ("progress 2/3 steps done · step 3 running …"), both plain strings.
+function M.progress_lines(state, a, r)
+  local head
+  if not r then
+    head = t("detail.progress_none")
+  elseif r.estimated then
+    head = t("detail.progress_est", { pct = require("agentmap.progress").pct_text(r) })
+  else
+    head = t("detail.progress_fact", { pct = require("agentmap.progress").pct_text(r) })
+  end
+  local body
+  if r and (r.basis == "tasks" or r.basis == "steps" or ((r.basis == "done" or r.basis == "failed") and r.n)) then
+    body = t("detail.progress_steps", { k = r.k or 0, n = r.n or 0 })
+    if r.n_children then
+      body = body .. " · " .. t("detail.progress_children", { n = r.n_children })
+    elseif r.cur_elapsed_ms and r.expected_ms and r.k and r.n and r.k < r.n then
+      body = body .. t(r.over and "detail.progress_over" or "detail.progress_running", { n = r.k + 1,
+        elapsed = H.fmt_elapsed(r.cur_elapsed_ms), typical = H.fmt_elapsed(r.expected_ms) })
+    end
+  elseif r and r.basis == "children" then
+    body = t("detail.progress_children", { n = r.n_children or 0 })
+  elseif r and r.basis == "time" then
+    body = t(r.over and "detail.progress_time_over" or "detail.progress_time", { typical = H.fmt_elapsed(r.expected_ms) })
+  end
+  local sb = r and r.estimated and stat_basis_text(r)
+  if body and sb then body = body .. " · " .. sb end
+  return head, body
+end
+
+-- 手順の節（■ Steps）。tasks（道具）があればそれ、無ければ steps（目印）
+local function step_rows(a)
+  local tk = a.tasks
+  if type(tk) == "table" and type(tk.items) == "table" and next(tk.items) then
+    local ids, seen = {}, {}
+    for _, id in ipairs(tk.order or {}) do
+      if tk.items[id] and not seen[id] then
+        seen[id] = true
+        ids[#ids + 1] = id
+      end
+    end
+    local rest = {}
+    for id in pairs(tk.items) do
+      if not seen[id] then rest[#rest + 1] = id end
+    end
+    table.sort(rest, function(x, y) return (tonumber(x) or math.huge) < (tonumber(y) or math.huge) end)
+    vim.list_extend(ids, rest)
+    local rows = {}
+    for i, id in ipairs(ids) do
+      local it = tk.items[id]
+      rows[#rows + 1] = { n = tonumber(id) or i, text = it.subject or it.active_form or ("#" .. id),
+        state = it.status == "completed" and "done" or it.status == "in_progress" and "running" or "todo",
+        started_at = it.started_at or (it.status ~= "pending" and it.created_at or nil), done_at = it.done_at }
+    end
+    return rows, "tasks"
+  end
+  local sp = a.steps
+  if type(sp) == "table" and type(sp.items) == "table" and #sp.items > 0 then
+    local rows, prev, cur_found = {}, sp.listed_at, false
+    for _, it in ipairs(sp.items) do
+      local st = "todo"
+      if it.done_at then
+        st = "done"
+      elseif not cur_found then
+        st, cur_found = "running", true
+      end
+      rows[#rows + 1] = { n = it.n, text = it.text, state = st, started_at = it.started_at or (st ~= "todo" and prev or nil),
+        done_at = it.done_at }
+      if it.done_at then prev = it.done_at end
+    end
+    return rows, "steps", sp.truncated
+  end
+  return nil
+end
+
+local function hm(iso)
+  local s = H.fmt_clock(iso)
+  return s == "-" and "--:--" or s:sub(1, 5)
+end
+
 local function check_line(state, cid)
   local c = state.checks and state.checks[cid]
   if not c then return nil end
@@ -126,7 +235,7 @@ local function checks_for(state, a)
 end
 
 --- Build the detail lines of `agent` (pure). Returns { lines, marks, links }.
--- extra = { branch = "…", width = 列数, now = 秒,
+-- extra = { branch = "…", width = 列数, now = 秒, stats = stats.load() の結果（無ければ読む）,
 --           notes = { {ts, kind = "note"|"tool", text, tool, target}, … } | nil（transcript が読めないとき） }
 function M.build(state, agent, extra)
   extra = extra or {}
@@ -146,11 +255,14 @@ function M.build(state, agent, extra)
   b:add(t("detail.model_line", { model = model, req = or_dash(H.model_short(a.model_requested)),
     parent = (a.id == "ROOT" and "-" or label_of(state, a.parent_id)) }),
     a.parent_id and a.parent_id ~= "ROOT" and a.parent_id or nil)
-  local pr = graph.progress(state, a.id)
-  local el = H.elapsed_ms(a, extra.now)
-  b:add({ { "  status   " }, { graph.status_tag(st), shl },
-    { t("detail.progress", { value = (pr and ("~" .. pr.pct .. "% (" .. pr.done .. "/" .. pr.total .. ")") or "-") }) },
+  local now, stats = now_and_stats(extra)
+  local pcfg = graph.progress_opts({}).config
+  local pr = require("agentmap.progress").compute(state, a.id, { now = now, stats = stats, config = pcfg })
+  local el = H.elapsed_ms(a, now)
+  local phead, pbody = M.progress_lines(state, a, pr)
+  b:add({ { "  status   " }, { graph.status_tag(st), shl }, { "  " .. phead, pr and pr.estimated and "AgentMapRunning" or nil },
     { t("detail.started_elapsed", { start = H.fmt_clock(a.started_at), elapsed = (el and H.fmt_elapsed(el) or "-") }) } })
+  if pbody then b:add("  " .. H.fit(t("detail.progress_label"), 9) .. pbody) end
   b:add(t("detail.review_line", { reviews = a.review_count or 0, reworks = a.rework_count or 0 })
     .. (a.escalated_to and t("detail.escalated_to", { label = label_of(state, a.escalated_to) }) or ""))
   b:add("  cwd      " .. or_dash(a.cwd or state.cwd))
@@ -158,6 +270,39 @@ function M.build(state, agent, extra)
   local tp = a.transcript_path or (a.id == "ROOT" and state.root_transcript) or nil
   b:add("  transcript " .. or_dash(tp))
   if a.error_head then b:add({ { "  error    " .. error_text(a.error_head), "AgentMapFailed" } }) end
+
+  -- 手順（DESIGN-v0.2 §2.6）：✓ 済み / ▶ 実行中 / 空白 まだ
+  local rows, src, truncated = step_rows(a)
+  if rows then
+    local k = 0
+    for _, r in ipairs(rows) do if r.state == "done" then k = k + 1 end end
+    b:add("")
+    b:add({ { t("detail.h_steps", { k = k, n = #rows,
+      source = t(src == "tasks" and "detail.steps_source_tasks" or "detail.steps_source_steps") }), "AgentMapHeader" } })
+    local mdone, mrun = step_marks()
+    local tw = 0
+    for _, r in ipairs(rows) do tw = math.max(tw, H.dw(tostring(r.n) .. ". " .. H.oneline(r.text or ""))) end
+    tw = math.min(tw, math.max(20, width - 34))
+    for _, r in ipairs(rows) do
+      local label = H.fit(tostring(r.n) .. ". " .. H.oneline(r.text or ""), tw)
+      if r.state == "done" then
+        b:add({ { "  " .. mdone .. " ", "AgentMapDone" }, { label .. "  " },
+          { hm(r.started_at) .. " → " .. hm(r.done_at), "AgentMapDim" } })
+      elseif r.state == "running" then
+        local tail = ""
+        local cel = r.started_at and H.parse_iso(r.started_at) and math.max(0, (now - H.parse_iso(r.started_at)) * 1000) or nil
+        if cel and pr and pr.expected_ms and pr.basis ~= "children" then
+          tail = " " .. t(cel > pr.expected_ms and "detail.step_over" or "detail.step_running",
+            { elapsed = H.fmt_elapsed(cel), typical = H.fmt_elapsed(pr.expected_ms) })
+        end
+        b:add({ { "  " .. mrun .. " ", "AgentMapRunning" }, { label .. "  " },
+          { hm(r.started_at) .. " → " .. tail, "AgentMapDim" } })
+      else
+        b:add({ { "    " }, { (label:gsub("%s+$", "")), "AgentMapDim" } })
+      end
+    end
+    if truncated then b:add({ { t("detail.steps_truncated"), "AgentMapDim" } }) end
+  end
 
   -- 任せた内容：親の指示の【目的】【任せる理由】【期待する結果】と、親の直前の発言
   b:add("")
@@ -193,6 +338,57 @@ function M.build(state, agent, extra)
       local hl = at.verdict == "PASS" and "AgentMapDone" or at.verdict == "RETRY" and "AgentMapRework"
         or at.verdict == "ESCALATE" and "AgentMapReview" or nil
       b:add({ { "  " .. attempt_line(state, at), hl } })
+    end
+  end
+
+  -- 修正指示（DESIGN-v0.2-steer §6.4）。1 件以上あるときだけ
+  local function steer_outcome(x)
+    if x.status == "DELIVERED" then
+      if x.delivered_via == "UserPromptSubmit" then
+        return t("detail.steer_confirmed", { time = H.fmt_clock(x.confirmed_at or x.delivered_at) }), "AgentMapDone"
+      elseif x.via == "terminal" or x.delivered_via == "terminal" then
+        return t("detail.steer_sent", { time = H.fmt_clock(x.delivered_at) }), "AgentMapDone"
+      end
+      return t("detail.steer_delivered", { time = H.fmt_clock(x.delivered_at), via = or_dash(x.delivered_via) }), "AgentMapDone"
+    elseif x.status == "EXPIRED" then
+      local rk = ({ agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
+        no_terminal = "detail.steer_reason_no_terminal" })[x.end_reason]
+      return t("detail.steer_expired", { reason = rk and t(rk) or or_dash(x.end_reason) }), "AgentMapRework"
+    elseif x.status == "CANCELLED" then
+      return t("detail.steer_cancelled", { time = H.fmt_clock(x.ended_at) }), "AgentMapDim"
+    end
+    return t("detail.steer_pending"), "AgentMapWaiting"
+  end
+  local sids = graph.steers_of(state, a.id)
+  if #sids > 0 then
+    b:add("")
+    b:add({ { t("detail.h_steers", { n = #sids }), "AgentMapHeader" } })
+    local mk = graph.steer_mark()
+    for i, sid in ipairs(sids) do
+      local x = state.steers[sid]
+      local outcome, hl = steer_outcome(x)
+      local body = H.truncate(H.oneline(x.text or t("common.missing")), cfg.note_chars)
+      b:add({ { "  " .. mk .. " ", hl }, { "#" .. (x.n or i) .. " " .. H.fmt_clock(x.requested_at) .. "  " },
+        { outcome, hl }, { "  " .. t("common.quote", { text = body }), "AgentMapDim" } }, "steer:" .. sid)
+      -- 親への知らせ（付録 E）：届いたか・未配達か
+      local nt = graph.notice_of(state, sid)
+      if nt then
+        local no, nhl = steer_outcome(nt)
+        b:add({ { t("detail.steer_notice", { parent = label_of(state, nt.agent_id or "ROOT") }), "AgentMapDim" },
+          { no, nhl } }, nt.agent_id and nt.agent_id ~= "ROOT" and nt.agent_id or nil)
+      end
+      -- 配達のあと 60 秒以内に最初に使った道具（作者が「従ったか」を目で確かめるため。§12.2）
+      local dt = x.status == "DELIVERED" and H.parse_iso(x.delivered_at)
+      if dt then
+        for _, tl in ipairs(a.tools or {}) do
+          local tt = H.parse_iso(tl.ts)
+          if tt and tt >= dt and tt - dt <= 60 then
+            b:add({ { t("detail.steer_next_tool", { time = H.fmt_clock(tl.ts),
+              tool = (tl.name or "?") .. (tl.target and (" " .. H.oneline(tl.target)) or "") }), "AgentMapDim" } })
+            break
+          end
+        end
+      end
     end
   end
 

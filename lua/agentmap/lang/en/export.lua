@@ -37,7 +37,7 @@ return {
   -- map
   ["export.stage"] = "Stage %{k}",
   ["export.text_tree_intro"] = "Text version (for viewers that cannot show Mermaid):",
-  ["export.progress_note"] = "Progress (~NN%) is the number of child agents that are DONE divided by the number of child agents. Agents without children show none.",
+  ["export.progress_note"] = "Progress is the number of finished steps divided by all steps (TaskCreate/TaskUpdate for the main agent, \"## Steps\" in a sub-agent's transcript). \"~\" marks an estimate: the running step is filled in from the typical time (median) of similar past agents, and a running agent without a step list is estimated from its elapsed time alone (at most 95%). Estimates are rounded down. Values are as of export time.",
   ["export.tree_check_q"] = "\"%{q}\"",
   -- agents table
   ["export.agents_header"] = "| # | Name | ID | type | model | Parent | status | task | Started | Duration | worktree · branch | Review | Rework |",
@@ -117,4 +117,19 @@ return {
   ["export.pdf_no_output"] = "PDF command finished but did not create %{path}",
   -- md.lua
   ["md.toc"] = "Contents",
+  -- v0.2.0: steps and steering
+  ["export.steps_line"] = "> Steps: %{k}/%{n} done",
+  ["export.steps_progress"] = "Progress: %{pct}",
+  ["export.h_steers"] = "Steering instructions",
+  ["export.steer_line"] = "- %{label} — %{time} \"%{text}\" → %{outcome}",
+  ["export.steer_delivered"] = "delivered %{time} at %{via}",
+  ["export.steer_sent"] = "sent to the terminal %{time}",
+  ["export.steer_pending"] = "pending at export time",
+  ["export.steer_expired"] = "not delivered: %{reason}",
+  ["export.steer_cancelled"] = "cancelled",
+  ["export.steer_none"] = "(no steering instructions)",
+  ["export.ov_steers_label"] = "Steering",
+  ["export.ov_steers"] = "%{n} (%{pending} pending)",
+  -- v0.2.0: notice to the parent
+  ["export.steer_notice"] = "  - told the parent %{parent}: %{outcome}",
 }

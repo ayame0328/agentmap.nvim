@@ -1,9 +1,14 @@
--- agentmap の描画：graph.layout の結果をバッファへ書く
+-- agentmap/renderer.lua ... writes a graph.layout() result into the map buffer.
+--   Only changed lines are rewritten; colors are extmarks in the "agentmap" namespace, and the
+--   flow light (anim.lua) uses its own "agentmap_anim" namespace.
 --   前回との差分だけを書き換える（変わっていない行には触らない＝ちらつかない）。
 --   色は "agentmap" 名前空間の extmark で付ける。
 local M = {}
 
 M.ns = vim.api.nvim_create_namespace("agentmap")
+-- 矢印の光（anim.lua）専用。基本の印とは別の名前空間なので、光を消しても色分けは残る
+M.anim_ns = vim.api.nvim_create_namespace("agentmap_anim")
+M.ANIM_PRIORITY = 4200
 
 -- 色の定義。default = true なので、色テーマや利用者の設定があればそちらが勝つ
 function M.setup_highlights()
@@ -25,6 +30,9 @@ function M.setup_highlights()
   set("AgentMapIndex", { link = "Number" })
   set("AgentMapHeader", { link = "Title" })
   set("AgentMapDim", { link = "Comment" })
+  -- 矢印の光の色（背景の明暗で変わる）
+  local ok, anim = pcall(require, "agentmap.anim")
+  if ok and anim.setup_highlights then pcall(anim.setup_highlights) end
 end
 
 function M.new_cache()
@@ -194,6 +202,31 @@ function M.builder()
     return { lines = self.lines, marks = self.marks, links = self.links }
   end
   return b
+end
+
+--- Replace the light of the flow animation: clear the "agentmap_anim" namespace and set `specs`.
+---   specs = { { row0, byte0, byte1, hl_group }, … } (anim.frame()). Only highlights; the text is
+---   never changed. Cells past the end of a line (the map was redrawn shorter) are skipped.
+function M.set_anim_marks(buf, specs)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.api.nvim_buf_clear_namespace(buf, M.anim_ns, 0, -1)
+  local nlines = vim.api.nvim_buf_line_count(buf)
+  local lens = {}
+  for _, m in ipairs(specs or {}) do
+    local r = m[1]
+    if r >= 0 and r < nlines then
+      local len = lens[r]
+      if not len then
+        len = #(vim.api.nvim_buf_get_lines(buf, r, r + 1, false)[1] or "")
+        lens[r] = len
+      end
+      local c0, c1 = m[2], math.min(m[3], len)
+      if c1 > c0 then
+        pcall(vim.api.nvim_buf_set_extmark, buf, M.anim_ns, r, c0,
+          { end_col = c1, hl_group = m[4], priority = M.ANIM_PRIORITY })
+      end
+    end
+  end
 end
 
 -- 全部書き直す（詳細・transcript・diff 用。これらは開くたびに作り直すだけ）

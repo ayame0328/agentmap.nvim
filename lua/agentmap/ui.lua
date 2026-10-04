@@ -1,7 +1,10 @@
--- agentmap/ui.lua ... screens: the map tab, the side (aux) window and the back navigation.
+-- agentmap/ui.lua ... screens: the map tab, the side (aux) window and the back navigation,
+--   the once-a-second redraw while something runs (progress % and elapsed time move), the flow
+--   light (anim.lua) and steering (writing an instruction to a box with `s`).
 --   図 → 詳細 → transcript/diff → BS → 詳細 → BS → 図、を ui.nav（戻り先の積み重ね）で実現する。
 local graph = require("agentmap.graph")
 local renderer = require("agentmap.renderer")
+local anim = require("agentmap.anim")
 local keymaps = require("agentmap.keymaps")
 local state_mod = require("agentmap.state")
 local i18n = require("agentmap.i18n")
@@ -20,7 +23,15 @@ local M = {
   nav = {}, -- { {kind, id}, … } 補助ウィンドウの戻り先
   cache = nil,
   layout = nil,
+  clock = os.time, -- 「今」（秒）。試験で差し替える
+  term_choice = {}, -- { [sid] = buf } 同点の端末から選んだもの（同じ run では次から聞かない）
+  steer_expanded = {}, -- { [steer_id] = true } 詳細画面で本文を全部開いている指示
 }
+
+local ticker = nil -- 毎秒の描き直しのタイマー
+local log_marks = {} -- { ["<sid>:<id>"] = { last = 秒, running = bool } } 推定の記録（30 秒に 1 回）
+local expired_seen = {} -- { [sid] = { [steer_id] = true } } 「届かなかった」と知らせ済み
+local notice_done = {} -- { [sid] = { [steer_id] = true } } 親への知らせを作った（または作らないと決めた）指示
 
 local VIEWS = {
   detail = "agentmap.views.detail",
@@ -114,6 +125,141 @@ local function map_win()
   return nil
 end
 
+-- 図が今のタブページに見えているか（見えていないときは毎秒の描き直しも光も止める）
+local function map_visible_here()
+  if not valid_buf(M.buf) then return false end
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_get_buf(w) == M.buf then return true end
+  end
+  return false
+end
+
+-- ------------------------------------------------------------
+-- 進み具合と毎秒の描き直し（DESIGN-v0.2 §2.7）
+-- ------------------------------------------------------------
+local PROGRESS_DEFAULTS = { enabled = true, tick_ms = 1000, log = true }
+
+--- Effective progress settings (config.get().progress; false = { enabled = false }).
+function M.progress_cfg()
+  local ok, config = pcall(require, "agentmap.config")
+  local raw = nil
+  if ok then raw = config.get().progress end
+  if raw == false then return vim.tbl_extend("force", PROGRESS_DEFAULTS, { enabled = false }) end
+  if type(raw) ~= "table" then return vim.deepcopy(PROGRESS_DEFAULTS) end
+  return vim.tbl_extend("force", PROGRESS_DEFAULTS, raw)
+end
+
+--- History of past agents for the estimate (stats.load; nil when the module is missing).
+---   The run on screen is skipped: its state.json changes every second.
+function M._stats()
+  local stats = try_require("agentmap.stats")
+  if not stats or not stats.load then return nil end
+  local okc, config = pcall(require, "agentmap.config")
+  if not okc then return nil end
+  local ok, S = pcall(stats.load, config.root(), { skip_dir = M.run and M.run.dir or nil })
+  return ok and S or nil
+end
+
+--- { [id] = status } of the agents and HUMAN CHECK boxes in state `s` (what the light follows).
+function M.status_map(s)
+  local out = {}
+  if type(s) ~= "table" then return out end
+  for id, a in pairs(s.agents or {}) do
+    if type(a) == "table" and a.status then out[id] = a.status end
+  end
+  for id, c in pairs(type(s.checks) == "table" and s.checks or {}) do
+    if type(c) == "table" and c.status then out[c.id or id] = c.status end
+  end
+  return out
+end
+
+local MOVING = { RUNNING = true, PENDING = true, REVIEW = true }
+
+--- True when something on screen changes by itself every second: an agent that is RUNNING,
+--- PENDING or REVIEW (ROOT only when RUNNING), or a HUMAN CHECK that waits for an answer.
+---@param s table|nil state (usually display_state())
+function M.should_tick(s)
+  if type(s) ~= "table" then return false end
+  for id, a in pairs(s.agents or {}) do
+    if type(a) == "table" then
+      if id == "ROOT" then
+        if a.status == "RUNNING" then return true end
+      elseif MOVING[a.status] then
+        return true
+      end
+    end
+  end
+  for _, c in pairs(type(s.checks) == "table" and s.checks or {}) do
+    if type(c) == "table" and c.status == "WAITING" then return true end
+  end
+  return false
+end
+
+local function iso(secs)
+  return os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(secs))
+end
+
+-- 推定の答え合わせの記録（progress_log.jsonl。DESIGN-v0.2 §2.5）
+--   動いている箱ごとに 30 秒に 1 回と、終わった瞬間に 1 回（final）。見ていた間の分だけ
+local function log_progress(s, now)
+  if type(s) ~= "table" or not M.run then return end
+  local pcfg = M.progress_cfg()
+  if pcfg.log == false then return end
+  local stats, progress = try_require("agentmap.stats"), try_require("agentmap.progress")
+  if not (stats and stats.log and progress and progress.compute) then return end
+  local okc, config = pcall(require, "agentmap.config")
+  if not okc then return end
+  local root = config.root()
+  local sid = M.run.sid or (s.run_id) or "?"
+  for id, a in pairs(s.agents or {}) do
+    if type(a) == "table" and type(id) == "string" and id:sub(1, 3) ~= "wf:" then
+      local key = sid .. ":" .. id
+      local L = log_marks[key]
+      if a.status == "RUNNING" then
+        if not L then
+          L = {}
+          log_marks[key] = L
+        end
+        L.running = true
+        if not L.last or now - L.last >= 30 then
+          local ok, r = pcall(progress.compute, s, id, {
+            now = now, stats = M.view.stats, config = pcfg, flow_id = M.flow_id,
+          })
+          if ok and r then
+            local extra = { ts = iso(now), run = sid, started_at = a.started_at }
+            local e
+            if progress.log_entry then
+              local ok2, got = pcall(progress.log_entry, s, id, r, extra)
+              e = ok2 and got or nil
+            end
+            e = e or vim.tbl_extend("force", {
+              agent = id, type = a.agent_type, model = a.model or a.model_requested,
+              basis = r.basis, n = r.n, k = r.k, f = r.f, pct = r.pct,
+              stat_basis = r.stat_basis, samples = r.samples, d_hat_ms = r.expected_ms,
+            }, extra)
+            pcall(stats.log, root, e)
+            L.last = now
+          end
+        end
+      elseif L and L.running then
+        L.running = false
+        if a.status == "DONE" and a.elapsed_ms then
+          local facts
+          if state_mod.progress_facts then
+            local ok, f = pcall(state_mod.progress_facts, s, id)
+            facts = ok and f or nil
+          end
+          pcall(stats.log, root, {
+            ts = iso(now), run = sid, agent = id, final = true, elapsed_ms = a.elapsed_ms,
+            started_at = a.started_at, n = facts and facts.n or nil, k = facts and facts.k or nil,
+          })
+        end
+      end
+    end
+  end
+end
+M._log_progress = log_progress
+
 local function set_win_opts(win, opts)
   for k, v in pairs(opts) do
     pcall(vim.api.nvim_set_option_value, k, v, { win = win, scope = "local" })
@@ -142,6 +288,8 @@ local function create_map_buf(run_id)
     group = grp,
     buffer = b,
     callback = function()
+      M.stop_ticker()
+      anim.stop()
       M.buf, M.cache, M.win = nil, nil, nil
     end,
   })
@@ -178,6 +326,9 @@ function M.open_map(run, flow_id)
     M.nav = {}
     M.cache = nil
     M.close_aux() -- 別の run・別の指示に切り替えるとき、前の詳細画面を残さない
+    anim.reset() -- 前に見ていたものの「終わった瞬間」を新しい図で光らせない
+    M.steer_expanded = {}
+    M._seed_expired()
   end
 
   if not valid_buf(M.buf) then
@@ -227,6 +378,7 @@ function M.set_flow(flow_id)
   M.view = { root = "ROOT", collapsed = {}, mode = M.view.mode }
   M.cache = nil
   M._place = "ROOT"
+  anim.reset()
   -- 自動の切り替えで、ほかの窓で作業中のカーソルを図へ動かさない（補助画面にいたときだけ図へ戻す）
   local cur = vim.api.nvim_get_current_win()
   local in_aux = cur == M.aux_win
@@ -286,8 +438,21 @@ function M.refresh(opts)
   else
     M.view.width = win and (vim.api.nvim_win_get_width(win) - 1) or 120
   end
+  -- 進み具合（%）の計算に使うもの（graph が progress.compute に渡す）
+  M.view.now = M.clock()
+  M.view.progress = M.progress_cfg()
+  M.view.stats = M._stats()
   M.layout = graph.layout(state(), M.view)
   M.cache = renderer.render(M.buf, M.layout, M.cache)
+  -- 矢印の光と毎秒の描き直し（描き直したら、必要に応じて動き出す・止まる）
+  local shown = state()
+  pcall(anim.update, M.buf, M.layout, M.status_map(shown))
+  pcall(log_progress, shown, M.view.now)
+  if M.should_tick(shown) and map_visible_here() then
+    M.start_ticker()
+  else
+    M.stop_ticker()
+  end
   if win then
     local want = M._place or keep
     M._place = nil
@@ -307,6 +472,8 @@ end
 
 --- Close the map tab/window and stop watching.
 function M.close()
+  M.stop_ticker()
+  anim.stop()
   M.close_aux()
   local buf = M.buf
   if valid_win(M.win) and #vim.api.nvim_list_tabpages() > 1 and M.tab and vim.api.nvim_tabpage_is_valid(M.tab) then
@@ -385,15 +552,24 @@ function M._show(entry, opts)
   ensure_aux(b, entry.kind)
   local width = vim.api.nvim_win_get_width(M.aux_win)
   -- 詳細などの画面には、見せている流れの状態（番号が流れの中の番号）を渡す
-  mod.open(setmetatable({ state = state() }, { __index = M.run }), a, b, { width = width })
+  mod.open(setmetatable({ state = state() }, { __index = M.run }), a, b, {
+    width = width, now = M.clock(), steer_expanded = M.steer_expanded,
+  })
   if opts.keep_cursor then
     if valid_win(back_to) then vim.api.nvim_set_current_win(back_to) end
     return true
   end
   local row = 1
+  local marker = nil
   if entry.focus == "history" then
+    marker = t("detail.history_marker")
+  elseif entry.focus == "steers" then
+    -- 「■ Steering (2)」の数字の前まで
+    marker = (t("detail.h_steers", { n = "" }):gsub("%s*[%(（].*$", ""))
+  end
+  if marker and marker ~= "" then
     for i, l in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
-      if l:find(t("detail.history_marker"), 1, true) then
+      if l:find(marker, 1, true) then
         row = i
         break
       end
@@ -403,9 +579,9 @@ function M._show(entry, opts)
   return true
 end
 
-local function open_view(kind, id)
+local function open_view(kind, id, want_focus)
   if not id then return end
-  local focus = nil
+  local focus = want_focus
   if id:sub(1, 5) == "gate:" then
     id = id:sub(6)
     focus = "history"
@@ -458,6 +634,8 @@ function M.open_transcript(id) open_view("transcript", id) end
 function M.open_diff(id) open_view("diff", id) end
 --- Open the HUMAN CHECK view.
 function M.open_check(id) open_view("check", id) end
+--- Open the detail view of an agent at its steering section.
+function M.open_steers(id) open_view("detail", id, "steers") end
 
 --- Open the details of agent number `n`.
 -- 番号（[n]）で詳細を開く
@@ -480,6 +658,18 @@ function M.follow_link()
   local links = mod and mod.links and mod.links[b] or {}
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local id = links[row]
+  if type(id) == "string" and id:sub(1, 6) == "steer:" then
+    -- 修正指示の行：本文全体を開く・閉じる（画面を作り直し、カーソルはその行のまま）
+    local sid = id:sub(7)
+    M.steer_expanded[sid] = (not M.steer_expanded[sid]) or nil
+    local top = M.nav[#M.nav]
+    if top then
+      local win = vim.api.nvim_get_current_win()
+      M._show(top, { keep_cursor = true })
+      pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
+    end
+    return
+  end
   if id then
     open_view("detail", id) -- check: で始まれば open_view が確認の画面に振り分ける
     return
@@ -799,6 +989,580 @@ function M.help()
   for _, k in ipairs({ "q", "<Esc>", "?" }) do
     vim.keymap.set("n", k, function() pcall(vim.api.nvim_win_close, win, true) end, { buffer = b, nowait = true })
   end
+end
+
+-- ------------------------------------------------------------
+-- 毎秒の描き直し（ticker）
+-- ------------------------------------------------------------
+--- Start the once-a-second redraw (no-op when it already runs). Interval: progress.tick_ms.
+function M.start_ticker()
+  if ticker then return end
+  local ms = math.max(100, tonumber(M.progress_cfg().tick_ms) or 1000)
+  local timer = vim.uv.new_timer()
+  if not timer then return end
+  ticker = timer
+  timer:start(ms, ms, function()
+    vim.schedule(function()
+      if ticker ~= timer then return end
+      local ok, err = pcall(M.tick)
+      if not ok then
+        M.stop_ticker()
+        notify(tostring(err), vim.log.levels.WARN)
+      end
+    end)
+  end)
+end
+
+--- Stop the once-a-second redraw.
+function M.stop_ticker()
+  if ticker then
+    pcall(ticker.stop, ticker)
+    pcall(ticker.close, ticker)
+    ticker = nil
+  end
+end
+
+--- True while the once-a-second redraw runs (tests).
+function M._ticking() return ticker ~= nil end
+
+--- One tick: read new step marks, expire undelivered steering, redraw the map (only changed
+--- lines are rewritten). The redraw decides whether the ticker keeps running.
+function M.tick()
+  if not M.run or not valid_buf(M.buf) or not map_visible_here() then
+    M.stop_ticker()
+    anim.stop()
+    return
+  end
+  local ev = try_require("agentmap.events")
+  if ev and ev.poll_steps then
+    local ok, changed = pcall(ev.poll_steps, M.run)
+    if ok and changed and ev.enrich then pcall(ev.enrich, M.run) end
+  end
+  M.sweep_steers()
+  M.refresh({ aux = false })
+end
+
+-- ------------------------------------------------------------
+-- 修正指示（steer。DESIGN-v0.2-steer.md §2・§4・§6）
+-- ------------------------------------------------------------
+local STEER_DEFAULTS = {
+  enabled = true, mode = "deny", at_stop = true, root_via = "terminal", no_terminal = "hook",
+  submit_delay_ms = 0, input = "window", text_max = 4000,
+}
+local STEER_PREFIX = "[AgentMap] " -- 端末へ送る文の先頭（固定。state が「流れの続き」の判定に使う）
+local FINISHED = { DONE = true, REWORK = true, FAILED = true }
+
+--- Effective steering settings (config.get().steer; false = { enabled = false }).
+function M.steer_cfg()
+  local ok, config = pcall(require, "agentmap.config")
+  local raw = nil
+  if ok then raw = config.get().steer end
+  if raw == false then return vim.tbl_extend("force", STEER_DEFAULTS, { enabled = false }) end
+  if type(raw) ~= "table" then return vim.deepcopy(STEER_DEFAULTS) end
+  return vim.tbl_extend("force", STEER_DEFAULTS, raw)
+end
+
+--- The agent a steering instruction for map id `id` goes to, or nil when the box cannot take one
+--- (HUMAN CHECK, Workflow summary wf:, UNKNOWN_PARENT, START/END, stage headers, unknown ids).
+function M.steer_target(id)
+  if type(id) ~= "string" then return nil end
+  if id:sub(1, 5) == "gate:" then id = id:sub(6) end
+  if is_check(id) or id:sub(1, 3) == "wf:" or id:sub(1, 6) == "stage:" then return nil end
+  if id == "UNKNOWN_PARENT" or id == "START" or id == "END" then return nil end
+  local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
+  if not a or a.kind == "workflow" then return nil end
+  return id
+end
+
+local function label_of(id)
+  if id == "ROOT" or id == nil then return "ROOT" end
+  local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
+  if not a then return tostring(id) end
+  return "[" .. tostring(a.index or "?") .. "] " .. graph.util.truncate(a.name or a.task or id, 40)
+end
+M._steer_label = label_of
+
+--- How a steering instruction to `id` is delivered: "root" (the terminal), "redo" (a finished
+--- agent: ask the main agent in the terminal to redo it) or "hook" (a running agent: its next tool call).
+function M.steer_kind(id)
+  if id == "ROOT" then return "root" end
+  local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
+  if a and FINISHED[a.status] then return "redo" end
+  return "hook"
+end
+
+-- 宛先 id の未配達の指示（古い順）
+local function pending_of(id)
+  local s = M.run and M.run.state
+  if not s or type(s.steers) ~= "table" then return {} end
+  local ids
+  if state_mod.steers_of then
+    local ok, r = pcall(state_mod.steers_of, s, id)
+    if ok and type(r) == "table" then ids = r end
+  end
+  if not ids then
+    ids = {}
+    for sid, st in pairs(s.steers) do
+      if st.agent_id == id then ids[#ids + 1] = sid end
+    end
+    table.sort(ids, function(x, y)
+      return tostring(s.steers[x].requested_at or "") < tostring(s.steers[y].requested_at or "")
+    end)
+  end
+  local out = {}
+  for _, sid in ipairs(ids) do
+    local st = s.steers[sid]
+    if st and st.status == "PENDING" then out[#out + 1] = sid end
+  end
+  return out
+end
+M._pending_steers = pending_of
+
+-- 「やり直し」の文（UI の言語。i18n の鍵が無ければ英語の既定の文）
+local REDO_FALLBACK = {
+  en = 'Please redo agent [%{index}] "%{name}" (id %{id}, finished %{time}): %{text}. Use the same delegation; report what changed.',
+  ja = "エージェント [%{index}]「%{name}」（id %{id}、%{time} 終了）をやり直してください：%{text}。同じ任せ方で、何が変わったかを報告してください。",
+}
+function M.redo_text(id, text)
+  local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id]) or {}
+  local fin = a.finished_at and graph.util.parse_iso(a.finished_at)
+  local vars = {
+    index = a.index or "?",
+    name = graph.util.truncate(a.name or a.task or id, 40),
+    id = id,
+    time = fin and os.date("%H:%M", math.floor(fin)) or "?",
+    text = text,
+  }
+  local lang = i18n.lang == "ja" and "ja" or "en"
+  local key = "steer.redo_" .. lang
+  local out
+  if i18n.has(key) or i18n.has(key, "en") then
+    out = t(key, vars)
+  else
+    out = REDO_FALLBACK[lang]:gsub("%%{([%w_]+)}", function(k) return tostring(vars[k]) end)
+  end
+  -- 先頭の [AgentMap] は送るときに付ける
+  if out:sub(1, #STEER_PREFIX) == STEER_PREFIX then out = out:sub(#STEER_PREFIX + 1) end
+  return out
+end
+
+local function events_mod()
+  local ev = try_require("agentmap.events")
+  if not ev or not ev.request_steer then return nil end
+  return ev
+end
+
+local function request(ev, agent_id, text, opts)
+  local ok, id, err = pcall(ev.request_steer, M.run, agent_id, text, opts)
+  if not ok then return nil, id end
+  return id, err
+end
+
+local function after_steer()
+  pcall(M.refresh, { aux = true })
+end
+
+-- 端末が無いとき（steer.no_terminal）
+local function no_terminal(ev, cfg, agent_id, hook_text, line, opts)
+  local how = cfg.no_terminal or "hook"
+  if how == "hook" then
+    local id = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "hook" }))
+    notify(t("ui.steer_no_terminal_hook"))
+    after_steer()
+    return id and "fallback_hook" or nil
+  elseif how == "clipboard" then
+    pcall(vim.fn.setreg, "+", line)
+    pcall(vim.fn.setreg, '"', line)
+    -- 送れたかは分からないので PENDING のまま（作者が s → 取り消しで消す）
+    request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
+    notify(t("ui.steer_no_terminal_clip"))
+    after_steer()
+    return "clipboard"
+  end
+  notify(t("ui.steer_no_terminal_none"), vim.log.levels.WARN)
+  return "none"
+end
+
+-- 端末へ送る。cb(result) は同点の端末を選ばせたときも最後に 1 回呼ぶ。
+-- no_pick = true（自動で送る親への知らせ）なら、同点でも選ばせずに落とし先へ
+local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick)
+  local term = try_require("agentmap.term")
+  local line = STEER_PREFIX .. hook_text
+  local s = M.run and M.run.state or {}
+  local cwd = s.cwd or vim.fn.getcwd()
+  local function send_to(cand)
+    local id = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
+    local ok = term.send(cand.job, line, { delay_ms = cfg.submit_delay_ms })
+    if ok then
+      if id and ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, id) end
+      notify(t("ui.steer_sent"))
+      after_steer()
+      return cb("sent")
+    end
+    -- 送れなかった（端末が直前に終わった）。置いた要求は取り消して、落とし先へ
+    if id and ev.cancel_steer then pcall(ev.cancel_steer, M.run, id) end
+    return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts))
+  end
+  if not term then return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts)) end
+  local cand, list, tied = term.find(cwd)
+  local sid = M.run and M.run.sid or "?"
+  -- 前に選んだ端末がまだあれば、それを使う
+  local remembered = M.term_choice[sid]
+  if remembered then
+    for _, c in ipairs(list or {}) do
+      if c.buf == remembered then cand, tied = c, false end
+    end
+  end
+  if cand then return send_to(cand) end
+  if tied and list and #list > 0 and not no_pick then
+    vim.ui.select(list, {
+      prompt = t("ui.steer_pick_terminal"),
+      format_item = function(c) return vim.api.nvim_buf_get_name(c.buf) end,
+    }, function(choice)
+      if not choice then return cb(nil) end
+      M.term_choice[sid] = choice.buf
+      send_to(choice)
+    end)
+    return
+  end
+  return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts))
+end
+
+--- Send a steering instruction `text` for box `id`, choosing the route from the box
+--- (running agent: hooks; ROOT: terminal; finished agent: ask ROOT in the terminal to redo it).
+---@param id string agent id (gate: ids are accepted)
+---@param text string
+---@param cb? fun(result: string|nil) "queued" | "sent" | "fallback_hook" | "clipboard" | "none" | "empty" | nil
+---@return string|nil result (nil while waiting for the user to pick a terminal)
+function M.steer_send(id, text, cb)
+  local result
+  local function done(r)
+    result = r
+    if cb then cb(r) end
+    return r
+  end
+  local cfg = M.steer_cfg()
+  if not cfg.enabled then
+    notify(t("ui.steer_disabled"))
+    return done(nil)
+  end
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(t("ui.steer_not_target"), vim.log.levels.WARN)
+    return done(nil)
+  end
+  text = vim.trim(tostring(text or ""))
+  if text == "" then
+    notify(t("ui.steer_empty"))
+    return done("empty")
+  end
+  local max = tonumber(cfg.text_max) or 4000
+  if vim.fn.strchars(text) > max then text = vim.fn.strcharpart(text, 0, max) end
+  local ev = events_mod()
+  if not ev or not M.run then
+    notify(t("ui.steer_disabled"), vim.log.levels.WARN)
+    return done(nil)
+  end
+  local s = M.run.state
+  local prompt_id = M.flow_id or (s and state_mod.latest_flow_id(s)) or nil
+  local kind = M.steer_kind(aid)
+  if kind == "hook" then
+    local sid = request(ev, aid, text, { via = "hook", kind = "steer", prompt_id = prompt_id })
+    if not sid then
+      notify(t("ui.steer_disabled"), vim.log.levels.WARN)
+      return done(nil)
+    end
+    notify(t("ui.steer_queued", { label = label_of(aid) }))
+    after_steer()
+    return done("queued")
+  end
+  if kind == "root" then
+    local opts = { kind = "steer", prompt_id = prompt_id }
+    if cfg.root_via == "hook" then
+      request(ev, "ROOT", text, vim.tbl_extend("force", opts, { via = "hook" }))
+      notify(t("ui.steer_queued", { label = "ROOT" }))
+      after_steer()
+      return done("queued")
+    end
+    via_terminal(ev, cfg, "ROOT", text, opts, done)
+    return result
+  end
+  -- 終わった箱：親（ROOT）の端末へやり直しの依頼。差し戻し（REWORK）は記録しない（親が決める）
+  via_terminal(ev, cfg, "ROOT", M.redo_text(aid, text), { kind = "redo", redo_of = aid, prompt_id = prompt_id }, done)
+  return result
+end
+
+local input_seq = 0
+
+--- Open the instruction editor for `id` (a small floating window; steer.input = "line" uses
+--- vim.ui.input). <C-s>, :w or <CR> in normal mode sends, q / <Esc> cancels.
+---@param on_submit? fun(text: string) default: M.steer_send(id, text)
+---@return integer|nil buf, integer|nil win
+function M.steer_input(id, on_submit)
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(t("ui.steer_not_target"), vim.log.levels.WARN)
+    return nil
+  end
+  on_submit = on_submit or function(text) M.steer_send(aid, text) end
+  local cfg = M.steer_cfg()
+  local kind = M.steer_kind(aid)
+  local title = aid == "ROOT" and t("ui.steer_prompt", { label = "ROOT (terminal)" })
+    or t("ui.steer_prompt", { label = label_of(aid) })
+  if cfg.input == "line" then
+    vim.ui.input({ prompt = title .. ": " }, function(text)
+      if text == nil then return end
+      on_submit(text)
+    end)
+    return nil
+  end
+  local hint = t("ui.steer_hint")
+  local b = vim.api.nvim_create_buf(false, true)
+  vim.bo[b].buftype = "acwrite"
+  vim.bo[b].bufhidden = "wipe"
+  vim.bo[b].swapfile = false
+  input_seq = input_seq + 1
+  pcall(vim.api.nvim_buf_set_name, b, "agentmap://steer/" .. aid .. "/" .. input_seq)
+  vim.bo[b].filetype = "markdown"
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, { hint, "" })
+  vim.bo[b].modified = false
+  pcall(vim.api.nvim_buf_set_extmark, b, renderer.ns, 0, 0, { end_col = #hint, hl_group = "AgentMapDim" })
+  vim.b[b].agentmap_steer_target = aid
+  vim.b[b].agentmap_steer_kind = kind
+  local width = math.max(20, math.min(80, vim.o.columns - 4))
+  local height = math.max(3, math.min(6, vim.o.lines - 4))
+  local win = vim.api.nvim_open_win(b, true, {
+    relative = "editor", width = width, height = height,
+    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    style = "minimal", border = "rounded", title = " " .. title .. " ", title_pos = "center",
+  })
+  pcall(vim.api.nvim_set_option_value, "wrap", true, { win = win, scope = "local" })
+  pcall(vim.api.nvim_win_set_cursor, win, { 2, 0 })
+  local finished = false
+  local function close(later)
+    local function go()
+      if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+      if vim.api.nvim_buf_is_valid(b) then pcall(vim.api.nvim_buf_delete, b, { force = true }) end
+    end
+    if later then vim.schedule(go) else go() end
+  end
+  local function submit(later)
+    if finished then return end
+    finished = true
+    local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+    if lines[1] == hint then table.remove(lines, 1) end
+    local text = vim.trim(table.concat(lines, "\n"))
+    vim.bo[b].modified = false
+    pcall(vim.cmd, "stopinsert")
+    close(later)
+    if text == "" then
+      notify(t("ui.steer_empty"))
+      return
+    end
+    on_submit(text)
+  end
+  local function cancel()
+    if finished then return end
+    finished = true
+    close(false)
+  end
+  local o = { buffer = b, nowait = true, silent = true }
+  vim.keymap.set("n", "<CR>", function() submit(false) end, o)
+  vim.keymap.set({ "n", "i" }, "<C-s>", function() submit(true) end, o)
+  vim.keymap.set("n", "q", cancel, o)
+  vim.keymap.set("n", "<Esc>", cancel, o)
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    buffer = b,
+    callback = function() submit(true) end,
+  })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(win),
+    once = true,
+    callback = function() finished = true end,
+  })
+  pcall(vim.cmd, "startinsert")
+  return b, win
+end
+
+--- `s` on a box: write an instruction / ask the parent to redo / send to the terminal,
+--- cancel pending instructions, or show the steering history.
+function M.steer_menu(id)
+  local cfg = M.steer_cfg()
+  if not cfg.enabled then
+    notify(t("ui.steer_disabled"))
+    return
+  end
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(t("ui.steer_not_target"), vim.log.levels.WARN)
+    return
+  end
+  local kind = M.steer_kind(aid)
+  local first = kind == "redo" and t("ui.steer_redo")
+    or (kind == "root" and cfg.root_via ~= "hook") and t("ui.steer_terminal")
+    or t("ui.steer_write")
+  local items, acts = { first }, { "write" }
+  local pend = pending_of(aid)
+  if #pend > 0 then
+    items[#items + 1] = t("ui.steer_cancel_n", { n = #pend })
+    acts[#acts + 1] = "cancel"
+  end
+  items[#items + 1] = t("ui.steer_show")
+  acts[#acts + 1] = "show"
+  vim.ui.select(items, { prompt = t("ui.steer_prompt", { label = label_of(aid) }) }, function(_, idx)
+    local act = idx and acts[idx]
+    if act == "write" then
+      M.steer_input(aid)
+    elseif act == "cancel" then
+      M.steer_cancel(aid)
+    elseif act == "show" then
+      M.open_steers(aid)
+    end
+  end)
+end
+
+--- Cancel a pending instruction of `id` (asks which one when there are several).
+function M.steer_cancel(id)
+  local ev = try_require("agentmap.events")
+  if not ev or not ev.cancel_steer or not M.run then return end
+  local pend = pending_of(id)
+  if #pend == 0 then return end
+  local function cancel(sid)
+    pcall(ev.cancel_steer, M.run, sid)
+    notify(t("ui.steer_cancelled"))
+    after_steer()
+  end
+  if #pend == 1 then return cancel(pend[1]) end
+  local steers = M.run.state.steers
+  vim.ui.select(pend, {
+    prompt = t("ui.steer_cancel_n", { n = #pend }),
+    format_item = function(sid)
+      local st = steers[sid] or {}
+      return graph.util.truncate(tostring(st.text or sid):gsub("[\r\n]+", " "), 60)
+    end,
+  }, function(sid)
+    if sid then cancel(sid) end
+  end)
+end
+
+-- 開いた時点でもう「届かなかった」指示は知らせない
+function M._seed_expired()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not sid then return end
+  local seen, done = {}, {}
+  for k, st in pairs(s and type(s.steers) == "table" and s.steers or {}) do
+    if st.status == "EXPIRED" then seen[k] = true end
+    -- 開いた時点でもう届いていた指示の知らせは、今さら作らない（見ていない間のことは分からない）
+    if st.status == "DELIVERED" then done[k] = true end
+  end
+  expired_seen[sid] = seen
+  notice_done[sid] = done
+end
+
+--- Notify (once each) steering instructions that expired without being delivered.
+function M.notify_expired()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not s or not sid or type(s.steers) ~= "table" then return end
+  local seen = expired_seen[sid]
+  if not seen then
+    M._seed_expired()
+    return
+  end
+  for k, st in pairs(s.steers) do
+    if st.status == "EXPIRED" and not seen[k] then
+      seen[k] = true
+      notify(t("ui.steer_expired_notice", { label = label_of(st.redo_of or st.agent_id) }), vim.log.levels.WARN)
+    end
+  end
+end
+
+-- 親への知らせの文（i18n の鍵が無ければ英語の既定の文）。先頭の [AgentMap] は送るときに付ける
+local NOTICE_FALLBACK = 'The user sent this instruction directly to your sub-agent [%{index}] "%{name}" (id %{id}): %{text}. If it also affects other sub-agents or your plan, update them.'
+function M.notice_text(child_id, text)
+  local a = (M.run and M.run.state and M.run.state.agents and M.run.state.agents[child_id]) or agent_of(child_id) or {}
+  local vars = {
+    index = a.index or "?", name = graph.util.truncate(a.name or a.task or child_id, 40), id = child_id,
+    text = text or "",
+  }
+  local key = "steer.notice_to_parent"
+  local out
+  if i18n.has(key) or i18n.has(key, "en") then
+    out = t(key, vars)
+  else
+    out = NOTICE_FALLBACK:gsub("%%{([%w_]+)}", function(k) return tostring(vars[k]) end)
+  end
+  if out:sub(1, #STEER_PREFIX) == STEER_PREFIX then out = out:sub(#STEER_PREFIX + 1) end
+  return out
+end
+
+--- Tell the parent about instructions that were delivered directly to its sub-agent
+--- (DESIGN-v0.2-steer.md appendix E): once per instruction, only for deliveries seen while the
+--- map was open, not when the parent has finished. A parent that is ROOT gets it like any ROOT
+--- instruction (terminal, else hooks); a parent that is a sub-agent gets it through hooks.
+---@return integer number of notices created
+function M.notify_parents()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not s or not sid or type(s.steers) ~= "table" then return 0 end
+  local ev = events_mod()
+  if not ev then return 0 end
+  local cfg = M.steer_cfg()
+  if not cfg.enabled then return 0 end
+  local done = notice_done[sid]
+  if not done then
+    M._seed_expired()
+    return 0
+  end
+  -- 既に知らせがある指示（記録に notice_of が残っていれば、それも見る）
+  for _, st in pairs(s.steers) do
+    if st.kind == "notice" and st.notice_of then done[st.notice_of] = true end
+  end
+  local n = 0
+  for k, st in pairs(s.steers) do
+    if st.status == "DELIVERED" and not done[k] then
+      done[k] = true
+      local child = st.agent_id
+      local kind = st.kind or "steer"
+      local a = child and s.agents and s.agents[child]
+      local parent = a and (a.parent_id or "ROOT")
+      local pa = parent and s.agents and s.agents[parent]
+      if kind == "steer" and child ~= "ROOT" and a and pa and not FINISHED[pa.status]
+        and parent ~= "UNKNOWN_PARENT" and parent:sub(1, 3) ~= "wf:" then
+        local text = M.notice_text(child, st.text)
+        local opts = { kind = "notice", notice_of = k, prompt_id = st.prompt_id }
+        if parent == "ROOT" then
+          if cfg.root_via == "hook" then
+            request(ev, "ROOT", text, vim.tbl_extend("force", opts, { via = "hook" }))
+          else
+            via_terminal(ev, cfg, "ROOT", text, opts, function() end, true)
+          end
+        else
+          request(ev, parent, text, vim.tbl_extend("force", opts, { via = "hook" }))
+        end
+        n = n + 1
+      end
+    end
+  end
+  return n
+end
+
+--- Expire undelivered instructions whose agent finished (events.sweep_steers), tell the user,
+--- and pass delivered instructions on to the parent (notify_parents).
+---@return boolean changed
+function M.sweep_steers()
+  local ev = try_require("agentmap.events")
+  local changed = false
+  if ev and ev.sweep_steers and M.run then
+    local ok, r = pcall(ev.sweep_steers, M.run)
+    changed = ok and r == true
+  end
+  M.notify_expired()
+  local ok, n = pcall(M.notify_parents)
+  if ok and n and n > 0 then changed = true end
+  return changed
 end
 
 return M

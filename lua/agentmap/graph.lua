@@ -576,13 +576,39 @@ local function model_text(a)
   return "model: ?"
 end
 
+--- Options for progress.compute() taken from the view (DESIGN-v0.2 §2.7):
+--- view.now (seconds), view.stats (stats.load()), view.progress (config.progress).
+function M.progress_opts(view)
+  view = view or {}
+  local pcfg = view.progress
+  if type(pcfg) ~= "table" then
+    local c = H.config().progress
+    pcfg = type(c) == "table" and c or {}
+  end
+  return { now = view.now or os.time(), stats = view.stats, config = pcfg }
+end
+
+--- Progress of box `id` for this view (nil: nothing to show). See progress.compute().
+function M.box_progress(state, id, view)
+  local ok, prog = pcall(require, "agentmap.progress")
+  if not ok then return nil end
+  local ok2, r = pcall(prog.compute, state, id, M.progress_opts(view))
+  if ok2 then return r end
+  return nil
+end
+
 local function status_segs(state, a, view)
   local st = a.status or "PENDING"
   local segs = { { M.status_tag(st), M.STATUS_HL[st] or "AgentMapPending" } }
-  local pr = M.progress(state, a.id)
-  if pr then segs[#segs + 1] = { " ~" .. pr.pct .. "%" } end
+  local opts = M.progress_opts(view)
+  local label
+  if opts.config.enabled ~= false and a.kind ~= "group" then
+    label = require("agentmap.progress").label(M.box_progress(state, a.id, view))
+    -- 推定（~）と事実を区別する。幅 24 に収めるため、% があるときは経過時間との間を 1 桁に詰める
+    if label then segs[#segs + 1] = { " " .. label } end
+  end
   local el = H.elapsed_ms(a, view and view.now)
-  if el then segs[#segs + 1] = { "  " .. H.fmt_elapsed(el) } end
+  if el then segs[#segs + 1] = { (label and " " or "  ") .. H.fmt_elapsed(el) } end
   if (a.rework_count or 0) > 0 then
     segs[#segs + 1] = { tr("graph.rework_n", { n = a.rework_count }), "AgentMapRework" }
   end
@@ -604,6 +630,95 @@ function M.check_marks(state, a)
     local c = a.ask_check and state.checks and state.checks[a.ask_check]
     if not (c and c.status == "ANSWERED") then return { { tr("graph.ask"), "AgentMapWaiting" } } end
   end
+  return {}
+end
+
+--- Steering mark (U+270E), or "*" where the terminal draws it two cells wide.
+function M.steer_mark()
+  return vim.fn.strdisplaywidth("✎") == 1 and "✎" or "*"
+end
+
+--- True for a "notice" (the parent being told about an instruction sent to its child; steer appendix E).
+function M.is_notice(x)
+  return type(x) == "table" and x.kind == "notice"
+end
+
+-- 知らせが元の指示を指す欄（W1 の名前が決まるまで、ありうる名前を全部見る）
+local NOTICE_LINK = { "notice_of", "of", "source_id", "about", "for_steer" }
+
+--- The notice sent to the parent about steer `sid` (the latest one), or nil.
+function M.notice_of(state, sid)
+  local all = state and state.steers
+  if type(all) ~= "table" then return nil end
+  local best
+  for _, y in pairs(all) do
+    if M.is_notice(y) then
+      for _, k in ipairs(NOTICE_LINK) do
+        if y[k] == sid then
+          if not best or (H.parse_iso(y.requested_at) or 0) > (H.parse_iso(best.requested_at) or 0) then best = y end
+          break
+        end
+      end
+    end
+  end
+  return best
+end
+
+-- 宛先 id の修正指示の一覧（state.steers_of があればそれ。無ければ同じ形をここで引く）。
+--   親への知らせ（kind = "notice"）は入れない：印を増やさず、元の指示の詳細に出す（付録 E）
+local function steers_of(state, id)
+  local all = state and state.steers
+  if type(all) ~= "table" then return {} end
+  local ok, st = pcall(require, "agentmap.state")
+  if ok and type(st) == "table" and type(st.steers_of) == "function" then
+    local ok2, r = pcall(st.steers_of, state, id)
+    if ok2 and type(r) == "table" then
+      return vim.tbl_filter(function(sid) return all[sid] ~= nil and not M.is_notice(all[sid]) end, r)
+    end
+  end
+  local out, seen = {}, {}
+  local a = state.agents and state.agents[id]
+  for _, sid in ipairs(a and a.steers or {}) do
+    if all[sid] and not seen[sid] and not M.is_notice(all[sid]) then
+      seen[sid] = true
+      out[#out + 1] = sid
+    end
+  end
+  for _, sid in ipairs(state.steer_order or {}) do
+    local x = all[sid]
+    if x and x.agent_id == id and not seen[sid] and not M.is_notice(x) then
+      seen[sid] = true
+      out[#out + 1] = sid
+    end
+  end
+  return out
+end
+M.steers_of = steers_of
+
+M.STEER_RECENT_S = 60 -- 配達済みの印 ✎ を出しておく秒数
+
+--- Steering marks on line 4 of a box (DESIGN-v0.2-steer §6.3):
+--- " ✎n" pending (purple), " ✎!" not delivered before the agent finished (red),
+--- " ✎" delivered within the last 60 s (green), otherwise nothing.
+function M.steer_marks(state, a, now)
+  if not a or type(state) ~= "table" or type(state.steers) ~= "table" then return {} end
+  now = now or os.time()
+  local pending, expired, recent = 0, false, false
+  for _, sid in ipairs(steers_of(state, a.id)) do
+    local x = state.steers[sid]
+    if x.status == "PENDING" then
+      pending = pending + 1
+    elseif x.status == "EXPIRED" then
+      expired = true
+    elseif x.status == "DELIVERED" then
+      local t = H.parse_iso(x.delivered_at)
+      if t and now - t <= M.STEER_RECENT_S then recent = true end
+    end
+  end
+  local mk = M.steer_mark()
+  if pending > 0 then return { { " " .. mk .. pending, "AgentMapWaiting" } } end
+  if expired then return { { " " .. mk .. "!", "AgentMapRework" } } end
+  if recent then return { { " " .. mk, "AgentMapDone" } } end
   return {}
 end
 
@@ -699,11 +814,12 @@ function M.box_spec(node, state, view)
   lines[4] = status_segs(state, a, view)
   -- 人の番の印は状態の札のすぐ後ろに置く（経過時間などで幅が足りなくなっても切れないように）
   local marks = M.check_marks(state, a)
+  -- 修正指示の印は人の番の印の後ろ（DESIGN-v0.2-steer §6.3）
+  vim.list_extend(marks, M.steer_marks(state, a, view and view.now))
   for i, s in ipairs(marks) do table.insert(lines[4], 1 + i, s) end
   if node.collapsed_count then
-    -- 畳んだ数は、印があるときはその後ろへ（[+n] も切れると畳んだことが分からない）
-    local seg = { " [+" .. node.collapsed_count .. "]", "AgentMapIndex" }
-    if #marks > 0 then table.insert(lines[4], 2 + #marks, seg) else table.insert(lines[4], seg) end
+    -- 畳んだ数は札と印のすぐ後ろへ（% と経過時間で幅が埋まっても [+n] が切れないように）
+    table.insert(lines[4], 2 + #marks, { " [+" .. node.collapsed_count .. "]", "AgentMapIndex" })
   end
   return lines, M.STATUS_HL[st] or "AgentMapPending", nil
 end
@@ -867,6 +983,7 @@ function Canvas:finish()
     end
   end
   local lines, marks, line_map = {}, {}, {}
+  self.colbyte = {}
   for y = 0, self.maxy do
     local cr = self.cells[y] or {}
     local hr = self.hl[y] or {}
@@ -885,6 +1002,7 @@ function Canvas:finish()
       end
     end
     colbyte[maxx + 1] = pos
+    self.colbyte[y] = colbyte
     local s = table.concat(parts):gsub("%s+$", "")
     lines[y + 1] = s
     local len = #s
@@ -963,11 +1081,17 @@ local function draw_header(cv, state, view, mode)
   end
   local legend = {
     { "[PENDING]", "AgentMapPending" }, { tr("graph.legend_grey") }, { "[RUNNING]", "AgentMapRunning" }, { tr("graph.legend_yellow") },
-    { "[WAITING]", "AgentMapWaiting" }, { tr("graph.legend_purple") }, { "[REVIEW]", "AgentMapReview" }, { tr("graph.legend_blue") },
+    { "[WAITING]", "AgentMapWaiting" }, { tr("graph.legend_purple") },
+    { (tr("graph.legend_steer"):gsub("✎", M.steer_mark())), "AgentMapWaiting" }, { " " },
+    { "[REVIEW]", "AgentMapReview" }, { tr("graph.legend_blue") },
     { "[DONE]", "AgentMapDone" }, { tr("graph.legend_green") },
     { "[REWORK]", "AgentMapRework" }, { "[FAILED]", "AgentMapFailed" }, { tr("graph.legend_red") },
-    { tr("graph.legend_keys", { mode = mode == "box" and tr("graph.mode_map") or tr("graph.mode_list") }), "AgentMapDim" },
   }
+  if M.progress_opts(view).config.enabled ~= false then
+    legend[#legend + 1] = { tr("graph.legend_est"), "AgentMapDim" }
+    legend[#legend + 1] = { "   " }
+  end
+  legend[#legend + 1] = { tr("graph.legend_keys", { mode = mode == "box" and tr("graph.mode_map") or tr("graph.mode_list") }), "AgentMapDim" }
   -- 畳んだ箱があると子が図から消えて見えるので、開き方をここに出す（- を押したことに気づけるように）
   if next(view.collapsed or {}) then
     legend[#legend + 1] = { tr("graph.legend_collapsed"), "AgentMapReview" }
@@ -1081,6 +1205,28 @@ local function box_layout(state, view, forest, cfg)
   local width = 0
   local late = {}
 
+  -- 光の通り道（DESIGN-v0.2 §3.2）：箱へ入る線のセルを親側 → ▶ の順に覚え、最後にバイト桁へ直す
+  local paths_xy = {}
+  local function lit(c) return c.kind == "agent" or c.kind == "check" end
+  local function path_new(id)
+    local pth = { cells = {}, seen = {} }
+    paths_xy[id] = pth
+    return pth
+  end
+  local function pc(pth, cx, cy)
+    local k = cx .. ":" .. cy
+    if not pth.seen[k] then
+      pth.seen[k] = true
+      pth.cells[#pth.cells + 1] = { cx, cy }
+    end
+  end
+  local function ph(pth, cy, xa, xb)
+    for cx = xa, xb, (xa <= xb and 1 or -1) do pc(pth, cx, cy) end
+  end
+  local function pv(pth, cx, ya, yb)
+    for cy = ya, yb, (ya <= yb and 1 or -1) do pc(pth, cx, cy) end
+  end
+
   local function exit_x(t)
     if has_stages(t) and t.jx then return t.jx end
     return t.x + t.bw
@@ -1153,6 +1299,14 @@ local function box_layout(state, view, forest, cfg)
       for _, c in ipairs(s1) do
         cv:hline(c.cy, bus, c.x - 2, hl1, false, true)
         cv:put(c.x - 1, c.cy, "▶", hl1)
+        if t.kind ~= "start" and lit(c) then
+          local pth = path_new(c.id)
+          pc(pth, x + t.bw - 1, t.cy)
+          ph(pth, t.cy, x + t.bw, bus)
+          pv(pth, bus, t.cy, c.cy)
+          ph(pth, c.cy, bus, c.x - 2)
+          pc(pth, c.x - 1, c.cy)
+        end
         ymin, ymax = math.min(ymin, c.cy), math.max(ymax, c.cy)
         edges[#edges + 1] = { from = t.id, to = c.id,
           kind = c.kind == "gate" and "gate" or c.kind == "check" and "check" or (seq1 and "seq" or "child") }
@@ -1170,6 +1324,26 @@ local function box_layout(state, view, forest, cfg)
         for _, n in ipairs(b) do
           cv:hline(n.cy, sb, n.x - 2, SEQ, false, true)
           cv:put(n.x - 1, n.cy, "▶", SEQ)
+          if lit(n) then
+            -- 前の段で一番近い箱（同じ距離なら上）の出口から
+            local m
+            for _, q in ipairs(a) do
+              if not m or math.abs(q.cy - n.cy) < math.abs(m.cy - n.cy)
+                or (math.abs(q.cy - n.cy) == math.abs(m.cy - n.cy) and q.cy < m.cy) then
+                m = q
+              end
+            end
+            local pth = path_new(n.id)
+            if has_stages(m) and m.jx then
+              ph(pth, m.cy, m.jx, sb)
+            else
+              pc(pth, m.x + m.bw - 1, m.cy)
+              ph(pth, m.cy, m.x + m.bw, sb)
+            end
+            pv(pth, sb, m.cy, n.cy)
+            ph(pth, n.cy, sb, n.x - 2)
+            pc(pth, n.x - 1, n.cy)
+          end
           y0, y1 = math.min(y0, n.cy), math.max(y1, n.cy)
           for _, m in ipairs(a) do
             edges[#edges + 1] = { from = m.id, to = n.id, kind = n.kind == "gate" and "gate" or "seq" }
@@ -1207,9 +1381,19 @@ local function box_layout(state, view, forest, cfg)
 
   draw_header(cv, state, view, "box")
   local lines, marks, line_map = cv:finish()
+  local paths = {}
+  for id, pth in pairs(paths_xy) do
+    local list = {}
+    for _, c in ipairs(pth.cells) do
+      local cb = cv.colbyte[c[2]]
+      local b0, b1 = cb and cb[c[1]], cb and cb[c[1] + 1]
+      if b0 and b1 and b1 > b0 and b1 <= #(lines[c[2] + 1] or "") then list[#list + 1] = { c[2], b0, b1 } end
+    end
+    if #list > 0 then paths[id] = list end
+  end
   return {
     mode = "box", width = width, height = #lines, nodes = nodes, edges = edges, order = order,
-    lines = lines, marks = marks, line_map = line_map,
+    lines = lines, marks = marks, line_map = line_map, paths = paths,
   }
 end
 
@@ -1278,6 +1462,7 @@ local function tree_segs(t, state, view)
   end
   for _, s in ipairs(status_segs(state, a, view)) do segs[#segs + 1] = s end
   for _, s in ipairs(M.check_marks(state, a)) do segs[#segs + 1] = s end
+  for _, s in ipairs(M.steer_marks(state, a, view and view.now)) do segs[#segs + 1] = s end
   if t.collapsed_count then segs[#segs + 1] = { " [+" .. t.collapsed_count .. "]", "AgentMapIndex" } end
   if t.id == "ROOT" and state.title then segs[#segs + 1] = { "   " .. state.title, "AgentMapDim" } end
   if t.id ~= "ROOT" and a.task and a.task ~= a.name then
@@ -1367,7 +1552,7 @@ local function tree_layout(state, view, forest, width)
   local lines, marks, line_map = cv:finish()
   return {
     mode = "tree", width = maxw, height = #lines, nodes = nodes, edges = edges, order = order,
-    lines = lines, marks = marks, line_map = line_map,
+    lines = lines, marks = marks, line_map = line_map, paths = {},
   }
 end
 
@@ -1381,7 +1566,9 @@ end
 
 -- ------------------------------------------------------------
 -- 入口
--- view = { root = "ROOT"|id, collapsed = {id=true}, mode = "box"|"tree"|"auto", width = 列数, now = 秒 }
+-- view = { root = "ROOT"|id, collapsed = {id=true}, mode = "box"|"tree"|"auto", width = 列数, now = 秒,
+--          stats = stats.load() の結果, progress = config.progress }
+-- 戻り値の paths（box だけ）= { [id] = { {row0, byte0, byte1}, … } }：その箱へ入る線のセル（親側 → ▶）
 -- ------------------------------------------------------------
 --- Lay out the map (box or tree view): lines, highlights, and the cursor-to-id tables.
 function M.layout(state, view)

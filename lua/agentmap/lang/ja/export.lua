@@ -37,7 +37,7 @@ return {
   -- 構成図
   ["export.stage"] = "段%{k}",
   ["export.text_tree_intro"] = "文字の図（Mermaid が表示できない場所向け）:",
-  ["export.progress_note"] = "進み具合（~NN%）は「子 Agent のうち DONE になった数 ÷ 子 Agent の数」。子が無い Agent には出さない。",
+  ["export.progress_note"] = "進み具合は「済んだ手順の数 ÷ 全部の手順の数」（親は TaskCreate/TaskUpdate、子は会話記録の「## 手順」）。「~」の付いた数は推定で、実行中の手順を過去の似た作業の典型的な時間（中央値）で補ったもの。手順表の無い動いている Agent は経過時間だけから推定する（上限 95%）。推定は切り捨て。値は書き出した時点のもの。",
   ["export.tree_check_q"] = "「%{q}」",
   -- Agent 一覧
   ["export.agents_header"] = "| # | 名前 | ID | type | model | 親 | status | task | 開始 | 所要 | worktree・branch | review 結果 | 差し戻し |",
@@ -117,4 +117,19 @@ return {
   ["export.pdf_no_output"] = "PDF のコマンドは終わりましたが %{path} ができていません",
   -- md.lua
   ["md.toc"] = "目次",
+  -- v0.2.0: 手順・修正指示
+  ["export.steps_line"] = "> 手順: %{k}/%{n} 済",
+  ["export.steps_progress"] = "進み具合: %{pct}",
+  ["export.h_steers"] = "修正指示",
+  ["export.steer_line"] = "- %{label} — %{time}「%{text}」→ %{outcome}",
+  ["export.steer_delivered"] = "%{time} に配達（%{via}）",
+  ["export.steer_sent"] = "%{time} に端末へ送信",
+  ["export.steer_pending"] = "書き出し時点で未配達",
+  ["export.steer_expired"] = "未配達: %{reason}",
+  ["export.steer_cancelled"] = "取り消し",
+  ["export.steer_none"] = "（修正指示なし）",
+  ["export.ov_steers_label"] = "修正指示",
+  ["export.ov_steers"] = "%{n} 件（未配達 %{pending}）",
+  -- v0.2.0: 親への知らせ
+  ["export.steer_notice"] = "  - 親 %{parent} に知らせた: %{outcome}",
 }

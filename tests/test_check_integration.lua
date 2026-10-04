@@ -80,7 +80,7 @@ t.run(":AgentMap <sid>", function() vim.cmd("AgentMap " .. sid) end)
 t.ok(ui.run and ui.run.sid == sid, "run が開いた")
 t.ok(af._watching(), "見張りが動いている")
 local s = ui.run.state
-t.eq(s.sv, 8, "state の版は 8")
+t.eq(s.sv, 9, "state の版は 9")
 local c = s.checks["check:toolu_Q"]
 t.eq(c and c.status, "WAITING", "質問を出したところ：WAITING")
 t.eq(c and c.agent_id, "a2", "子 a2 の要確認に結びつく（名前）")

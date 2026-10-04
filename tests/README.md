@@ -80,14 +80,16 @@ All paths, user names and project names in the fixtures are anonymized
 
 | File | What it is | Source |
 |---|---|---|
-| `hook_payloads_real.jsonl` | 14 raw hook payloads as Claude Code sends them to the collector | captured from Claude Code **2.1.283**, then anonymized |
-| `hooks_probe.jsonl` | the same payloads after `bin/agentmap-collect` | generated: `bash tests/test_collector.sh --regen-fixture` |
+| `hook_payloads_real.jsonl` | 29 raw hook payloads as Claude Code sends them to the collector: a probe run (ROOT → child → grandchild, 14 lines), a run with the step-list tools `TaskCreate` / `TaskUpdate` / `TaskList` (11 lines), and the `PreToolUse` / `SubagentStop` payloads used by the steering tests (4 lines) | first 14 captured from Claude Code **2.1.283**; the step-list run captured from **2.1.288**; the steering payloads written in the **2.1.288** payload shape; all anonymized |
+| `hooks_probe.jsonl` | the probe run's payloads after `bin/agentmap-collect` (other tests refer to its lines by number; keep the order) | generated: `bash tests/test_collector.sh --regen-fixture` |
+| `hooks_tasks.jsonl` | the step-list run after `bin/agentmap-collect` | generated: `bash tests/test_collector.sh --regen-fixture` |
+| `agent_steps.jsonl` | a sub-agent transcript with a `## Steps` list and a `Step 1 done` mark (plus marks inside tool input / tool results, which must be ignored) | hand-written in the transcript format of Claude Code **2.1.288** |
 | `claude_config/` | a fake Claude Code config dir (`projects/<slug>/<session>.jsonl`, `subagents/`, a Workflow run) | transcripts from Claude Code **2.1.283**, anonymized and trimmed |
 | `agent_report*.jsonl` | sub-agent transcripts with a parent prompt and a final report (Japanese and English variants) | based on Claude Code **2.1.286** transcripts; the `_en` files are hand-written English versions |
 | `convention_cases.jsonl` | writing-convention cases shared by the Lua parser and the Python collector (parity test) | hand-written |
 | `hooks_ask.jsonl`, `transcript_ask.jsonl` | a run that stops for a human check (AskUserQuestion) | hand-written in the recorded format |
 | `events_review.jsonl` | events for the review reducer | hand-written |
-| `state_small.lua`, `state_check.lua`, `transcript_small.jsonl` | small in-memory states for rendering and export | hand-written |
+| `state_small.lua`, `state_check.lua`, `transcript_small.jsonl` | small in-memory states for rendering and export (`state_small.lua` also has step lists on ROOT and `[1]`, and steering instructions on `[2]`) | hand-written |
 
 Hook payloads carry no version field, so the Claude Code version is recorded here. When Claude
 Code changes its hook or transcript format, capture new payloads, anonymize them the same way and

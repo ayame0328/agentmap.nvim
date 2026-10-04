@@ -121,9 +121,17 @@ feed("v")
 ok(ui.layout.mode == "box", "もう一度 v で図")
 
 -- 状態が変わったら refresh で反映（変わった行だけ）
+-- （v0.2.0 で % の出し方が変わった。値そのものは test_progress / test_render が確かめる）
+local function count_done()
+  local n = 0
+  for _ in buftext():gmatch("%[DONE%]") do n = n + 1 end
+  return n
+end
+local done_before = count_done()
 state.agents.a2.status = "DONE"
 ui.refresh()
-ok(buftext():find("~100%", 1, true) ~= nil, "refresh で ROOT の進捗が ~100% に")
+ok(count_done() == done_before + 1, "refresh で a2 が [DONE] に")
+ok(buftext():find("%d%.%d%%") ~= nil, "ROOT の箱に進み具合の % が出ている")
 
 -- 9 は無い番号 → 知らせるだけ
 feed("9")

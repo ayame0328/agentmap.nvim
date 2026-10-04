@@ -141,15 +141,19 @@ local function status_tag(a)
   return "[" .. tostring(a.status or "PENDING") .. "]"
 end
 
---- 客観的な進み具合：子の数のうち終わった数（子が無ければ nil）
+--- 進み具合（DESIGN-v0.2 §2.6）："~62.4%"（推定）/ "66.6%"（事実）/ nil。書き出した時点の値
 local function progress(s, id)
-  local kids = (s._kids or {})[id]
-  if not kids or #kids == 0 then return nil end
-  local done = 0
-  for _, k in ipairs(kids) do
-    if s.agents[k] and s.agents[k].status == "DONE" then done = done + 1 end
-  end
-  return ("~%d%%"):format(math.floor(100 * done / #kids))
+  local prog = try("agentmap.progress")
+  if not prog then return nil end
+  local ok, r = pcall(prog.compute, s, id, { now = s._now, stats = s._stats, config = s._pcfg })
+  if not ok then return nil end
+  return prog.label(r), r
+end
+
+--- 手順表があるか（tasks か steps）
+local function has_steps(a)
+  return (type(a.tasks) == "table" and type(a.tasks.items) == "table" and next(a.tasks.items) ~= nil)
+    or (type(a.steps) == "table" and type(a.steps.items) == "table" and #a.steps.items > 0)
 end
 
 --- 親子の並びを作る：kids[親] = { 子… }（番号順）と、親が分からないもの
@@ -365,9 +369,15 @@ local function index_checks(s)
   return by
 end
 
-local function prepare(state)
+--- opts = { now = 秒, stats = stats.load() の結果 }（進み具合をその時点の値で出すため）
+local function prepare(state, opts)
+  opts = opts or {}
   local s = setmetatable({}, { __index = state })
   s.agents = state.agents or {}
+  s._now = opts.now or os.time()
+  s._stats = opts.stats
+  local cfg = try("agentmap.config")
+  s._pcfg = cfg and type(cfg.get) == "function" and cfg.get().progress or nil
   s.checks = state.checks or {}
   s._check_ids = check_ids(state)
   s._checks = index_checks(s)
@@ -733,11 +743,20 @@ end
 
 --- Build the Markdown document for a run.
 ---@param state table the reduced state (DESIGN §4)
----@param opts? { source?: string }  record source code ("hooks" / "transcript" / "history")
+---@param opts? { source?: string, now?: number, stats?: table }  source: record source code ("hooks" / "transcript" / "history");
+---   now / stats: the moment and the history used for progress (default: os.time() and stats.load())
 ---@return string markdown
 function M.to_markdown(state, opts)
   opts = opts or {}
-  local s = prepare(state)
+  local stats = opts.stats
+  if stats == nil then
+    local st_mod, cfg = try("agentmap.stats"), try("agentmap.config")
+    if st_mod and cfg then
+      local ok, r = pcall(st_mod.load, cfg.root())
+      if ok then stats = r end
+    end
+  end
+  local s = prepare(state, { now = opts.now, stats = stats })
   local out = {}
   local function w(line) out[#out + 1] = line or "" end
   local root = s.agents.ROOT or { id = "ROOT" }
@@ -759,6 +778,32 @@ function M.to_markdown(state, opts)
   end
   local n_checks_text = n_unanswered > 0 and tr("export.ov_checks_unanswered", { n = n_checks, u = n_unanswered })
     or tr("export.ov_checks_n", { n = n_checks })
+  -- 修正指示（DESIGN-v0.2-steer §6.5）：出てきた順
+  local steer_ids, n_steer_pending = {}, 0
+  do
+    local all, seen = type(state.steers) == "table" and state.steers or {}, {}
+    for _, sid in ipairs(state.steer_order or {}) do
+      if all[sid] and not seen[sid] then
+        seen[sid] = true
+        steer_ids[#steer_ids + 1] = sid
+      end
+    end
+    local rest = {}
+    for sid in pairs(all) do
+      if not seen[sid] then rest[#rest + 1] = sid end
+    end
+    table.sort(rest, function(x, y)
+      local tx, ty = parse_iso(all[x].requested_at) or 0, parse_iso(all[y].requested_at) or 0
+      if tx ~= ty then return tx < ty end
+      return x < y
+    end)
+    vim.list_extend(steer_ids, rest)
+    -- 親への知らせ（kind = "notice"）は独立の行にせず、元の指示の下に 1 行（付録 E）
+    steer_ids = vim.tbl_filter(function(sid) return all[sid].kind ~= "notice" end, steer_ids)
+    for _, sid in ipairs(steer_ids) do
+      if all[sid].status == "PENDING" then n_steer_pending = n_steer_pending + 1 end
+    end
+  end
   local run_ms
   local st, en = parse_iso(state.started_at), parse_iso(state.ended_at)
   if st then run_ms = ((en or os.time()) - st) * 1000 end
@@ -797,6 +842,7 @@ function M.to_markdown(state, opts)
     { tr("export.ov_reviews"), tostring(reviews) },
     { tr("export.ov_reworks"), tostring(reworks) },
     { tr("export.ov_checks"), n_checks_text },
+    { tr("export.ov_steers_label"), tr("export.ov_steers", { n = #steer_ids, pending = n_steer_pending }) },
     { tr("export.ov_status"), run_status },
     { tr("export.ov_source"), source_text(opts.source or state.source) },
   }
@@ -896,6 +942,63 @@ function M.to_markdown(state, opts)
   if not any then w(tr("export.rev_none")) end
   w()
 
+  w("## " .. tr("export.h_steers"))
+  w()
+  if #steer_ids == 0 then
+    w(tr("export.steer_none"))
+  end
+  local REASON = { agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
+    no_terminal = "detail.steer_reason_no_terminal" }
+  local function steer_outcome(x)
+    local outcome
+    if x.status == "DELIVERED" then
+      if x.via == "terminal" and (x.delivered_via == nil or x.delivered_via == "terminal") then
+        outcome = tr("export.steer_sent", { time = fmt_dt(x.delivered_at):sub(12) })
+      else
+        outcome = tr("export.steer_delivered", { time = fmt_dt(x.delivered_at):sub(12), via = one_line(x.delivered_via or "-") })
+      end
+    elseif x.status == "EXPIRED" then
+      outcome = tr("export.steer_expired", { reason = REASON[x.end_reason] and tr(REASON[x.end_reason]) or one_line(x.end_reason or "-") })
+    elseif x.status == "CANCELLED" then
+      outcome = tr("export.steer_cancelled")
+    else
+      outcome = tr("export.steer_pending")
+    end
+    return outcome
+  end
+  local NOTICE_LINK = { "notice_of", "of", "source_id", "about", "for_steer" }
+  local function notice_of(sid)
+    local best
+    for _, y in pairs(state.steers or {}) do
+      if y.kind == "notice" then
+        for _, k in ipairs(NOTICE_LINK) do
+          if y[k] == sid then
+            if not best or (parse_iso(y.requested_at) or 0) > (parse_iso(best.requested_at) or 0) then best = y end
+            break
+          end
+        end
+      end
+    end
+    return best
+  end
+  for _, sid in ipairs(steer_ids) do
+    local x = state.steers[sid]
+    local outcome = steer_outcome(x)
+    local target = x.agent_id or "ROOT"
+    local ta = s.agents[target]
+    local label = target == "ROOT" and "ROOT" or (agent_label(s, target) .. (ta and (" " .. cut(name_of(ta), 30)) or ""))
+    local text = cut(x.text or "", 300):gsub("```", "'''")
+    w(tr("export.steer_line", { label = label, time = fmt_dt(x.requested_at):sub(12), text = text, outcome = outcome }))
+    local nt = notice_of(sid)
+    if nt then
+      local p = nt.agent_id or "ROOT"
+      local pa = s.agents[p]
+      local plabel = p == "ROOT" and "ROOT" or (agent_label(s, p) .. (pa and (" " .. cut(name_of(pa), 30)) or ""))
+      w(tr("export.steer_notice", { parent = plabel, outcome = steer_outcome(nt) }))
+    end
+  end
+  w()
+
   w("## " .. tr("export.h_checks"))
   w()
   local function v_or_missing(v)
@@ -981,22 +1084,60 @@ function M.to_markdown(state, opts)
     if vim.fn.strchars(text) > 800 then text = vim.fn.strcharpart(text, 0, 799) .. "…" end
     for _, l in ipairs(vim.split(text:gsub("```", "'''"), "\n", { plain = true })) do w("> " .. l) end
   end
-  local function quote(label, text)
-    w("**" .. label .. "**")
-    w()
-    quote_lines(text)
-    w()
-  end
   local function nonempty(x) return type(x) == "string" and x ~= "" end
   --- Agent の成果：任せた内容（目的など）→ 報告の 4 項目／要確認／原文（設計書 §10）
   --   state が作った report_fields / ask をそのまま使う（ここで報告を読み直さない。設計書 §3.1）
+  --- 手順表（DESIGN-v0.2 §2.6 (3)）："> Steps: 2/3 done" と 1 手順 1 行
+  local function steps_out(a)
+    local rows = {}
+    local tk = a.tasks
+    if type(tk) == "table" and type(tk.items) == "table" and next(tk.items) then
+      local ids, seen = {}, {}
+      for _, tid in ipairs(tk.order or {}) do
+        if tk.items[tid] and not seen[tid] then
+          seen[tid] = true
+          ids[#ids + 1] = tid
+        end
+      end
+      local rest = {}
+      for tid in pairs(tk.items) do
+        if not seen[tid] then rest[#rest + 1] = tid end
+      end
+      table.sort(rest, function(x, y) return (tonumber(x) or math.huge) < (tonumber(y) or math.huge) end)
+      vim.list_extend(ids, rest)
+      for i, tid in ipairs(ids) do
+        local it = tk.items[tid]
+        rows[#rows + 1] = { n = tonumber(tid) or i, text = it.subject or it.active_form or ("#" .. tid),
+          st = it.status == "completed" and "done" or (it.status == "in_progress" and "run" or "todo") }
+      end
+    elseif type(a.steps) == "table" and type(a.steps.items) == "table" and #a.steps.items > 0 then
+      local cur = false
+      for _, it in ipairs(a.steps.items) do
+        local st = "todo"
+        if it.done_at then st = "done" elseif not cur then st, cur = "run", true end
+        rows[#rows + 1] = { n = it.n, text = it.text, st = st }
+      end
+    end
+    if #rows == 0 then return false end
+    local k = 0
+    for _, r in ipairs(rows) do if r.st == "done" then k = k + 1 end end
+    local pl = progress(s, a.id)
+    w(tr("export.steps_line", { k = k, n = #rows }) .. (pl and (" · " .. tr("export.steps_progress", { pct = pl })) or ""))
+    for _, r in ipairs(rows) do
+      local mark = r.st == "done" and "✓" or (r.st == "run" and "▶" or "·")
+      local text = cut(r.text or "", 60):gsub("```", "'''")
+      w("> " .. mark .. " " .. tostring(r.n) .. ". " .. text)
+    end
+    return true
+  end
   local function agent_out(label, a)
     local b, f, ask = a.brief, a.report_fields, a.ask
     local raw = nonempty(a.report) and a.report or (nonempty(a.last_head) and a.last_head or nil)
-    if type(b) ~= "table" and type(f) ~= "table" and type(ask) ~= "table" and not raw then return false end
+    if type(b) ~= "table" and type(f) ~= "table" and type(ask) ~= "table" and not raw and not has_steps(a) then return false end
     w("**" .. label .. "**")
     w()
     local any_part = false
+    if steps_out(a) then any_part = true end
     if type(b) == "table" then
       w(tr("export.out_goal", { text = v_or_missing(b.purpose) }))
       w(tr("export.out_why_delegate", { text = v_or_missing(b.reason) }))
@@ -1032,8 +1173,16 @@ function M.to_markdown(state, opts)
     return true
   end
   local any_out = false
-  if root.last_head and root.last_head ~= "" then
-    quote("ROOT", root.last_head)
+  local root_said = root.last_head and root.last_head ~= ""
+  if root_said or has_steps(root) then
+    w("**ROOT**")
+    w()
+    local st_written = steps_out(root)
+    if root_said then
+      if st_written then w(">") end
+      quote_lines(root.last_head)
+    end
+    w()
     any_out = true
   end
   for _, id in ipairs(s._ids) do

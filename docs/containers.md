@@ -50,19 +50,24 @@ Do it from the host's Neovim, giving the host path of the container's `settings.
 and the hook command as the **container** sees it (`cmd`). First look at the diff:
 
 ```vim
-:lua local ok, r = require("agentmap.hooks").install({ path = vim.fn.expand("~/projects/shared/claude/settings.json"), cmd = "python3 '/workspace/.shared/agentmap/agentmap-collect' --root '/workspace/.shared/agentmap/records'", dry_run = true }); print(r.diff or "no change")
+:lua local ok, r = require("agentmap.hooks").install({ path = vim.fn.expand("~/projects/shared/claude/settings.json"), cmd = "python3 '/workspace/.shared/agentmap/agentmap-collect' --root '/workspace/.shared/agentmap/records'", root = "/workspace/.shared/agentmap/records", dry_run = true }); print(r.diff or "no change")
 ```
 
 Then write it (the original is kept as `settings.json.bak-<timestamp>`; other settings and hooks are left alone;
 running it again changes nothing):
 
 ```vim
-:lua require("agentmap.hooks").install({ path = vim.fn.expand("~/projects/shared/claude/settings.json"), cmd = "python3 '/workspace/.shared/agentmap/agentmap-collect' --root '/workspace/.shared/agentmap/records'" })
+:lua require("agentmap.hooks").install({ path = vim.fn.expand("~/projects/shared/claude/settings.json"), cmd = "python3 '/workspace/.shared/agentmap/agentmap-collect' --root '/workspace/.shared/agentmap/records'", root = "/workspace/.shared/agentmap/records" })
 ```
 
 If the container's `settings.json` is not visible from the host, run the same `install()` with
 Neovim inside the container, or add the `hooks` block by hand: run the dry run against a copy
 of the file and paste the result.
+
+**Give `root` as the container sees the record folder, too.** Since 0.1.1 a second, synchronous
+`PreToolUse` hook delivers steering instructions; it first tests `<root>/steer.pending` with a tiny
+shell check. Without `root`, that path is taken from your host's Neovim (`config.root()`), the
+container cannot see it, and steering instructions never arrive (recording still works).
 
 Instead of `--root`, the record folder can also be set as an environment variable in the
 container's `settings.json` (`"env": { "AGENTMAP_DIR": "/workspace/.shared/agentmap/records" }`)
@@ -111,7 +116,10 @@ require("agentmap").setup({
   cannot see that path, they cannot open it.
 - **Transcripts** (progress notes, `t`, importing old sessions) need `claude_config_dir` to point at
   the container's Claude folder through a shared mount. Without it, the map and the reports still work.
-- **Windows-native Neovim** with a Linux container is experimental in v0.1.0. Give `root` as a
+- **Steering the main session** goes to its terminal only when Claude Code runs in a Neovim
+  `:terminal` (for example `:terminal docker exec -it <container> claude`). Otherwise it falls back to
+  the hook route, which reaches the main session at its next tool call.
+- **Windows-native Neovim** with a Linux container is experimental. Give `root` as a
   Windows path (forward slashes are fine). Please report what does not work.
 - Records contain file names and the start of prompts (see "Privacy" in the README). Keep the record
   folder out of shared drives and out of client repositories.

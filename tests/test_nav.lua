@@ -121,7 +121,7 @@ feed("v")
 ok(ui.layout.mode == "box", "もう一度 v で図")
 
 -- 状態が変わったら refresh で反映（変わった行だけ）
--- （v0.2.0 で % の出し方が変わった。値そのものは test_progress / test_render が確かめる）
+-- （v0.1.1 で % の出し方が変わった。値そのものは test_progress / test_render が確かめる）
 local function count_done()
   local n = 0
   for _ in buftext():gmatch("%[DONE%]") do n = n + 1 end

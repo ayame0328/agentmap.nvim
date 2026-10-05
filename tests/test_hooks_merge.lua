@@ -4,7 +4,7 @@
 --   ・書き換える前に控え（.bak-日時）を作る
 --   ・command は '<python>' '<plugin>/bin/agentmap-collect' --root '<root>'（DESIGN §4.2）
 --   ・status() は installed / outdated / partial / missing
---   ・v0.2.0：PostToolUse に TaskCreate|TaskUpdate|TaskList、PreToolUse に修正指示の配達（同期・門番つき）の 2 組目、
+--   ・v0.1.1：PostToolUse に TaskCreate|TaskUpdate|TaskList、PreToolUse に修正指示の配達（同期・門番つき）の 2 組目、
 --     SubagentStop / Stop は同期で --steer --record（DESIGN-v0.2 §2.2、DESIGN-v0.2-steer §7）
 local t = require("t")
 local J = require("agentmap.jsonfmt")

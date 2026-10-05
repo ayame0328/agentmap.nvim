@@ -271,7 +271,7 @@ return {
   ["jsonfmt.missing_comma_bracket"] = ", か ] がありません",
   ["jsonfmt.bad_value"] = "読めない値があります",
   ["jsonfmt.trailing"] = "余分な文字があります",
-  -- v0.2.0: 進み具合・修正指示（DESIGN-v0.2 付録 B、DESIGN-v0.2-steer 付録 B）
+  -- v0.1.1: 進み具合・修正指示（DESIGN-v0.2 付録 B、DESIGN-v0.2-steer 付録 B）
   ["graph.legend_est"] = "~% 推定（手順表か経過時間）",
   ["graph.legend_steer"] = "✎ 指示",
   ["detail.progress_label"] = "進み具合",
@@ -326,9 +326,9 @@ return {
   ["ui.steer_cancelled"] = "取り消しました",
   ["ui.steer_expired_notice"] = "%{label} への指示は届きませんでした（先に終わりました）",
   ["ui.steer_empty"] = "（空のため送っていません）",
-  -- v0.2.0: 親への知らせ（steer 設計書 付録 E）
+  -- v0.1.1: 親への知らせ（steer 設計書 付録 E）
   ["detail.steer_notice"] = "      → 親 %{parent} に知らせた: ",
-  -- v0.2.0: 送る前に断る（hooks で届ける経路だけ／実行が終わっている）
+  -- v0.1.1: 送る前に断る（hooks で届ける経路だけ／実行が終わっている）
   ["ui.steer_hooks_outdated"] = "hooks の登録が古いので届きません。:AgentMapInstallHooks で登録し直してください",
   ["ui.steer_run_ended"] = "この実行は終わっています。新しい指示は Claude の画面で出してください",
 }

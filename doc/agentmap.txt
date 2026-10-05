@@ -1,6 +1,6 @@
 *agentmap.txt*    Live map of Claude Code agents inside Neovim
 
-Version: 0.2.0 (unreleased)
+Version: 0.1.1
 
 Author:  ayame0328
 License: MIT
@@ -52,7 +52,7 @@ Install with your plugin manager. `setup()` is optional. Then once:
 
 Claude Code in a container: see `docs/containers.md` in the plugin folder.
 
-After upgrading from 0.1.0, run |:AgentMapInstallHooks| again: 0.2.0 records
+After upgrading from 0.1.0, run |:AgentMapInstallHooks| again: 0.1.1 records
 TaskCreate / TaskUpdate / TaskList, adds a synchronous PreToolUse hook that
 delivers steering, and makes SubagentStop synchronous. `:checkhealth agentmap`
 says "outdated" until then. Run it again after changing `steer.mode` or

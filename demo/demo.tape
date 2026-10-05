@@ -1,4 +1,4 @@
-# Demo GIF for the README (v0.2.0). Recorded with vhs (https://github.com/charmbracelet/vhs)
+# Demo GIF for the README (v0.1.1). Recorded with vhs (https://github.com/charmbracelet/vhs)
 # from replayed, made-up hook records: no Claude Code, nothing personal on screen.
 #
 #   bash demo/record.sh        (runs vhs in docker; see the comments there)

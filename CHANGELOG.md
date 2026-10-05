@@ -1,10 +1,9 @@
 # Changelog
 
-All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/).
-The minor version goes up when the record format (`_v` in `hooks.jsonl`, the state cache version)
-changes; records written by older versions stay readable.
+All notable changes are listed here. Records written by older versions stay readable: when the
+state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next open.
 
-## [0.2.0] - unreleased
+## [0.1.1] - 2026-10-05
 
 ### Added
 
@@ -63,7 +62,7 @@ changes; records written by older versions stay readable.
 - A sub-agent's transcript does not exist until its first message; the step list is now looked for
   again after 2 seconds (was 10), so `## Steps` shows up a few seconds after the agent starts.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-02
 
 First public release.
 

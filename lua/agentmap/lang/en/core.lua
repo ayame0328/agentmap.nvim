@@ -69,7 +69,7 @@ return {
   ["health.claude_projects_missing"] = "Claude config dir: %{path} (from %{source}) has no projects/ folder; import and transcripts are unavailable",
   ["health.claude_dir_missing"] = "Claude config dir does not exist: %{path} (from %{source})",
   ["health.hooks_installed"] = "Hooks are registered in %{path}",
-  ["health.hooks_outdated"] = "Hooks in %{path} are outdated (v0.2.0 records TaskCreate/TaskUpdate/TaskList and delivers steering instructions): run :AgentMapInstallHooks",
+  ["health.hooks_outdated"] = "Hooks in %{path} are outdated (v0.1.1 records TaskCreate/TaskUpdate/TaskList and delivers steering instructions): run :AgentMapInstallHooks",
   ["health.hooks_partial"] = "Only some hooks are registered in %{path}; run :AgentMapInstallHooks again",
   ["health.hooks_missing"] = "Hooks are not registered in %{path}; run :AgentMapInstallHooks",
   ["health.store_ok"] = "Record store: %{path} (from %{source}), writable, %{runs} runs",
@@ -87,7 +87,7 @@ return {
   ["health.claude_missing"] = "`claude` is not on PATH (verified with Claude Code %{verified})",
   ["health.lang_ok"] = "Language: %{lang}",
   ["health.lang_missing"] = "Language: %{lang}, %{n} missing keys (English is shown instead): %{keys}",
-  -- v0.2.0: steering command, redo text sent to the terminal (model-facing; steer.redo_en / steer.redo_ja are the same in every language), health rows 10-15
+  -- v0.1.1: steering command, redo text sent to the terminal (model-facing; steer.redo_en / steer.redo_ja are the same in every language), health rows 10-15
   ["init.cmd_steer"] = "AgentMap: send a steering instruction to an agent",
   ["init.steer_usage"] = ":AgentMapSteer {n|id} [text]",
   ["steer.redo_en"] = "[AgentMap] Please redo agent [%{index}] \"%{name}\" (id %{id}, finished %{time}): %{text}. Use the same delegation; report what changed.",
@@ -109,6 +109,6 @@ return {
   ["health.term_ok"] = "Claude terminal: buffer %{buf} (cwd %{cwd})",
   ["health.term_none"] = "No :terminal running claude in this Neovim; main-agent steering falls back to hooks",
   ["health.term_missing"] = "Claude terminal: term module missing; main-agent steering falls back to hooks",
-  -- v0.2.0: notice to the parent of a steered sub-agent (model-facing; the same English text in every language, steer appendix E)
+  -- v0.1.1: notice to the parent of a steered sub-agent (model-facing; the same English text in every language, steer appendix E)
   ["steer.notice_to_parent"] = "[AgentMap] The user sent this instruction directly to your sub-agent [%{index}] \"%{name}\": %{text}. If it also affects other sub-agents or your plan, update them.",
 }

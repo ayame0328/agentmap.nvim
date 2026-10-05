@@ -117,7 +117,7 @@ return {
   ["export.pdf_no_output"] = "PDF のコマンドは終わりましたが %{path} ができていません",
   -- md.lua
   ["md.toc"] = "目次",
-  -- v0.2.0: 手順・修正指示
+  -- v0.1.1: 手順・修正指示
   ["export.steps_line"] = "> 手順: %{k}/%{n} 済",
   ["export.steps_progress"] = "進み具合: %{pct}",
   ["export.h_steers"] = "修正指示",
@@ -130,6 +130,6 @@ return {
   ["export.steer_none"] = "（修正指示なし）",
   ["export.ov_steers_label"] = "修正指示",
   ["export.ov_steers"] = "%{n} 件（未配達 %{pending}）",
-  -- v0.2.0: 親への知らせ
+  -- v0.1.1: 親への知らせ
   ["export.steer_notice"] = "  - 親 %{parent} に知らせた: %{outcome}",
 }

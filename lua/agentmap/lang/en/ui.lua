@@ -271,7 +271,7 @@ return {
   ["jsonfmt.missing_comma_bracket"] = "missing , or ]",
   ["jsonfmt.bad_value"] = "unreadable value",
   ["jsonfmt.trailing"] = "extra characters after the value",
-  -- v0.2.0: progress, steering (DESIGN-v0.2 appendix B, DESIGN-v0.2-steer appendix B)
+  -- v0.1.1: progress, steering (DESIGN-v0.2 appendix B, DESIGN-v0.2-steer appendix B)
   ["graph.legend_est"] = "~% estimate (steps/time)",
   ["graph.legend_steer"] = "✎ steer",
   ["detail.progress_label"] = "progress",
@@ -326,9 +326,9 @@ return {
   ["ui.steer_cancelled"] = "Cancelled",
   ["ui.steer_expired_notice"] = "A steering instruction for %{label} was not delivered: the agent finished first",
   ["ui.steer_empty"] = "(empty; nothing sent)",
-  -- v0.2.0: notice to the parent (steer appendix E)
+  -- v0.1.1: notice to the parent (steer appendix E)
   ["detail.steer_notice"] = "      → told the parent %{parent}: ",
-  -- v0.2.0: refusals before sending (hooks route only / the run has ended)
+  -- v0.1.1: refusals before sending (hooks route only / the run has ended)
   ["ui.steer_hooks_outdated"] = "The registered hooks are outdated, so the instruction would not arrive; run :AgentMapInstallHooks to register them again",
   ["ui.steer_run_ended"] = "This run has ended; give new instructions in Claude's own screen",
 }

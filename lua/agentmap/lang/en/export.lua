@@ -117,7 +117,7 @@ return {
   ["export.pdf_no_output"] = "PDF command finished but did not create %{path}",
   -- md.lua
   ["md.toc"] = "Contents",
-  -- v0.2.0: steps and steering
+  -- v0.1.1: steps and steering
   ["export.steps_line"] = "> Steps: %{k}/%{n} done",
   ["export.steps_progress"] = "Progress: %{pct}",
   ["export.h_steers"] = "Steering instructions",
@@ -130,6 +130,6 @@ return {
   ["export.steer_none"] = "(no steering instructions)",
   ["export.ov_steers_label"] = "Steering",
   ["export.ov_steers"] = "%{n} (%{pending} pending)",
-  -- v0.2.0: notice to the parent
+  -- v0.1.1: notice to the parent
   ["export.steer_notice"] = "  - told the parent %{parent}: %{outcome}",
 }

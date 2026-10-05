@@ -118,7 +118,7 @@ with `:AgentMapRuns` or `:AgentMapImport`.
 
 ### Upgrading
 
-After upgrading from 0.1.0, run `:AgentMapInstallHooks` again. Version 0.2.0 records
+After upgrading from 0.1.0, run `:AgentMapInstallHooks` again. Version 0.1.1 records
 TaskCreate / TaskUpdate / TaskList (the main agent's step list), adds the synchronous
 `PreToolUse` guard that delivers steering, and makes `SubagentStop` synchronous.
 `:checkhealth agentmap` says "outdated" until you do. Run it again as well when you change
@@ -208,7 +208,7 @@ Each box shows how far the agent is, next to its elapsed time:
   started yet (`PENDING`) count as 0, so the number does not run ahead while more are still to come.
 - **Typical times** come from your finished agents (`:checkhealth agentmap` shows how many). With
   no history the default is 10 minutes per agent (`progress.default_ms`). They improve as records
-  accumulate; per-step times are used once v0.2.0 has recorded enough steps.
+  accumulate; per-step times are used once v0.1.1 has recorded enough steps.
 - **Every second.** While something runs, the map is redrawn once a second (only changed lines).
   With a long typical time the last digit moves only every few seconds. Nothing runs while the
   map is hidden or in another tab page. Exports show the value at the time of export.
@@ -537,7 +537,7 @@ The record format is versioned (`_v`). Records written by older versions stay re
 
 ## Status and roadmap
 
-v0.1.0 is the first public release of a tool I built for my own work; v0.2.0 adds progress,
+v0.1.0 is the first public release of a tool I built for my own work; v0.1.1 adds progress,
 the light and steering. I answer issues a few times a week, without promises.
 
 Planned:
@@ -546,7 +546,7 @@ Planned:
 - **Custom markers** for the writing convention (`brief.markers`, reserved now)
 - Automatic cleanup of old records
 - Windows-native Neovim: leave experimental after fixes
-- Per-step typical times improve as records accumulate (v0.2.0 starts recording them)
+- Per-step typical times improve as records accumulate (v0.1.1 starts recording them)
 
 Bug reports are most useful with `:checkhealth agentmap` output and a few lines of `hooks.jsonl`
 (check them for anything private first). See [CONTRIBUTING.md](CONTRIBUTING.md).

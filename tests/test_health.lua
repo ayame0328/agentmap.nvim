@@ -44,7 +44,7 @@ t.eq(c.lang, "en", "既定の言語は en")
 t.eq(c.keymaps.global, false, "グローバルキーは既定で無し")
 t.eq(c.review.provider, "auto", "review.provider")
 t.eq(c.export, {}, "export は既定で空（html_command / pdf_command は nil）")
--- v0.2.0 の既定と false / true の正規化（DESIGN-v0.2 §4.1・付録 D、DESIGN-v0.2-steer §8.1）
+-- v0.1.1 の既定と false / true の正規化（DESIGN-v0.2 §4.1・付録 D、DESIGN-v0.2-steer §8.1）
 t.eq({ c.progress.enabled, c.progress.no_steps, c.progress.default_ms, c.progress.min_samples, c.progress.log, c.progress.tick_ms },
   { true, "time", 600000, 3, true, 1000 }, "progress の既定（手順表が無くても時間で推定）")
 t.eq({ c.animation.enabled, c.animation.frame_ms, c.animation.period, c.animation.tail, c.animation.back_ms, c.animation.max_paths },
@@ -107,7 +107,7 @@ local leftovers = vim.fn.glob(dir .. "/old-store/.agentmap-health-*", false, tru
 t.eq(leftovers, {}, "書き込み確認の一時ファイルは残さない")
 t.eq(vim.fn.filereadable(dir .. "/claude/settings.json"), 0, "health は settings.json を作らない")
 
--- 6. v0.2.0 の 6 行（DESIGN-v0.2 §4.2 の 10〜12、DESIGN-v0.2-steer §8.2 の 13〜15）。担当 W2
+-- 6. v0.1.1 の 6 行（DESIGN-v0.2 §4.2 の 10〜12、DESIGN-v0.2-steer §8.2 の 13〜15）。担当 W2
 local function run_health()
   got = {}
   vim.health = setmetatable({}, { __index = function(_, k)

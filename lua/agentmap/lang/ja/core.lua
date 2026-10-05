@@ -69,7 +69,7 @@ return {
   ["health.claude_projects_missing"] = "Claude の設定フォルダ: %{path}（%{source} から）に projects/ がありません。取り込みと会話記録は使えません",
   ["health.claude_dir_missing"] = "Claude の設定フォルダがありません: %{path}（%{source} から）",
   ["health.hooks_installed"] = "hooks は %{path} に登録済みです",
-  ["health.hooks_outdated"] = "%{path} の hooks は古い形です（v0.2.0 は TaskCreate/TaskUpdate/TaskList の記録と修正指示の配達が増えました）: :AgentMapInstallHooks を実行してください",
+  ["health.hooks_outdated"] = "%{path} の hooks は古い形です（v0.1.1 は TaskCreate/TaskUpdate/TaskList の記録と修正指示の配達が増えました）: :AgentMapInstallHooks を実行してください",
   ["health.hooks_partial"] = "%{path} には hooks の一部しか登録されていません。:AgentMapInstallHooks をもう一度実行してください",
   ["health.hooks_missing"] = "%{path} に hooks が登録されていません。:AgentMapInstallHooks を実行してください",
   ["health.store_ok"] = "記録の保存先: %{path}（%{source} から）、書き込み可、run %{runs} 件",
@@ -87,7 +87,7 @@ return {
   ["health.claude_missing"] = "`claude` が PATH にありません（確認済みの版: Claude Code %{verified}）",
   ["health.lang_ok"] = "言語: %{lang}",
   ["health.lang_missing"] = "言語: %{lang}、訳の無いキーが %{n} 個（英語で表示します）: %{keys}",
-  -- v0.2.0: 修正指示のコマンド、端末へ送るやり直しの文（モデル向け。steer.redo_en / steer.redo_ja はどの言語の表でも同じ文）、health の 10〜15 行目
+  -- v0.1.1: 修正指示のコマンド、端末へ送るやり直しの文（モデル向け。steer.redo_en / steer.redo_ja はどの言語の表でも同じ文）、health の 10〜15 行目
   ["init.cmd_steer"] = "AgentMap: Agent に修正指示を送る",
   ["init.steer_usage"] = ":AgentMapSteer {n|id} [text]",
   ["steer.redo_en"] = "[AgentMap] Please redo agent [%{index}] \"%{name}\" (id %{id}, finished %{time}): %{text}. Use the same delegation; report what changed.",
@@ -109,6 +109,6 @@ return {
   ["health.term_ok"] = "Claude の端末: バッファ %{buf}（%{cwd}）",
   ["health.term_none"] = "この Neovim に claude の端末がありません。親への指示は hooks に落ちます",
   ["health.term_missing"] = "Claude の端末: term モジュールがありません。親への指示は hooks に落ちます",
-  -- v0.2.0: 子への修正指示を親に知らせる文（モデル向け。どの言語の表でも同じ英文。steer 設計書 付録 E）
+  -- v0.1.1: 子への修正指示を親に知らせる文（モデル向け。どの言語の表でも同じ英文。steer 設計書 付録 E）
   ["steer.notice_to_parent"] = "[AgentMap] The user sent this instruction directly to your sub-agent [%{index}] \"%{name}\": %{text}. If it also affects other sub-agents or your plan, update them.",
 }

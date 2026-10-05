@@ -262,7 +262,7 @@ t.run("enrich: 子の transcript から brief", function()
 end)
 
 vim.fn.delete(TMP, "rf")
--- ---------- 手順表（Task ツール）と修正指示の配達の記録（v0.2.0） ----------
+-- ---------- 手順表（Task ツール）と修正指示の配達の記録（v0.1.1） ----------
 do
   local base = { session_id = SID, prompt_id = "pv2", _ts = "2026-10-04T09:00:00.000Z", _src = "claude_hook", _v = 1 }
   local function rec(t2) return vim.tbl_extend("force", base, t2) end

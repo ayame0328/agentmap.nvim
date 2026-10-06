@@ -645,6 +645,30 @@ def claim_hit(side, pause, auto, d, ev):
     return now + auto, False
 
 
+def pause_file_names(root):
+    """どの run にも止まれファイル（<target>.json。.hit.json と書きかけの .tmp.* は除く）があるか"""
+    import glob
+    for f in glob.glob(os.path.join(root, "projects", "*", "runs", "*", "pause", "*.json")):
+        if not f.endswith(".hit.json"):
+            return True
+    return False
+
+
+def clear_pause_flag(root):
+    """hook が自分で止まれを消したあと（期限・上限）、ほかに止まれが無ければ <root>/pause.pending を消す。
+    Neovim が閉じていると印が残り、全セッションの道具 1 回ごとに Python が起動し続けるため。
+    Neovim は「止まれファイルを書く → 印を作る」の順なので、消した後にもう一度見て、あれば印を作り直す"""
+    flag = os.path.join(root, "pause.pending")
+    try:
+        if not os.path.exists(flag) or pause_file_names(root):
+            return
+        os.remove(flag)
+        if pause_file_names(root):
+            os.close(os.open(flag, os.O_WRONLY | os.O_CREAT, 0o600))
+    except OSError:
+        pass
+
+
 def pause_wait(root, d, run, argv):
     """止まれがあれば hook の中で待つ（DESIGN-v0.1.2-pause §3.2）。
     戻り値: 待った場合 {"id", "target", "reason", "waited_ms"}、待たなかった場合 None。
@@ -733,13 +757,14 @@ def pause_wait(root, d, run, argv):
         os.remove(side)
     except OSError:
         pass
+    if reason in ("auto", "max_wait"):
+        clear_pause_flag(root)
     info["reason"] = reason
     info["waited_ms"] = int((time.time() - start) * 1000)
     return info
 
 
 def take_steers(run, target):
-
     """<run>/steer/ の <target>-<ms>.json を ms 順に取る（先に rename して取り合う＝二重配達しない）。
     戻り値: [(steer_id, 本文)]。取れたものは <id>.delivered.json に名前を変える"""
     sdir = os.path.join(run, "steer")

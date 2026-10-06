@@ -175,7 +175,7 @@ local PAUSE_KEYS = {
   "detail.h_pauses", "detail.pause_requested_next", "detail.pause_requested_stop", "detail.pause_gate",
   "detail.pause_paused", "detail.pause_waiting", "detail.pause_resumed_user", "detail.pause_resumed_with",
   "detail.pause_resumed_auto", "detail.pause_resumed_exit", "detail.pause_resumed_gate_off", "detail.pause_aborted",
-  "detail.pause_expired", "detail.pause_reason_finished", "detail.pause_reason_session", "detail.pause_reason_gate_off",
+  "detail.pause_expired", "detail.pause_reason_finished", "detail.pause_reason_session", "detail.pause_reason_gate_off", "detail.pause_reason_stale",
   "detail.pause_duration", "detail.footer",
   "export.h_pauses", "export.pause_line", "export.pause_waiting", "export.pause_resumed_user", "export.pause_resumed_with",
   "export.pause_resumed_auto", "export.pause_resumed_exit", "export.pause_resumed_gate_off", "export.pause_aborted",

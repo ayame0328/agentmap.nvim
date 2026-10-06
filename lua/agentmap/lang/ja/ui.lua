@@ -369,7 +369,7 @@ return {
   ["ui.pause_run_ended"] = "この実行は終わっています。止めるものがありません",
   ["ui.pause_disabled"] = "一時停止は無効です（pause.enabled = false）",
   ["ui.pause_hooks_outdated"] = "登録済みの hooks に一時停止がありません。先に :AgentMapInstallHooks を実行してください",
-  ["ui.pause_failed"] = "%{label} を止められませんでした: %{err}",
+  ["ui.pause_failed"] = "%{label} の一時停止を変えられませんでした: %{err}",
   ["ui.gate_on"] = "この実行の関門を入れました。子は終わる直前に止まります（x で通す／s で直す）",
   ["ui.gate_off"] = "この実行の関門を切りました",
   ["detail.h_pauses"] = "■ 一時停止 (%{n})",
@@ -390,5 +390,6 @@ return {
   ["detail.pause_reason_session"] = "セッションが終わった",
   ["detail.pause_reason_gate_off"] = "関門を切った",
   ["detail.pause_reason_exit"] = "Neovim を閉じた",
+  ["detail.pause_reason_stale"] = "長いあいだ止まらないままだった（取り下げた）",
   ["detail.pause_duration"] = " (%{dur})",
 }

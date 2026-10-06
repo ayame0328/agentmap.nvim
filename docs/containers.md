@@ -65,9 +65,10 @@ Neovim inside the container, or add the `hooks` block by hand: run the dry run a
 of the file and paste the result.
 
 **Give `root` as the container sees the record folder, too.** Since 0.1.1 a second, synchronous
-`PreToolUse` hook delivers steering instructions; it first tests `<root>/steer.pending` with a tiny
-shell check. Without `root`, that path is taken from your host's Neovim (`config.root()`), the
-container cannot see it, and steering instructions never arrive (recording still works).
+`PreToolUse` hook delivers steering instructions; it first tests `<root>/steer.pending` (and, since
+0.1.2, `<root>/pause.pending`) with a tiny shell check. Without `root`, that path is taken from your
+host's Neovim (`config.root()`), the container cannot see it, and steering instructions and pauses
+never arrive (recording still works).
 
 Instead of `--root`, the record folder can also be set as an environment variable in the
 container's `settings.json` (`"env": { "AGENTMAP_DIR": "/workspace/.shared/agentmap/records" }`)

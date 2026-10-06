@@ -767,6 +767,8 @@ function M.paused_ms(state, id, now, since)
   for _, pid in ipairs(M.pauses_of(state, id)) do
     local x = all[pid]
     local h = M.pause_time(x.hit_at)
+    -- 流れの写しでは、流れの外の宛先の止まれが ROOT に付く（owner_id）。止まっていたのはその宛先なので数えない
+    if x.agent_id ~= nil and x.agent_id ~= id then h = nil end
     if h and (x.status == "PAUSED" or x.status == "RESUMED" or x.status == "EXPIRED") then
       local e = M.pause_time(x.released_at)
       if not e then

@@ -758,7 +758,8 @@ local function pause_clock(v)
 end
 
 local PAUSE_REASON = { agent_finished = "detail.pause_reason_finished", session_ended = "detail.pause_reason_session",
-  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit" }
+  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit",
+  stale = "detail.pause_reason_stale" }
 
 --- One "## Pauses" line (DESIGN-v0.1.2-pause §6.6), e.g.
 --- "- [3] name — 10:21:03 pause → paused 10:21:09 (PreToolUse:Read) → resumed by the user 10:24:40 with instruction #2".

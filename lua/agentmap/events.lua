@@ -557,8 +557,30 @@ function M.cancel_steer(run, steer_id)
 end
 
 --- 宛先が終わったか（終わってから STEER_EXPIRE_GRACE 秒たったか）。理由の符号か nil
+-- 止まれの hook に渡した指示の猶予（秒）。止まれを消してから hook が指示を取りに来るまで（ふだん 0.1 秒以内）
+local STEER_HANDOFF_GRACE = 10
+
+--- 宛先を止まれの hook が握っている（PAUSED）か、その hook に今渡した指示（止まれをこの指示つきで解いた直後）か。
+--- 関門で終わる前に止まっている子・Stop で止まっている ROOT は、終わりの記録がもう書かれていて終わって見えるが、
+--- hook は止まれが消えた後でこの指示を配達する（DESIGN-v0.1.2-pause §5.4）。そのあいだは片付けない
+local function held_by_pause(s, st, now)
+  if type(s.pauses) ~= "table" then return false end
+  for _, pid in ipairs(s.pause_order or {}) do
+    local p = s.pauses[pid]
+    if p and p.agent_id == st.agent_id then
+      if p.status == "PAUSED" then return true end
+      if p.status == "RESUMED" and p.steer_id == st.id then
+        local r = util.parse_iso(p.released_at)
+        if not r or now - r < STEER_HANDOFF_GRACE then return true end
+      end
+    end
+  end
+  return false
+end
+
 local function expire_reason(s, st, now)
   if s.ended_at then return "session_ended" end
+  if held_by_pause(s, st, now) then return nil end
   if st.agent_id == "ROOT" then
     -- ROOT は指示の番が終わって、その流れに動いているものが無ければ（止まっている ROOT には hooks で届かない）
     local f = st.prompt_id and state_mod.flow_of(s, st.prompt_id)

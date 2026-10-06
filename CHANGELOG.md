@@ -14,7 +14,7 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   agent sees nothing; `s` on a paused box resumes it with the instruction on the spot, through the
   same hook (the main agent included). A pause left alone resumes by itself after
   `pause.auto_resume_s` (600 s); the hook keeps that deadline itself, so it holds when Neovim is
-  closed or the computer sleeps.
+  closed or the computer sleeps (and removes the `pause.pending` flag when no pause is left).
 - Gate: `X` (or `:AgentMapGate [on|off]`, `pause.gate` for runs you start watching) makes every
   running sub-agent of the run wait when it tries to finish. Its report can already be read;
   `x` on the box offers Pass (let it finish), Fix (write an instruction; it continues) or Keep

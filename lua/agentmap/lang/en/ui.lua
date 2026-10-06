@@ -369,7 +369,7 @@ return {
   ["ui.pause_run_ended"] = "This run has ended; nothing to pause",
   ["ui.pause_disabled"] = "Pausing is off (pause.enabled = false)",
   ["ui.pause_hooks_outdated"] = "The registered hooks have no pause support: run :AgentMapInstallHooks first",
-  ["ui.pause_failed"] = "Could not pause %{label}: %{err}",
+  ["ui.pause_failed"] = "Could not change the pause of %{label}: %{err}",
   ["ui.gate_on"] = "Gate on for this run: every sub-agent waits at its end (x pass / s fix)",
   ["ui.gate_off"] = "Gate off for this run",
   ["detail.h_pauses"] = "■ Pauses (%{n})",
@@ -390,5 +390,6 @@ return {
   ["detail.pause_reason_session"] = "the session ended",
   ["detail.pause_reason_gate_off"] = "the gate was turned off",
   ["detail.pause_reason_exit"] = "Neovim closed",
+  ["detail.pause_reason_stale"] = "nothing reached it for too long (withdrawn)",
   ["detail.pause_duration"] = " (%{dur})",
 }

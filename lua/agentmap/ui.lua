@@ -1245,7 +1245,9 @@ end
 function M.steer_hooks_ok()
   local hooks = try_require("agentmap.hooks")
   if not hooks or type(hooks.status) ~= "function" then return true end
-  local ok, st = pcall(hooks.status)
+  -- 修正指示は一時停止の有無に関係なく届く（v0.1.1 の登録のままでも動く。DESIGN-v0.1.2-pause §7.2）ので、
+  -- 一時停止の条件（--pause と長い timeout）は見ない
+  local ok, st = pcall(hooks.status, nil, nil, false)
   if not ok then return true end
   return st == "installed"
 end
@@ -1765,9 +1767,15 @@ local function pause_events(fn)
   return ev
 end
 
---- True when the registered hooks can pause (the same check as steering: hooks.status() is
---- "installed", which in v0.1.2 also means the delivery hooks carry --pause and a long timeout).
-function M.pause_hooks_ok() return M.steer_hooks_ok() end
+--- True when the registered hooks can pause: hooks.status() is "installed", which in v0.1.2 also
+--- means the delivery hooks carry --pause and a long timeout (steering only needs the (event, matcher) pairs).
+function M.pause_hooks_ok()
+  local hooks = try_require("agentmap.hooks")
+  if not hooks or type(hooks.status) ~= "function" then return true end
+  local ok, st = pcall(hooks.status)
+  if not ok then return true end
+  return st == "installed"
+end
 
 -- 秒 → "10:00"（自動再開までの長さ）
 local function mmss(secs) return graph.util.fmt_elapsed((tonumber(secs) or 600) * 1000) end
@@ -2010,12 +2018,12 @@ function M.toggle_gate(on)
   end
   local ev = pause_events("set_gate")
   if not ev then
-    notify(pt("ui.pause_failed", { label = "gate", err = "events.set_gate is missing" }), vim.log.levels.WARN)
+    notify(pt("ui.pause_failed", { label = t("keymaps.desc_gate"), err = "events.set_gate is missing" }), vim.log.levels.WARN)
     return nil
   end
   local ok, r = pcall(ev.set_gate, M.run, on)
   if not ok or r == false then
-    notify(pt("ui.pause_failed", { label = "gate", err = tostring(ok and "write failed" or r) }), vim.log.levels.WARN)
+    notify(pt("ui.pause_failed", { label = t("keymaps.desc_gate"), err = tostring(ok and "write failed" or r) }), vim.log.levels.WARN)
     return nil
   end
   notify(pt(on and "ui.gate_on" or "ui.gate_off"))

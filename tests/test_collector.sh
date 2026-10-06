@@ -452,7 +452,7 @@ PY
 
 # 4h) --pause：止まれファイルがある間 hook の中で待つ（DESIGN-v0.1.2-pause §3.2、§10 の (a)〜(j)）
 python3 - "$COLLECT" "$TMP/pause" "$RAW" <<'PY' || FAIL=1
-import json, sys, os, subprocess, time, threading
+import json, sys, os, subprocess, time, threading, shutil
 collect, root, raw = sys.argv[1:4]
 bad = []
 def check(c, msg):
@@ -536,6 +536,27 @@ code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10")
 ps = pause_lines(n0)
 check(dt < 0.8 and [p["phase"] for p in ps] == ["released"] and ps[0]["reason"] == "auto", "(d) past deadline: released at once, reason auto")
 check(not os.path.exists(PF) and not os.path.exists(SIDE), "(d) the hook removed the pause file itself")
+# (d2) 期限で解いた hook は、ほかに止まれが無ければ <root>/pause.pending も消す（Neovim が閉じていても遅いままにしない）。
+#      ほかの run に止まれがあれば残す
+FLAGP = os.path.join(root, "pause.pending")
+other = os.path.join(root, "projects", "-other", "runs", "s9", "pause")
+os.makedirs(other, exist_ok=True)
+open(os.path.join(other, "ROOT.hit.json"), "w").close()  # .hit.json は数えない
+for keep in (False, True):
+    if keep:
+        open(os.path.join(other, "ROOT.json"), "w").close()
+    pid = put_pause()
+    open(FLAGP, "w").close()
+    with open(SIDE, "w") as f:
+        json.dump({"id": pid, "deadline": int(time.time()) - 5}, f)
+    call(pre_child, *ARGS, "--max-wait", "10")
+    if keep:
+        check(os.path.exists(FLAGP), "(d2) auto release keeps pause.pending while another run has a pause file")
+    else:
+        check(not os.path.exists(FLAGP), "(d2) auto release removes pause.pending when no pause file is left")
+shutil.rmtree(os.path.join(root, "projects", "-other"))
+if os.path.exists(FLAGP):
+    os.remove(FLAGP)
 
 # (e) at = stop は PreToolUse では止めない。SubagentStop では止まる
 pid = put_pause(at="stop", kind="gate")

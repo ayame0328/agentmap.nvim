@@ -489,6 +489,12 @@ t.run("v0.1.2 detail: pauses", function()
   sp.steer_order = { "a1-s" }
   sp.agents.a1.steers = { "a1-s" }
   local d = detail.build(sp, sp.agents.a1, { width = 200, now = NOW })
+  -- 取り残しとして取り下げた（sweep_pauses の end_reason = "stale"）も鍵の文で出す（符号のまま出さない）
+  local stale_segs = detail.pause_line(sp, { kind = "pause", at = "next", status = "EXPIRED", requested_at = iso(NOW - 9000),
+    end_reason = "stale" }, 1, NOW)
+  local stale_text = ""
+  for _, sg in ipairs(stale_segs) do stale_text = stale_text .. sg[1] end
+  t.matches(stale_text, "not reached: nothing reached it for too long %(withdrawn%)$", "end_reason stale は文で出す")
   has(d, "■ Pauses (8)", "節の見出しと件数")
   t.matches(text(d), "\n  " .. vim.pesc(mk) .. " #1 " .. clk(NOW - 3000) .. " requested %(next tool call%) → paused "
     .. clk(NOW - 2994) .. " at PreToolUse:Read → resumed by you " .. clk(NOW - 2783) .. " with instruction #2 %(3 min 31 s%)\n",

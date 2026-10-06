@@ -237,7 +237,8 @@ end
 --- Build the detail lines of `agent` (pure). Returns { lines, marks, links }.
 -- 一時停止 1 件の結果（§6.4）。止まった・再開の文と色
 local PAUSE_REASON = { agent_finished = "detail.pause_reason_finished", session_ended = "detail.pause_reason_session",
-  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit" }
+  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit",
+  stale = "detail.pause_reason_stale" }
 
 local function clock_of(v)
   local tsec = graph.pause_time(v)

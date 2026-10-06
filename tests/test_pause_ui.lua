@@ -259,6 +259,12 @@ t.run("refusals", function()
   ui.pause_toggle("a1")
   t.eq(fns(n0), { "resume_pause" }, "再開は登録に関係なくできる")
   clear_pauses()
+  -- v0.1.1 の登録（組は同じ・--pause 無し）：修正指示は今までどおり送れる、一時停止だけ断る
+  local real_status = hooks.status
+  hooks.status = function(_path, _scfg, pcfg) return pcfg == false and "installed" or "outdated" end
+  t.eq(ui.steer_hooks_ok(), true, "v0.1.1 の登録でも修正指示は届く（一時停止の条件は見ない）")
+  t.eq(ui.pause_hooks_ok(), false, "v0.1.1 の登録では一時停止は断る")
+  hooks.status = real_status
   hooks_status = "installed"
   -- pause.enabled = false
   config.get().pause = { enabled = false }

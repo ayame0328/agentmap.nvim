@@ -154,6 +154,28 @@ vim.fn.writefile({}, FLAG)
 t.eq(events._sweep_pause_flag(run), false, "flag kept while another run has a pause file")
 os.remove(old)
 
+-- 関門の「直す」：止まっている子（終わりの記録で DONE に見える）への指示は、止まれを消した後に hook が配達する。
+-- そのあいだ（と解いた直後）に Neovim の掃除が指示を「届かなかった」として消さない
+local Z = "afeed000000000059"
+append_hooks({ hook("SubagentStart", 52, { agent_id = Z, agent_type = "general-purpose" }) })
+events.poll(run)
+local idz = events.request_pause(run, Z, { at = "stop", kind = "gate" })
+append_hooks({
+  hook("SubagentStop", 53, { agent_id = Z, last_head = "report" }),
+  hook("SubagentStop", 53, { agent_id = Z, pause = { id = idz, phase = "hit", kind = "gate", at = "stop", target = Z } }),
+})
+events.poll(run)
+t.eq(state.display_status(run.state, Z), "GATE", "Z waits at the gate (finished long ago by its stop record)")
+local sfix = events.request_steer(run, Z, "fix it", { via = "hook" })
+t.eq(events.sweep_steers(run), false, "sweep keeps an instruction to an agent held at its end")
+events.resume_pause(run, Z, { steer_id = sfix })
+append_hooks({ hook("PreToolUse", 54, { agent_id = A, tool_name = "Read", tool_use_id = "toolu_fix" }) })
+events.poll(run)
+events.sweep_steers(run)
+t.ok(exists(run_dir .. "/steer/" .. sfix .. ".json"), "… and right after the pause was removed with it (the hook takes it)")
+t.eq(run.state.steers[sfix].status, "PENDING", "the instruction stays PENDING for the hook")
+t.eq(events.sweep_steers(run, os.time() + 60), true, "a while after the hand-off it expires like any other")
+
 -- ---------- 4. gate ----------
 -- 新しい子 2 つ（RUNNING）、ROOT と終わった子には置かない
 local D, E = "afeed000000000054", "afeed000000000055"

@@ -370,7 +370,8 @@ run on screen). When Claude Code exits, the waiting hook ends and the pause
 is recorded as ended.
 
 Cost: nothing paused, 1-2 ms per tool call as before; while any pause file
-exists (always while a gate is on), about 15-20 ms per tool call. Files:
+exists (always while a gate is on), about 15-20 ms per tool call. When the
+last pause resumes by itself the hook also removes the flag. Files:
 `<run>/pause/<agent>.json` (0600), `<agent>.hit.json` (written by the hook),
 `<run>/pause/GATE`, and the flag `<root>/pause.pending`.
 

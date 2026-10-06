@@ -498,7 +498,9 @@ file every 100 ms) instead of returning. Removing the file (`x`) lets the hook r
   keep working.
 - **Cost.** With nothing paused, a tool call costs the same 1–2 ms shell check as before. While
   any pause file exists (always, while a gate is on), each tool call starts the recorder
-  (about 15–20 ms). A waiting hook checks one file every 100 ms (under 1% of a CPU).
+  (about 15–20 ms). When the last pause resumes by itself, the hook removes the flag too, so a
+  closed Neovim does not leave every session slower. A waiting hook checks one file every 100 ms
+  (under 1% of a CPU).
 - **Files.** `<root>/projects/<project>/runs/<session>/pause/<agent>.json` is the pause (mode 0600,
   no text), `<agent>.hit.json` is written by the hook when the agent stopped (time, deadline, tool
   name), `GATE` marks a run whose gate is on, and `<root>/pause.pending` is the flag the shell check

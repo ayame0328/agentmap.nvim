@@ -467,6 +467,12 @@ ok(graph.paused_ms(xm, "a1", NOW) == 40000, "paused_ms：PAUSED は今まで")
 ok(graph.paused_ms(xm, "a1", NOW, NOW - 10) == 10000, "paused_ms：since より後だけ")
 ok(graph.paused_ms(with_pause({ status = "EXPIRED", hit_at = iso(NOW - 40) }), "a1", NOW) == 0, "paused_ms：EXPIRED で解放時刻なし → 0")
 ok(graph.paused_ms(with_pause(nil), "a1", NOW) == 0, "paused_ms：止まれ無し → 0")
+-- 流れの写しで ROOT に付け替えた（owner_id）流れの外の宛先の止まれは、ROOT の止まっていた時間に数えない
+local xo = with_pause(nil)
+xo.pauses = { ["zz-1"] = { id = "zz-1", agent_id = "zz", owner_id = "ROOT", status = "RESUMED",
+  requested_at = iso(NOW - 60), hit_at = iso(NOW - 50), released_at = iso(NOW - 20) } }
+xo.pause_order = { "zz-1" }
+ok(graph.paused_ms(xo, "ROOT", NOW, NOW - 100) == 0, "paused_ms：ROOT に付けた別の宛先の止まれは数えない")
 
 -- 所要時間の文
 require("agentmap.i18n").setup("en")

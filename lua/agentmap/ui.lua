@@ -1928,6 +1928,9 @@ function M.gate_menu(id)
   if not aid then return end
   local items = { pt("ui.pause_pass"), pt("ui.pause_fix"), pt("ui.pause_keep_gate") }
   vim.ui.select(items, { prompt = pt("ui.pause_prompt", { label = label_of(aid) }) }, function(_, idx)
+    -- the built-in select leaves its list in the message area; clear it so that the notice of the
+    -- choice (e.g. "resumed") does not end in a "Press ENTER" prompt
+    pcall(vim.cmd, "redraw")
     if idx == 1 then
       M.pause_resume(aid)
     elseif idx == 2 then

@@ -672,6 +672,49 @@ n0 = len(lines())
 code, out, err, dt = call(pre_child, "--steer", "--mode", "deny")
 check(out == "" and dt < 0.8 and pause_lines(n0) == [], "without --pause: a pause file is ignored (v0.1.1 registration)")
 os.remove(PF)
+
+# (k) SessionEnd（記録係、--steer 無し＝v0.1.1 の登録でも同じ command）：この run の止まれファイルと .hit.json を片付け、
+#     ほかに止まれが無ければ pause.pending も消す。GATE は残す。記録の 1 行は今までどおり。ほかの記録では片付けない
+end_ev = {k: v for k, v in pre_child.items() if k not in ("agent_id", "tool_name", "tool_use_id", "tool_input")}
+end_ev.update({"hook_event_name": "SessionEnd", "reason": "prompt_input_exit"})
+ROOTF, GATE = os.path.join(pdir, "ROOT.json"), os.path.join(pdir, "GATE")
+other = os.path.join(root, "projects", "-other", "runs", "s9", "pause")
+os.makedirs(other, exist_ok=True)
+def stage(keep_other):
+    put_pause(); put_pause(target="ROOT")
+    with open(SIDE, "w") as f:
+        json.dump({"id": "x", "deadline": int(time.time()) + 600}, f)
+    open(GATE, "w").close()
+    open(FLAGP, "w").close()
+    if keep_other:
+        open(os.path.join(other, "ROOT.json"), "w").close()
+stage(keep_other=True)
+n0 = len(lines())
+code, out, err, dt = call(stop_first)  # 普通の記録（SubagentStop）では片付けない
+check(code == 0 and out == "" and os.path.exists(PF) and os.path.exists(ROOTF) and os.path.exists(SIDE) and os.path.exists(FLAGP),
+      "(k) an ordinary record (SubagentStop) leaves the pause files and the flag alone")
+code, out, err, dt = call(end_ev)
+rec = lines()[-1]
+check(code == 0 and out == "" and err == "", "(k) SessionEnd: exit 0, silent")
+check(rec.get("hook_event_name") == "SessionEnd" and rec.get("reason") == "prompt_input_exit" and "pause" not in rec,
+      "(k) SessionEnd: the ordinary record is written as before")
+check(not os.path.exists(PF) and not os.path.exists(ROOTF) and not os.path.exists(SIDE),
+      "(k) SessionEnd: the run's pause files and .hit.json are removed")
+check(os.path.exists(GATE), "(k) SessionEnd: GATE (Neovim's mark) is kept")
+check(os.path.exists(FLAGP) and os.path.exists(os.path.join(other, "ROOT.json")),
+      "(k) SessionEnd: pause.pending stays while another run still has a pause file")
+os.remove(os.path.join(other, "ROOT.json"))
+stage(keep_other=False)
+code, out, err, dt = call(end_ev)
+check(code == 0 and out == "" and not os.path.exists(PF) and not os.path.exists(FLAGP),
+      "(k) SessionEnd: pause.pending is removed when no pause file is left anywhere")
+# run フォルダに pause/ が無くても・印が無くても、何も起きずに記録だけ
+code, out, err, dt = call(end_ev)
+check(code == 0 and out == "" and err == "" and lines()[-1].get("hook_event_name") == "SessionEnd",
+      "(k) SessionEnd without pause files: record only, no error")
+check(not os.path.isfile(os.path.join(root, "collector.log")) or "SessionEnd" not in open(os.path.join(root, "collector.log")).read(),
+      "(k) SessionEnd: nothing logged to collector.log")
+shutil.rmtree(os.path.join(root, "projects", "-other"))
 sys.exit(1 if bad else 0)
 PY
 

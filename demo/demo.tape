@@ -1,22 +1,27 @@
-# Demo GIF for the README (v0.1.1). Recorded with vhs (https://github.com/charmbracelet/vhs)
+# Demo GIF for the README (v0.1.2). Recorded with vhs (https://github.com/charmbracelet/vhs)
 # from replayed, made-up hook records: no Claude Code, nothing personal on screen.
 #
 #   bash demo/record.sh        (runs vhs in docker; see the comments there)
 #
-# Timeline (seconds after replay.py starts; see demo/scenario.jsonl):
+# Timeline (seconds after replay.py starts; see demo/scenario.jsonl). A pause holds the replayed
+# hook exactly as it holds Claude Code, so everything after a pause happens that much later:
 #    0  prompt; the parent creates three tasks (TaskCreate) and starts two agents
 #       (Survey: no step list -> "~" from elapsed time; Design: "## Steps" -> steps as fact)
 #  6.5  Survey reports; 9 Design reports (the light flows back to the parent for 3 s)
 #   10  Implement starts and writes its "## Steps"
-#   11  the user presses `s` on Implement and writes a steering instruction  -> " ✎1" (purple)
-#   19  Implement's next tool call is stopped and gets the text          -> " ✎"  (green);
-#       the parent is told (no terminal here, so through the hooks)
-#   22  Implement stops with "Needs confirmation"; 23.5 the parent asks the user
-#       -> HUMAN CHECK, WAITING (purple light); the detail view of Implement shows its steps,
-#          the instruction and "told the parent"
-#   31  the user answers -> HUMAN CHECK DONE (green); Tests run; 37.6 the prompt ends -> END [DONE]
-# The map is shown from about t = 1.6 (after the hidden setup); the sleeps below line the key
-# presses up with t = 11 (Implement is running) and t = 24.5 (the question is on screen).
+#   11  the user opens Implement's detail (`3`) and presses `x`              -> " ⏸" (orange)
+# 14.2  Implement's next tool call is held by the hook                       -> [PAUSED] (orange),
+#       the light on its line stops, its % stops moving
+#   18  the user presses `s` and writes an instruction; Ctrl+S resumes Implement with it
+#       (about 9 s paused)                                                   -> " ✎" (delivered)
+#   25  `q` closes the detail, `X` turns the gate on for the run              -> " ⏸" on Implement
+# 26.6  Implement tries to finish ("Needs confirmation") and waits at the gate -> [GATE] (orange);
+#       its report is already in the detail view (`3`)
+#   34  `x` on the box -> Pass (1); `X` turns the gate off; the parent asks the user
+#       -> HUMAN CHECK, WAITING (purple light); Implement's detail shows the pause and the
+#          instruction
+#   42  the user answers -> HUMAN CHECK DONE (green); Tests run; ~49 the prompt ends -> END [DONE]
+# The map is shown from about t = 1.6 (after the hidden setup).
 
 Output demo/agentmap.gif
 
@@ -40,10 +45,15 @@ Show
 # Survey and Design run (one with steps, one estimated from time), then Implement starts
 Sleep 9.6s
 
-# Steer Implement: `3` opens its detail view (steps on the right), `s` there opens the steering
-# menu, 1 = write an instruction, Ctrl+S sends
+# Pause Implement: `3` opens its detail view (steps on the right), `x` places the pause.
+# Its next tool call (t = 14.2) is held -> [PAUSED], the light stops
 Type "3"
 Sleep 500ms
+Type "x"
+Sleep 6s
+
+# Resume it with an instruction: `s` opens the steering menu, 1 = write an instruction, Ctrl+S
+# sends it; the held hook delivers it on the spot and Implement goes on
 Type "s"
 Sleep 800ms
 Type "1"
@@ -52,11 +62,30 @@ Sleep 700ms
 Type "Quote every field that contains a comma."
 Sleep 300ms
 Ctrl+S
+Sleep 1.5s
 
-# " ✎1" while it waits; at t = 19 the next tool call delivers it -> " ✎", the parent is told
-Sleep 7.8s
+# Gate: close the detail, `X` makes every sub-agent wait before it finishes
+Type "q"
+Sleep 300ms
+Type "X"
 
-# The parent asks the user (HUMAN CHECK, purple). Refresh Implement's detail: steps, steering, notice
+# Implement tries to finish at t = 26.6 and waits -> [GATE]; open its detail (report, pauses)
+Sleep 5s
+Type "3"
+Sleep 2.5s
+
+# `x` on the waiting box: Pass (1) lets it finish; then the gate goes off (`X`)
+Type "x"
+Sleep 1.2s
+Type "1"
+Enter
+Sleep 1s
+Type "q"
+Sleep 300ms
+Type "X"
+
+# The parent asks the user (HUMAN CHECK, purple). Refresh Implement's detail: steps, pause, steering
+Sleep 1.5s
 Type "3"
 Sleep 4.8s
 
@@ -65,4 +94,4 @@ Type "q"
 Sleep 300ms
 # Scroll the map back to the left edge (the side view had pushed it sideways)
 Type "0"
-Sleep 9.8s
+Sleep 9.5s

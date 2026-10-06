@@ -367,7 +367,8 @@ Esc in Claude Code interrupts the main agent's turn only; a pause on ROOT
 stays placed and stops it again at its next tool call. Closing Neovim does
 nothing by default (`pause.release_on_exit = true` resumes every pause of the
 run on screen). When Claude Code exits, the waiting hook ends and the pause
-is recorded as ended.
+is recorded as ended; at the end of a session the recorder removes that
+run's pause files (and the flag when none is left anywhere).
 
 Cost: nothing paused, 1-2 ms per tool call as before; while any pause file
 exists (always while a gate is on), about 15-20 ms per tool call. When the

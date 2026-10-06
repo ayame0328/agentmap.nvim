@@ -62,26 +62,34 @@ RECORD_MATCH = {
                     "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskList"},
     "PostToolUseFailure": {"Agent", "AskUserQuestion"},
 }
-# SubagentStop / Stop are registered once, synchronously, as "record + deliver" (steer at stop).
+# SubagentStop / Stop are registered once, synchronously, as "record + deliver" (steer at stop,
+# and since 0.1.2 "--pause --max-wait": the hook waits inside while a pause file exists).
 STOP_EVENTS = {"SubagentStop", "Stop"}
+PAUSE_ARGS = ["--pause", "--max-wait", "600"]
 
 
 def run_hooks(python, root, ev, data):
-    """Call the collector the way the registered hooks would for this payload."""
+    """Call the collector the way the registered hooks would for this payload.
+    Returns the seconds the synchronous hook took: while the agent is paused (demo: `x` on its box)
+    the delivery hook blocks here, exactly as it does inside Claude Code."""
     name = ev.get("hook_event_name")
+    t0 = time.monotonic()
     if name == "PreToolUse":
-        # the steering guard: `[ -e <root>/steer.pending ] || exit 0; exec ... --steer --mode deny`
-        if os.path.exists(os.path.join(root, "steer.pending")):
-            subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny"],
+        # the delivery guard: `[ -e <root>/steer.pending ] || [ -e <root>/pause.pending ] || exit 0;
+        #                      exec ... --steer --mode deny --pause --max-wait 600`
+        if (os.path.exists(os.path.join(root, "steer.pending"))
+                or os.path.exists(os.path.join(root, "pause.pending"))):
+            subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny"] + PAUSE_ARGS,
                            input=data, check=False, stdout=subprocess.DEVNULL)
     if name in STOP_EVENTS:
-        subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny", "--at-stop", "--record"],
-                       input=data, check=False, stdout=subprocess.DEVNULL)
-        return
+        subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny", "--at-stop"] + PAUSE_ARGS
+                       + ["--record"], input=data, check=False, stdout=subprocess.DEVNULL)
+        return time.monotonic() - t0
     match = RECORD_MATCH.get(name)
     if match is not None and ev.get("tool_name") not in match:
-        return
+        return time.monotonic() - t0
     subprocess.run([python, COLLECTOR, "--root", root], input=data, check=False)
+    return time.monotonic() - t0
 
 
 def payload(line):
@@ -175,7 +183,11 @@ def main():
             if args.claude_dir:
                 write_meta(ev.get("agent_id"), pre, models.get(pre["ev"].get("tool_use_id")))
         p = payload(line)
-        run_hooks(args.python, args.root, p, json.dumps(p, ensure_ascii=False).encode("utf-8"))
+        blocked = run_hooks(args.python, args.root, p, json.dumps(p, ensure_ascii=False).encode("utf-8"))
+        if blocked > 0.5:
+            # a pause held the hook: the rest of the scenario happens that much later, as it would
+            # for a real agent (its later tool calls wait behind the paused one)
+            start += blocked
 
 
 if __name__ == "__main__":

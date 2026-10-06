@@ -17,6 +17,8 @@
 #            SubagentStop / Stop (any at). Polls every 100 ms; the deadline (auto-resume) is kept by
 #            the hook itself in <target>.hit.json, --max-wait caps one wait. Records hit / released /
 #            aborted lines in hooks.jsonl. Resuming without an instruction prints nothing (DESIGN-v0.1.2-pause).
+#            At SessionEnd the recorder removes the pause files of that run (and <root>/pause.pending when no
+#            pause file is left anywhere), so a pause that never stopped the agent cannot outlive the session.
 #  Root    : --root -> $AGENTMAP_DIR -> $AGENTFLOW_DIR (deprecated) ->
 #            $XDG_DATA_HOME/nvim/agentflow -> ~/.local/share/nvim/agentflow
 #            (the folder name stays "agentflow" so existing records keep working)
@@ -669,6 +671,25 @@ def clear_pause_flag(root):
         pass
 
 
+def end_session_cleanup(root, run):
+    """SessionEnd（記録係）：この run の止まれファイル（<target>.json と <target>.hit.json）を片付け、ほかに止まれが
+    無ければ <root>/pause.pending も消す。Neovim を閉じたまま、止まれが届く前（REQUESTED）にセッションが Stop を
+    経ずに終わった（Esc のあと /exit など）とき、待っていた hook が SIGTERM で死んだときの取り残しを防ぐ
+    （残ると全セッションの道具 1 回ごとに Python が起動し続ける）。GATE は Neovim の印なので触らない"""
+    pdir = os.path.join(run, "pause")
+    try:
+        names = os.listdir(pdir)
+    except OSError:
+        names = []
+    for n in names:
+        if n.endswith(".json"):
+            try:
+                os.remove(os.path.join(pdir, n))
+            except OSError:
+                pass
+    clear_pause_flag(root)
+
+
 def pause_wait(root, d, run, argv):
     """止まれがあれば hook の中で待つ（DESIGN-v0.1.2-pause §3.2）。
     戻り値: 待った場合 {"id", "target", "reason", "waited_ms"}、待たなかった場合 None。
@@ -894,6 +915,11 @@ def main():
             append(os.path.join(run, "hooks.jsonl"), encode(build(d)))
         except Exception as e:
             log_error(root, e, ev)
+        if ev == "SessionEnd":
+            try:
+                end_session_cleanup(root, run)  # 記録のあと。失敗しても記録と Claude Code は止めない
+            except Exception as e:
+                log_error(root, e, ev)
     if want_steer:
         try:
             answer = steer(root, d, run, argv)

@@ -2,7 +2,7 @@
 
 See what your Claude Code agents are doing, as a live map inside Neovim.
 
-![agentmap.nvim: agents run, one stops to ask, the human check turns from purple to green](demo/agentmap.gif)
+![agentmap.nvim: agents run; one is paused from the map, resumed with an instruction and held at the gate before it finishes; it stops to ask and the human check turns from purple to green](demo/agentmap.gif)
 
 *The demo replays made-up records (`demo/`); no real session is shown.*
 
@@ -140,7 +140,8 @@ python3 demo/replay.py --root /tmp/agentmap-demo --claude-dir /tmp/agentmap-demo
 sleep 1; AGENTMAP_DIR=/tmp/agentmap-demo nvim -c AgentMap
 ```
 
-The script plays the session from the demo above (about 30 seconds of made-up events)
+The script plays the session from the demo above (about 35 seconds of made-up events; a pause
+holds it as it would hold Claude Code, so `x` and `X` can be tried on it with current hooks)
 through the real recorder. The `sleep 1` gives it time to write the first record; without it
 `:AgentMap` can run before anything exists and say "No recorded runs" (then just run `:AgentMap` again).
 
@@ -492,7 +493,9 @@ file every 100 ms) instead of returning. Removing the file (`x`) lets the hook r
 - **Closing Neovim** changes nothing by default: paused agents resume by themselves at their
   deadline, and you can reopen the map to resume them earlier. With `pause.release_on_exit = true`
   closing Neovim resumes every pause of the run on screen. When Claude Code itself exits, the
-  waiting hook is ended and the pause is recorded as ended.
+  waiting hook is ended and the pause is recorded as ended; the session-end record also removes
+  that run's pause files (and the flag when no pause is left anywhere), so a pause that never
+  stopped its agent does not outlive the session.
 - **Hooks.** Pausing needs the hooks registered by 0.1.2: run `:AgentMapInstallHooks` after
   upgrading. With the old registration `x` and `X` say so and do nothing; recording and steering
   keep working.

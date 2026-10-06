@@ -4,6 +4,8 @@
 --    cancel_steer  : 未配達ファイルを消して steer_cancelled。hook が取った後なら何もしない
 --    sweep_steers  : 宛先が終わった未配達を steer_expired にしてファイルを消す。印（steer.pending）の掃除
 --    mark_steer_sent : 端末へ送った（steer_delivered via terminal）
+--    親経由（via relay。DESIGN-v0.1.2-steer2 §6.5）：ファイルも印も書かない、relay_line と expect、
+--      READ のあと親の番が終わって渡されなければ not_relayed、渡せば（SendMessage）期限切れにしない
 --    collector との往復：Neovim が書いたファイルを bin/agentmap-collect --steer が配達し、provider が DELIVERED にする
 --  記録の保存先は一時フォルダ（minimal_init.lua の AGENTMAP_DIR）。
 --  実行: nvim --headless --clean -u tests/minimal_init.lua -l tests/test_steer_events.lua
@@ -233,5 +235,110 @@ state.apply(s3, { event = "steer_requested", steer_id = "n1", agent_id = "ROOT",
 state.apply(s3, { event = "steer_requested", steer_id = "c1", agent_id = "kid", ts = "2026-10-04T10:00:00.000Z" })
 t.eq(s3.steers.n1.notice_of, "c1", "notice first: notice_of kept")
 t.eq(s3.steers.c1.notice_id, "n1", "notice first: the instruction still gets notice_id")
+
+-- ---------- 9. 親経由（relay）と expect（DESIGN-v0.1.2-steer2 §6.5） ----------
+local SID3 = "c0ffee43-0000-4000-8000-000000000043"
+local run3_dir = ROOT .. "/projects/" .. SLUG .. "/runs/" .. SID3
+vim.fn.mkdir(run3_dir, "p")
+local P3 = "c0ffee44-0000-4000-8000-000000000044"
+local C3 = "afeed000000000061"
+local function hook3(ev, sec, extra)
+  local r = { session_id = SID3, hook_event_name = ev, cwd = "/tmp/agentmap-test/steer", prompt_id = P3,
+    transcript_path = "/tmp/agentmap-test/claude/projects/" .. SLUG .. "/" .. SID3 .. ".jsonl",
+    _v = 1, _ts = iso(T0 + sec), _src = "claude_hook" }
+  for k, v in pairs(extra or {}) do r[k] = v end
+  return vim.json.encode(r)
+end
+local function append3(lines)
+  local f = assert(io.open(run3_dir .. "/hooks.jsonl", "ab"))
+  for _, l in ipairs(lines) do f:write(l .. "\n") end
+  f:close()
+end
+local function poll3(r) r._sweeping = true; events.poll(r); r._sweeping = nil end
+append3({
+  hook3("SessionStart", 0, { source = "startup" }),
+  hook3("UserPromptSubmit", 1, { prompt_head = "relay work" }),
+  hook3("SubagentStart", 2, { agent_id = C3, agent_type = "general-purpose" }),
+})
+local run3 = events.load(run3_dir)
+os.remove(FLAG)
+local function evs3(name, sid)
+  for _, e in ipairs(util.json_lines(run3_dir .. "/events.jsonl", 0)) do
+    if e.event == name and e.steer_id == sid then return e end
+  end
+end
+local RL = '[AgentMap] Tell sub-agent [1] "child" (agent id ' .. C3 .. ') this, with SendMessage: write b.txt instead'
+local r1 = events.request_steer(run3, C3, "write b.txt instead", { via = "relay", relay_line = RL })
+t.ok(r1 ~= nil, "relay: request_steer returns an id")
+t.eq(vim.uv.fs_stat(run3_dir .. "/steer/" .. r1 .. ".json"), nil, "relay: no pending file")
+t.eq(vim.uv.fs_stat(FLAG), nil, "relay: no steer.pending flag")
+local q1 = evs3("steer_requested", r1) or {}
+t.eq({ q1.via, q1.expect, q1.relay_line, q1.prompt_id }, { "relay", "parent", RL, P3 }, "relay: steer_requested carries via / expect parent / relay_line")
+t.eq(run3.state.steers[r1].relay_line, RL, "relay: state keeps relay_line")
+-- expect：hooks（既定の mode stop）→ stop、端末 → terminal、mode deny → next、ROOT で端末なし（hooks）も mode に従う
+local h1 = events.request_steer(run3, C3, "at its end")
+t.eq((evs3("steer_requested", h1) or {}).expect, "stop", "hook + mode stop → expect stop")
+t.eq(vim.uv.fs_stat(run3_dir .. "/steer/" .. h1 .. ".json") ~= nil, true, "hook: pending file as before")
+local tm = events.request_steer(run3, "ROOT", "for root", { via = "terminal" })
+t.eq((evs3("steer_requested", tm) or {}).expect, "terminal", "terminal → expect terminal")
+require("agentmap.config").setup({ steer = { mode = "deny" } })
+local h2 = events.request_steer(run3, C3, "next tool")
+t.eq((evs3("steer_requested", h2) or {}).expect, "next", "hook + mode deny → expect next")
+require("agentmap.config").setup({})
+t.eq(events.cancel_steer(run3, h2), true, "cancel the deny one")
+-- relay の取り消し（打つ前）：ファイルが無くても CANCELLED
+local r0 = events.request_steer(run3, C3, "never typed", { via = "relay", relay_line = "[AgentMap] x" })
+t.eq(events.cancel_steer(run3, r0), true, "relay: cancel before typing → true")
+t.eq(run3.state.steers[r0].status, "CANCELLED", "relay: CANCELLED")
+-- 打った → DELIVERED/terminal。読まれていなければ、親の番が終わっても期限切れにしない（SENT のまま）
+t.eq(events.mark_steer_sent(run3, r1), true, "relay: mark_steer_sent")
+t.eq(run3.state.steers[r1].status .. "/" .. run3.state.steers[r1].delivered_via, "DELIVERED/terminal", "relay: typed → DELIVERED/terminal")
+append3({ hook3("Stop", 10, { last_head = "waiting for the child" }) })
+poll3(run3)
+t.eq(events.sweep_steers(run3, T0 + 30), false, "relay not read yet: the turn ended earlier → not expired")
+t.eq(run3.state.steers[r1].status, "DELIVERED", "… stays DELIVERED (SENT)")
+-- Claude Code が読んだ（新しい番）→ 親が SendMessage せずに番を終えた → 3 秒後に not_relayed
+append3({ hook3("UserPromptSubmit", 40, { prompt_id = "c0ffee45-0000-4000-8000-000000000045", prompt_head = RL }) })
+poll3(run3)
+t.eq(run3.state.steers[r1].confirmed_at, iso(T0 + 40), "relay: READ by Claude Code (confirmed_at)")
+t.eq(events.sweep_steers(run3, T0 + 45), false, "READ, the turn has not ended again → kept")
+append3({ hook3("Stop", 50, { prompt_id = "c0ffee45-0000-4000-8000-000000000045", last_head = "ok" }) })
+poll3(run3)
+t.eq(events.sweep_steers(run3, T0 + 51), false, "READ, the turn ended 1 s ago (grace) → kept")
+t.eq(events.sweep_steers(run3, T0 + 54), true, "READ, the turn ended without SendMessage → expired")
+t.eq(run3.state.steers[r1].status .. "/" .. tostring(run3.state.steers[r1].end_reason), "EXPIRED/not_relayed", "relay: EXPIRED / not_relayed")
+local x1 = evs3("steer_expired", r1) or {}
+t.eq(x1.reason, "not_relayed", "steer_expired(not_relayed) recorded")
+-- もう 1 件（hook の時刻は頼んだ実時刻より後にする。T0 は今の 600 秒前）：READ → SendMessage（PostToolUse の記録）→ 番が終わっても期限切れにしない
+local r2 = events.request_steer(run3, C3, "and c.txt", { via = "relay", relay_line = RL:gsub("write b.txt instead", "and c.txt") })
+events.mark_steer_sent(run3, r2)
+append3({
+  hook3("UserPromptSubmit", 690, { prompt_id = "c0ffee46-0000-4000-8000-000000000046", prompt_head = (RL:gsub("write b.txt instead", "and c.txt")) }),
+  hook3("PostToolUse", 700, { prompt_id = "c0ffee46-0000-4000-8000-000000000046", tool_name = "SendMessage", tool_use_id = "toolu_sm1",
+    tool_input = { to = C3, head = "and c.txt", summary = "c.txt" } }),
+  hook3("Stop", 701, { prompt_id = "c0ffee46-0000-4000-8000-000000000046", last_head = "sent" }),
+})
+poll3(run3)
+t.eq(run3.state.steers[r2].delivered_via, "SendMessage", "relay 2: SendMessage → RELAYED")
+t.eq(run3.state.steers[r2].relayed_at, iso(T0 + 700), "relay 2: relayed_at")
+t.eq(events.sweep_steers(run3, T0 + 760), false, "relay 2: passed on → not expired after the turn ends")
+t.eq(run3.state.steers[r2].status, "DELIVERED", "relay 2: stays DELIVERED")
+-- 終わり際（stop）の未配達は、宛先が動いている間は残る
+t.eq(run3.state.steers[h1].status, "PENDING", "stop: PENDING while the target runs")
+t.ok(vim.uv.fs_stat(run3_dir .. "/steer/" .. h1 .. ".json") ~= nil, "stop: the file stays")
+-- セッションが終わる：READ 済みで渡っていない relay は not_relayed、読まれていない relay はそのまま
+local r3 = events.request_steer(run3, C3, "unread", { via = "relay", relay_line = "[AgentMap] unread" })
+events.mark_steer_sent(run3, r3)
+local r4 = events.request_steer(run3, C3, "read but not relayed", { via = "relay", relay_line = "[AgentMap] Tell read but not relayed" })
+events.mark_steer_sent(run3, r4)
+append3({ hook3("UserPromptSubmit", 770, { prompt_id = "c0ffee47-0000-4000-8000-000000000047", prompt_head = "[AgentMap] Tell read but not relayed" }) })
+poll3(run3)
+t.ok(run3.state.steers[r4].confirmed_at ~= nil, "relay 4: READ")
+append3({ hook3("SessionEnd", 780, { reason = "other" }) })
+poll3(run3)
+events.sweep_steers(run3, T0 + 781)
+t.eq(run3.state.steers[r4].end_reason, "not_relayed", "session ended: READ relay → not_relayed")
+t.eq(run3.state.steers[r3].status, "DELIVERED", "session ended: unread relay stays SENT (DELIVERED/terminal)")
+t.eq(run3.state.steers[h1].end_reason, "session_ended", "session ended: the stop one → session_ended")
 
 t.done()

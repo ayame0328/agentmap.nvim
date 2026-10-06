@@ -124,7 +124,7 @@ return {
   ["export.steer_line"] = "- %{label} — %{time}「%{text}」→ %{outcome}",
   ["export.steer_delivered"] = "%{time} に配達（%{via}）",
   ["export.steer_sent"] = "%{time} に端末へ送信",
-  ["export.steer_pending"] = "書き出し時点で未配達",
+  ["export.steer_pending"] = "書き出し時点で未配達（終わる直前に届く）",
   ["export.steer_expired"] = "未配達: %{reason}",
   ["export.steer_cancelled"] = "取り消し",
   ["export.steer_none"] = "（修正指示なし）",
@@ -152,4 +152,9 @@ return {
   ["export.ov_pauses"] = "%{n} 件（待機中 %{waiting}）",
   ["export.ov_gate_label"] = "関門",
   ["export.ov_gate"] = "入",
+  -- v0.1.2: steering at the end of an agent and relay through the main agent (DESIGN-v0.1.2-steer2 appendix A)
+  ["export.steer_pending_next"] = "書き出し時点で未配達（次の道具の呼び出しで届く）",
+  ["export.steer_relay_sent"] = "%{time} に親の端末へ送信、まだ渡っていない",
+  ["export.steer_relayed"] = "%{time} に %{parent} が渡した（SendMessage）",
+  ["export.steer_not_relayed"] = "渡らなかった: 親が番を終えた",
 }

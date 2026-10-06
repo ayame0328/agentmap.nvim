@@ -12,7 +12,8 @@
 --    :AgentMapReview <index|id> <PASS|RETRY|ESCALATE|SUBMIT> [reason]
 --    :AgentMapInstallHooks [path]        register the recording hooks in Claude Code's settings.json
 --    :AgentMapImport [session_id]        import a run that has no records from Claude's transcript
---    :AgentMapSteer <index|id> [text]    send a steering instruction to an agent (no text: editor)
+--    :AgentMapSteer <index|id> [relay] [text]  send a steering instruction to an agent (no text: editor;
+--                                        relay: through the main agent's terminal, it passes it on with SendMessage)
 --    :AgentMapPause <index|id> [next|stop]  pause an agent at its next tool call / only at its end
 --    :AgentMapResume <index|id>          resume a paused agent (a gate: let it pass)
 --    :AgentMapGate [on|off]              gate of the run on screen on / off (no argument: toggle)
@@ -601,10 +602,12 @@ function M.review(arg, verdict, ...)
 end
 
 --- Send a steering instruction to an agent (index or id). Without text the editor opens.
---- Running agents get it at their next tool call (hooks); the main agent and finished agents go
---- through the Claude terminal (see :h agentmap-steer).
+--- A sub-agent gets it when it tries to finish (hooks); the main agent and finished agents go
+--- through the Claude terminal. When the first word is `relay`, the text is typed into the main
+--- agent's terminal for it to pass on with SendMessage right away (a running direct sub-agent of the
+--- main agent only; refused without a Claude terminal). See :h agentmap-steer.
 ---@param arg string|number agent index, "ROOT" or id
----@param ... string words of the instruction
+---@param ... string words of the instruction (optionally led by "relay")
 function M.steer(arg, ...)
   ensure_setup()
   local ui = ensure_open()
@@ -615,11 +618,17 @@ function M.steer(arg, ...)
     notify(tr("init.agent_not_found", { arg = tostring(arg) }), vim.log.levels.WARN)
     return
   end
-  local text = vim.trim(table.concat({ ... }, " "))
-  if text == "" then
-    return ui.steer_input(id)
+  local words = { ... }
+  local route
+  if words[1] == "relay" then
+    route = "relay"
+    table.remove(words, 1)
   end
-  return ui.steer_send(id, text)
+  local text = vim.trim(table.concat(words, " "))
+  if text == "" then
+    return ui.steer_input(id, nil, route)
+  end
+  return ui.steer_send(id, text, nil, { route = route })
 end
 
 -- 図の run で Agent を探す（見せている流れ → run 全体）。見つからなければ知らせて nil

@@ -1046,20 +1046,36 @@ function M.to_markdown(state, opts)
   end
   local REASON = { agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
     no_terminal = "detail.steer_reason_no_terminal" }
+  local function agent_with_name(id)
+    if id == nil or id == "ROOT" then return "ROOT" end
+    local ag = s.agents[id]
+    return agent_label(s, id) .. (ag and (" " .. cut(name_of(ag), 30)) or "")
+  end
   local function steer_outcome(x)
     local outcome
-    if x.status == "DELIVERED" then
+    if x.via == "relay" and x.status ~= "EXPIRED" and x.status ~= "CANCELLED" then
+      -- 親経由（DESIGN-v0.1.2-steer2 §7.4）: ROOT が SendMessage で渡したか、まだか
+      if x.relayed_at then
+        outcome = tr("export.steer_relayed", { time = fmt_dt(x.relayed_at):sub(12), parent = agent_with_name(x.relayed_by) })
+      else
+        outcome = tr("export.steer_relay_sent", { time = fmt_dt(x.delivered_at or x.requested_at):sub(12) })
+      end
+    elseif x.status == "DELIVERED" then
       if x.via == "terminal" and (x.delivered_via == nil or x.delivered_via == "terminal") then
         outcome = tr("export.steer_sent", { time = fmt_dt(x.delivered_at):sub(12) })
       else
         outcome = tr("export.steer_delivered", { time = fmt_dt(x.delivered_at):sub(12), via = one_line(x.delivered_via or "-") })
       end
+    elseif x.status == "EXPIRED" and x.end_reason == "not_relayed" then
+      outcome = tr("export.steer_not_relayed")
     elseif x.status == "EXPIRED" then
       outcome = tr("export.steer_expired", { reason = REASON[x.end_reason] and tr(REASON[x.end_reason]) or one_line(x.end_reason or "-") })
     elseif x.status == "CANCELLED" then
       outcome = tr("export.steer_cancelled")
-    else
+    elseif x.expect == "stop" then
       outcome = tr("export.steer_pending")
+    else
+      outcome = tr("export.steer_pending_next") -- expect "next"、または v0.1.1 の記録（expect 無し）
     end
     return outcome
   end

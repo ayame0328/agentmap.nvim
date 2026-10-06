@@ -11,8 +11,9 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   tool call or when it finishes, whichever comes first (`stop`: only when it finishes); `x` again
   (or `:AgentMapResume {n|id}`) resumes it. Nothing is cancelled: the synchronous delivery hook
   waits inside Claude Code until the pause file is removed. Resumed without an instruction, the
-  agent sees nothing; `s` on a paused box resumes it with the instruction on the spot, through the
-  same hook (the main agent included). A pause left alone resumes by itself after
+  agent sees nothing; `s` on a box paused before a tool call resumes it and the instruction arrives
+  when it tries to finish (the main agent: the pause is lifted, then the text is typed into its
+  terminal); a box paused at its end gets it on the spot. A pause left alone resumes by itself after
   `pause.auto_resume_s` (600 s); the hook keeps that deadline itself, so it holds when Neovim is
   closed or the computer sleeps (and removes the `pause.pending` flag when no pause is left).
   When a session ends, the recorder removes that run's pause files (and the flag when no pause
@@ -27,19 +28,47 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   finishes before it could stop (`pause.notify`).
 - A pauses section in the detail view and `## Pauses` in exports (with a count and the gate in
   the overview).
-- `:checkhealth agentmap`: pause registration (hook timeout) and pending pause flag rows.
+- Relay through the main agent: `s` → "Write and relay now through the main agent" (item 2, only
+  for a running direct sub-agent of the main agent when its Claude terminal is in this Neovim;
+  `steer.relay = "menu"`, `"always"` puts it first, `"never"` hides it) or
+  `:AgentMapSteer {n} relay [text]`. The line `[AgentMap] Tell sub-agent [3] "<name>" (agent id <id>)
+  this, with SendMessage: <text>` (Japanese UI: the Japanese line) is typed into the main agent's
+  terminal, and the main agent passes it on with `SendMessage`. The detail view shows SENT → READ →
+  RELAYED from the records; PostToolUse now records `SendMessage` (recipient and the first 120
+  characters). Notices when the main agent passed it on or ended its turn without doing so
+  (` ✎!`). No parent notice is made for a relay.
+- Notices when a sub-agent received an instruction at its end, and, when the map can estimate it
+  from past runs, the time left until the agent is likely to finish.
+- `:checkhealth agentmap`: pause registration (hook timeout) and pending pause flag rows; steering
+  mode of the registered hooks, relay availability and the `SendMessage` matcher.
 - Setting `pause` (also accepts `false`): `enabled`, `auto_resume_s`, `gate`,
   `release_on_exit` (default `false`: closing Neovim leaves pauses to resume by themselves),
   `notify`.
 
 ### Changed
 
+- Steering reaches a sub-agent when it tries to finish (`SubagentStop` `decision: "block"`; Claude
+  Code adds it as `Stop hook feedback`, a user-side line), and the main agent at the end of its
+  turn when it has no terminal here (`Stop`). `steer.mode` defaults to `"stop"`; `"deny"` /
+  `"context"` stay as options that also deliver at the next tool call, but current models may
+  ignore text delivered as a tool result. The `PreToolUse` guard stays for pausing and, in mode
+  stop, tests only `pause.pending`. The text for the end says where it comes from and that it
+  arrives just before the agent finishes; until then the agent works on the old plan.
+- `steer.at_stop` is removed (always on; a value in your setup is ignored and `:checkhealth`
+  says so). `steer.no_terminal = "hook"` is now `"stop"` (the old name still works).
+- With hooks registered by 0.1.1 (`--mode deny`) or with another `steer.mode` than the setting,
+  `s` on a sub-agent refuses and asks for `:AgentMapInstallHooks` (the old guard would hand the
+  file over at the next tool call, leaving nothing for the agent's end); the terminal routes (main
+  agent, redo, relay) still work.
 - The delivery hooks (`PreToolUse` guard, `SubagentStop`, `Stop`) carry `--pause --max-wait N`
   and a `timeout` of `auto_resume_s + 30` (630 s). Run `:AgentMapInstallHooks` again after
-  upgrading; until then `x` and `X` are refused, while recording and steering keep working.
+  upgrading; until then `x`, `X` and `s` on a sub-agent are refused, while recording and the
+  terminal routes keep working.
 - `hooks.status()` now also checks the feature words and the timeout of its own hook commands
   (still not their paths), so the 0.1.1 registration is reported as outdated.
-- The state cache version is 10 (the cache is rebuilt once from the records).
+- The state cache version is 11 (the cache is rebuilt once from the records). A second
+  `SubagentStart` for the same agent id (a finished sub-agent started again by `SendMessage`) opens a
+  new attempt and sets the box back to running.
 - `?` and the detail views list `x` / `X`.
 
 ### Notes
@@ -49,6 +78,17 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   (SIGTERM) and the tool runs, with nothing shown; Esc interrupts only the main agent's turn
   (background sub-agents and their waiting hooks go on); when Claude Code exits, a waiting hook
   is ended and nothing is left running.
+- Claude Code 2.1.291 facts behind the steering change: an instruction handed over with
+  `SubagentStop` / `Stop` `decision: "block"` was followed by Haiku and Sonnet sub-agents 17 times
+  out of 17 and by the main agent 9 out of 9; a Sonnet sub-agent ignored the same text in a
+  `PreToolUse` deny and said it came from a tool result, not the user; the main agent called
+  `SendMessage` with the text unchanged 5–8 s after a relay line was typed (7 of 7), and the
+  sub-agent got it at its next tool round (followed: Sonnet 1 of 1, Haiku 3 of 5); a message to a
+  finished sub-agent started it again with the same id; a sub-agent the main agent waits for in
+  the foreground gets a relay only after it finishes; the Agent tool runs in the background by
+  default; in interactive mode hidden helper agents send a `SubagentStop` without a start (no box
+  is made). The delay until an instruction arrives at the end is the rest of the agent's work
+  (14–17 s for six more tool calls in tests).
 
 ## [0.1.1] - 2026-10-05
 

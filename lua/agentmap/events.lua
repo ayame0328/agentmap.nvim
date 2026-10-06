@@ -492,10 +492,14 @@ M._sweep_flag = sweep_flag
 --- Queue a steering instruction for an agent.
 ---   via = "hook": writes <run>/steer/<agent_id>-<ms>.json (0600), touches <root>/steer.pending and records
 ---   steer_requested. via = "terminal": records steer_requested only (the caller sends it, then mark_steer_sent).
+---   via = "relay" (DESIGN-v0.1.2-steer2 §6.5): like "terminal" (no file, no flag); the caller types relay_line
+---   into the main agent's terminal, then mark_steer_sent. steer_requested carries relay_line.
+---   steer_requested also carries expect: "stop" (hook, steer.mode stop) | "next" (hook, mode deny / context) |
+---   "terminal" | "parent" (relay); shown on screen only.
 ---@param run table
 ---@param agent_id string "ROOT" or an agent id
 ---@param text string the instruction (clipped to steer.text_max characters)
----@param opts? { via?: "hook"|"terminal", kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string }
+---@param opts? { via?: "hook"|"terminal"|"relay", relay_line?: string, expect?: string, kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string }
 ---   kind = "notice" with notice_of = <steer_id>: a notice to the parent about an instruction delivered to its
 ---   sub-agent (DESIGN-v0.2-steer appendix E; created by the UI). The state links them both ways
 ---   (s.steers[id].notice_of and s.steers[notice_of].notice_id). Before writing, the records are read once
@@ -514,7 +518,14 @@ function M.request_steer(run, agent_id, text, opts)
   end
   local scfg = config.get().steer or {}
   text = brief.clip(text, tonumber(scfg.text_max) or 4000)
-  local via = opts.via == "terminal" and "terminal" or "hook"
+  local via = (opts.via == "terminal" or opts.via == "relay") and opts.via or "hook"
+  local expect = opts.expect
+  if type(expect) ~= "string" then
+    if via == "terminal" then expect = "terminal"
+    elseif via == "relay" then expect = "parent"
+    else expect = (scfg.mode == "deny" or scfg.mode == "context") and "next" or "stop" end
+  end
+  local relay_line = via == "relay" and type(opts.relay_line) == "string" and opts.relay_line or nil
   local id = agent_id .. "-" .. tostring(new_ms())
   if via == "hook" then
     local body = util.json_encode({ id = id, agent_id = agent_id, text = text, created_at = util.iso_now(),
@@ -524,14 +535,15 @@ function M.request_steer(run, agent_id, text, opts)
     touch_flag(run)
   end
   M.emit(run, {
-    event = "steer_requested", steer_id = id, agent_id = agent_id, text = text, via = via,
+    event = "steer_requested", steer_id = id, agent_id = agent_id, text = text, via = via, expect = expect,
+    relay_line = relay_line,
     prompt_id = opts.prompt_id or state_mod.latest_flow_id(run.state),
     kind = opts.kind or "steer", redo_of = opts.redo_of, notice_of = opts.notice_of,
   })
   return id
 end
 
---- Record that a terminal instruction was sent (steer_delivered, via = "terminal").
+--- Record that a terminal (or relay) instruction was typed (steer_delivered, via = "terminal").
 ---@return boolean
 function M.mark_steer_sent(run, steer_id)
   local st = run and run.state and state_mod.steer_of(run.state, steer_id)
@@ -547,7 +559,7 @@ function M.cancel_steer(run, steer_id)
   local st = run and run.state and state_mod.steer_of(run.state, steer_id)
   if not st then return false, "unknown" end
   if st.status ~= "PENDING" then return false, st.status:lower() end
-  if st.via ~= "terminal" then
+  if st.via ~= "terminal" and st.via ~= "relay" then
     local ok = os.remove(steer_dir(run) .. "/" .. steer_id .. ".json")
     if not ok then return false, "delivered" end
   end
@@ -578,6 +590,17 @@ local function held_by_pause(s, st, now)
   return false
 end
 
+--- 親経由（relay）の指示が「渡されなかった」か（DESIGN-v0.1.2-steer2 §4.5）。
+---   Claude Code が読んだ（confirmed_at）のに relayed_at が無く、その後に親の番が終わって（流れの ended_at が
+---   読んだ時刻以後）STEER_EXPIRE_GRACE 秒たった、かセッションが終わった。読まれていないものは対象外（SENT のまま）
+local function not_relayed(s, st, now)
+  if st.via ~= "relay" or st.status ~= "DELIVERED" or st.relayed_at or not st.confirmed_at then return false end
+  if s.ended_at then return true end
+  local f = st.prompt_id and state_mod.flow_of(s, st.prompt_id)
+  local e, c = f and f.ended_at and util.parse_iso(f.ended_at), util.parse_iso(st.confirmed_at)
+  return e ~= nil and c ~= nil and e >= c and now - e >= STEER_EXPIRE_GRACE
+end
+
 local function expire_reason(s, st, now)
   if s.ended_at then return "session_ended" end
   if held_by_pause(s, st, now) then return nil end
@@ -597,7 +620,8 @@ local function expire_reason(s, st, now)
 end
 
 --- Expire pending instructions whose target finished (or whose session ended): remove the file and
---- record steer_expired. Also removes <root>/steer.pending when no pending file is left anywhere.
+--- record steer_expired. A relay that Claude Code read but the main agent did not pass on before its turn
+--- ended expires with reason "not_relayed". Also removes <root>/steer.pending when no pending file is left anywhere.
 ---@return boolean changed
 function M.sweep_steers(run, now)
   if not run or not run.state or not run.dir then return false end
@@ -609,9 +633,10 @@ function M.sweep_steers(run, now)
     for _, sid in ipairs(vim.deepcopy(s.steer_order or {})) do
       local st = s.steers[sid]
       local reason = st and st.status == "PENDING" and expire_reason(s, st, now)
+      if not reason and st and not_relayed(s, st, now) then reason = "not_relayed" end
       if reason then
         local gone = true
-        if st.via ~= "terminal" then
+        if st.via ~= "terminal" and st.via ~= "relay" then
           local p = steer_dir(run) .. "/" .. sid .. ".json"
           if uv.fs_stat(p) then
             gone = os.remove(p) ~= nil

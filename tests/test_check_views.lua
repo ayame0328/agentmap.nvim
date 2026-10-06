@@ -403,8 +403,8 @@ t.run("v0.2 detail: progress, steps, steering", function()
   has(ds, "■ Steering (3)", "修正指示の見出し")
   t.matches(text(ds), mk .. " #1 %d%d:%d%d:%d%d  DELIVERED %d%d:%d%d:%d%d at PreToolUse:Write  \"資料は docs/v3 を読むこと\"", "配達済み")
   t.matches(text(ds), "→ next tool %d%d:%d%d:%d%d Read docs/v3/a%.md", "配達のあとの最初の道具")
-  has(ds, "PENDING (delivered at the next tool call)", "未配達")
-  has(ds, "NOT DELIVERED (the agent finished before its next tool call)", "届かないまま終了")
+  has(ds, "PENDING (arrives at its next tool call)", "未配達（expect の無い v0.1.1 の記録は次の道具）")
+  has(ds, "NOT DELIVERED (the agent finished before it could be delivered)", "届かないまま終了")
   local hi = row_of(ds, "■ History")
   local si = row_of(ds, "■ Steering (3)")
   local ci = row_of(ds, "■ Human checks")
@@ -431,7 +431,7 @@ t.run("v0.2 detail: progress, steps, steering", function()
   local dn2 = detail.build(sn, sn.agents.a1, { width = 140, now = NOW, stats = STATS })
   has(dn2, "■ Steering (2)", "知らせは数えない")
   t.matches(text(dn2), "\n      → told the parent ROOT: SENT to the terminal %d%d:%d%d:%d%d", "親に知らせた（端末へ送信）")
-  t.matches(text(dn2), "\n      → told the parent ROOT: PENDING %(delivered at the next tool call%)", "親への知らせが未配達")
+  t.matches(text(dn2), "\n      → told the parent ROOT: PENDING %(arrives at its next tool call%)", "親への知らせが未配達")
   hasnt(detail.build(sn, sn.agents.ROOT, { width = 140, now = NOW, stats = STATS }), "■ Steering", "親の詳細に知らせを独立の指示として出さない")
   local graph = require("agentmap.graph")
   t.eq(graph.steer_marks(sn, sn.agents.ROOT, NOW), {}, "知らせで親の箱に印を増やさない")
@@ -539,6 +539,76 @@ t.run("v0.1.2 detail: pauses", function()
   t.matches(text(dj), "#1 " .. clk(NOW - 3000) .. " 止まれ（次の道具の直前） → " .. clk(NOW - 2994)
     .. " に PreToolUse:Read で停止 → " .. clk(NOW - 2783) .. " に指示 #2 をつけて再開 %(3 分 31 秒%)", "日本語の行")
   has(dj, "x 一時停止", "日本語の footer")
+  require("agentmap.i18n").setup("en")
+end)
+
+t.run("v0.1.2 detail: steering at the end and relay through the main agent", function()
+  -- DESIGN-v0.1.2-steer2 §7.3 の 8 種の行、→ sent as:（本文と違うときだけ）、Enter で開いた全文と端末に打った文
+  local NOW = 1790600000
+  local function iso(sec) return os.date("!%Y-%m-%dT%H:%M:%S.000Z", sec) end
+  local function clk(sec) return os.date("%H:%M:%S", sec) end
+  local STATS = { all = {}, by_type = {}, by_model = {}, runs = {} }
+  local s2 = fixture()
+  local RL = '[AgentMap] Tell sub-agent [1] "調査" (agent id a1) this, with SendMessage: hello は古いので GOODBYE にして'
+  s2.steers = {
+    s1 = { id = "s1", agent_id = "a1", n = 1, text = "資料は docs/v3 を読むこと", via = "hook", expect = "stop", status = "PENDING",
+      requested_at = iso(NOW - 600) },
+    s2 = { id = "s2", agent_id = "a1", n = 2, text = "急いで", via = "hook", expect = "next", status = "PENDING",
+      requested_at = iso(NOW - 590) },
+    s3 = { id = "s3", agent_id = "a1", n = 3, text = "b.txt に書いて", via = "hook", expect = "stop", status = "DELIVERED",
+      requested_at = iso(NOW - 500), delivered_at = iso(NOW - 290), delivered_via = "SubagentStop" },
+    s4 = { id = "s4", agent_id = "a1", n = 4, text = "relay-sent", via = "relay", expect = "parent", status = "DELIVERED",
+      requested_at = iso(NOW - 400), delivered_at = iso(NOW - 399), delivered_via = "terminal", relay_line = RL },
+    s5 = { id = "s5", agent_id = "a1", n = 5, text = "relay-read", via = "relay", expect = "parent", status = "DELIVERED",
+      requested_at = iso(NOW - 300), delivered_at = iso(NOW - 299), delivered_via = "UserPromptSubmit", confirmed_at = iso(NOW - 297) },
+    s6 = { id = "s6", agent_id = "a1", n = 6, text = "hello は古いので GOODBYE にして", via = "relay", expect = "parent",
+      status = "DELIVERED", requested_at = iso(NOW - 200), delivered_at = iso(NOW - 199), confirmed_at = iso(NOW - 198),
+      delivered_via = "SendMessage", relayed_at = iso(NOW - 195), relayed_by = "ROOT",
+      relay_head = "The word hello is outdated. The file a.txt must say GOODBYE", relay_line = RL },
+    s7 = { id = "s7", agent_id = "a1", n = 7, text = "relay-not", via = "relay", expect = "parent", status = "EXPIRED",
+      requested_at = iso(NOW - 100), delivered_at = iso(NOW - 99), confirmed_at = iso(NOW - 98), end_reason = "not_relayed" },
+    s8 = { id = "s8", agent_id = "a1", n = 8, text = "too-late", via = "hook", expect = "stop", status = "EXPIRED",
+      requested_at = iso(NOW - 50), end_reason = "agent_finished" },
+    s9 = { id = "s9", agent_id = "a1", n = 9, text = "same words", via = "relay", expect = "parent", status = "DELIVERED",
+      requested_at = iso(NOW - 40), delivered_at = iso(NOW - 39), relayed_at = iso(NOW - 30), relayed_by = "ROOT",
+      relay_head = "same   words", delivered_via = "SendMessage" },
+  }
+  s2.steer_order = { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9" }
+  s2.agents.a1.steers = vim.deepcopy(s2.steer_order)
+  local d = detail.build(s2, s2.agents.a1, { width = 160, now = NOW, stats = STATS })
+  local T = text(d)
+  local mk = require("agentmap.graph").steer_mark()
+  has(d, "■ Steering (9)", "見出し")
+  t.matches(T, mk .. " #1 " .. clk(NOW - 600) .. "  PENDING %(arrives when the agent finishes%)  \"資料は docs/v3 を読むこと\"", "1: expect stop")
+  t.matches(T, "#2 " .. clk(NOW - 590) .. "  PENDING %(arrives at its next tool call%)  \"急いで\"", "2: expect next")
+  t.matches(T, "#3 [%d:]+  DELIVERED " .. clk(NOW - 290) .. " at SubagentStop  \"b%.txt に書いて\"", "3: 終わり際に配達")
+  t.matches(T, "#4 [%d:]+  SENT to the main agent's terminal " .. clk(NOW - 399) .. " %(to be relayed%)  \"relay%-sent\"", "4: relay を打った")
+  t.matches(T, "#5 [%d:]+  READ by Claude Code " .. clk(NOW - 297) .. " %(relay pending%)  \"relay%-read\"", "5: Claude Code が読んだ")
+  t.matches(T, "#6 [%d:]+  RELAYED " .. clk(NOW - 195) .. " by ROOT with SendMessage  \"hello は古いので GOODBYE にして\"", "6: ROOT が渡した")
+  t.matches(T, "\n      → sent as: \"The word hello is outdated%. The file a%.txt must say GOODBYE\"", "6: 言い換えた文")
+  t.matches(T, "#7 [%d:]+  NOT RELAYED %(the main agent ended its turn without passing it on%)  \"relay%-not\"", "7: 渡さず番を終えた")
+  t.matches(T, "#8 [%d:]+  NOT DELIVERED %(the agent finished before it could be delivered%)  \"too%-late\"", "8: 届く前に終わった")
+  t.matches(T, "#9 [%d:]+  RELAYED", "9: 渡した（同じ文）")
+  local n_as = select(2, T:gsub("→ sent as:", ""))
+  t.eq(n_as, 1, "→ sent as: は本文と違うときだけ（空白の違いは同じとみなす）")
+  hasnt(d, "typed: ", "閉じているときは端末に打った文を出さない")
+  local r6 = row_of(d, "hello は古いので")
+  t.eq(d.links[r6], "steer:s6", "6: 行に steer:<id>")
+  t.eq(d.links[r6 + 1], "steer:s6", "6: → sent as: の行も同じ指示へ")
+  -- Enter で開いた指示：本文全体の下に、端末に打った文
+  local de = detail.build(s2, s2.agents.a1, { width = 160, now = NOW, stats = STATS, steer_expanded = { s6 = true, s1 = true } })
+  local TE = text(de)
+  t.matches(TE, "\n      typed: %[AgentMap%] Tell sub%-agent %[1%] \"調査\" %(agent id a1%) this, with SendMessage: hello", "6: 端末に打った文")
+  t.eq(select(2, TE:gsub("typed: ", "")), 1, "relay_line の無い指示（s1）には typed: を出さない")
+  t.matches(TE, "\n      資料は docs/v3 を読むこと\n", "s1: 本文全体")
+  -- 日本語
+  require("agentmap.i18n").setup("ja")
+  local dj = text(detail.build(s2, s2.agents.a1, { width = 160, now = NOW, stats = STATS, steer_expanded = { s6 = true } }))
+  t.matches(dj, "未配達（終わる直前に届く）", "ja: stop")
+  t.matches(dj, "に ROOT が SendMessage で渡した", "ja: 渡した")
+  t.matches(dj, "親経由で渡らないまま終了（親が渡さずに番を終えた）", "ja: 渡らなかった")
+  t.matches(dj, "→ 渡した文: ", "ja: 渡した文")
+  t.matches(dj, "端末に打った文: %[AgentMap%] Tell sub%-agent", "ja: 端末に打った文")
   require("agentmap.i18n").setup("en")
 end)
 

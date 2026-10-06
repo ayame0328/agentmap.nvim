@@ -1,7 +1,9 @@
--- Steering from the map (DESIGN-v0.2-steer.md §2, §4, §6.1, §6.2): the `s` menu, the instruction
--- window, the route for each kind of box (running agent → hooks, ROOT → terminal, finished agent →
--- redo request in the terminal), the fallbacks without a terminal, cancel, :AgentMapSteer, and the
--- "not delivered" notice. The events.* functions that write files are replaced with recorders;
+-- Steering from the map (DESIGN-v0.2-steer.md §2, §4, §6.1, §6.2; v0.1.2: DESIGN-v0.1.2-steer2 §2,
+-- §4, §7.1, §7.5, §8.2): the `s` menu, the instruction window, the route for each kind of box
+-- (running agent → hooks, delivered when it tries to finish; ROOT → terminal; finished agent → redo
+-- request in the terminal), relay through the main agent (typed into ROOT's terminal for SendMessage),
+-- the fallbacks without a terminal, the refusal when the registered hooks use another mode, cancel,
+-- :AgentMapSteer [relay], and the notices ("not delivered", "relayed", "not relayed", "arrived at its end"). The events.* functions that write files are replaced with recorders;
 -- the terminal is a real :terminal running a small stand-in script named `claude`.
 local t = require("t")
 local ui = require("agentmap.ui")
@@ -88,7 +90,7 @@ end
 t.run("menu → window → hook", function()
   picks = { 1 }
   ui.steer_menu("a1")
-  t.eq(#menus[#menus].items, 2, "未配達が無ければ「書く」と「履歴」の 2 つ")
+  t.eq(#menus[#menus].items, 2, "未配達が無く端末も無ければ「書く」と「履歴」の 2 つ（親経由は出ない）")
   t.eq(menus[#menus].items[1], T("ui.steer_write"), "動いている箱は「指示を書く」")
   local b = input_buf()
   t.ok(b ~= nil, "入力の窓が開いた")
@@ -149,11 +151,16 @@ end)
 -- 4. ROOT：端末が無い → hooks に落とす
 t.run("ROOT without terminal", function()
   notes = {}
+  t.eq(ui.steer_cfg().no_terminal, "stop", "既定は stop（番の終わりに Stop の hook で届ける）")
   local r = ui.steer_send("ROOT", "please stop and summarize")
   t.eq(r, "fallback_hook", "端末が無いので hooks へ")
   local c = last("request")
   t.eq({ c.agent_id, c.text, c.opts.via }, { "ROOT", "please stop and summarize", "hook" }, "ROOT 宛てに hooks で")
-  t.ok(noted(T("ui.steer_no_terminal_hook")), "知らせた")
+  t.ok(noted(ui._st("ui.steer_queued_root_stop")), "番の終わりに届くと知らせた")
+  -- v0.1.1 の名前 "hook" は "stop" の別名
+  config.get().steer.no_terminal = "hook"
+  t.eq(ui.steer_cfg().no_terminal, "stop", "no_terminal = hook は stop として読む")
+  t.eq(ui.steer_send("ROOT", "alias"), "fallback_hook", "別名でも同じ")
   config.get().steer.no_terminal = "none"
   local n0 = #calls
   t.eq(ui.steer_send("ROOT", "x"), "none", "no_terminal = none")
@@ -162,7 +169,7 @@ t.run("ROOT without terminal", function()
   t.eq(ui.steer_send("ROOT", "copy me"), "clipboard", "no_terminal = clipboard")
   t.eq(vim.fn.getreg('"'), "[AgentMap] copy me", "文をコピーした")
   t.eq(last("request").opts.via, "terminal", "記録は terminal 宛て（PENDING のまま）")
-  config.get().steer.no_terminal = "hook"
+  config.get().steer.no_terminal = "stop"
   config.get().steer.root_via = "hook"
   t.eq(ui.steer_send("ROOT", "via hook"), "queued", "root_via = hook なら端末を探さない")
   config.get().steer.root_via = "terminal"
@@ -283,6 +290,111 @@ t.run("hooks outdated", function()
   t.eq(ui.steer_send("a1", "x"), "outdated", "登録が無くても同じ")
   hooks_status = "installed"
   t.eq(ui.steer_send("a1", "ok now"), "queued", "登録し直せば送れる")
+  -- 組は今の形でも、届け方が v0.1.1 の deny のまま（Q22）：hooks の経路は断る、端末の経路は断らない
+  local real_features = hooks.features
+  hooks.features = function() return { steer = true, pause = true, mode = "deny" } end
+  notes = {}
+  n0 = #calls
+  t.eq(ui.steer_hooks_ok(), false, "登録の mode が設定（stop）と違えば古い扱い")
+  t.eq(ui.steer_send("a1", "x"), "outdated", "動いている子（終わり際）→ 送らない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(ui._st("ui.steer_hooks_outdated")), ":AgentMapInstallHooks を案内")
+  t.eq(ui.steer_send("ROOT", "still to the terminal"), "sent", "ROOT の端末へは送る")
+  config.get().steer.mode = "deny"
+  t.eq(ui.steer_hooks_ok(), true, "設定も deny なら一致")
+  config.get().steer.mode = nil
+  hooks.features = function() return { steer = true, pause = true } end
+  t.eq(ui.steer_hooks_ok(), true, "mode が読めない登録は組の一致だけで決める")
+  hooks.features = real_features
+end)
+
+-- 6b'. 親経由（relay。DESIGN-v0.1.2-steer2 §4・§7.1）：ROOT の端末に「子へ SendMessage で伝えて」と打つ
+t.run("relay menu", function()
+  menus, picks = {}, {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items, { T("ui.steer_write"), ui._st("ui.steer_relay"), T("ui.steer_show") },
+    "ROOT の直接の子＋端末あり → 2 番目が親経由")
+  t.eq(ui.relay_available("a1"), true, "a1 は親経由できる")
+  s.agents.g1.status = "RUNNING"
+  t.eq(ui.relay_available("g1"), false, "孫には出さない（V41）")
+  menus = {}
+  ui.steer_menu("g1")
+  t.eq(#menus[#menus].items, 2, "孫のメニューは「書く」と「履歴」だけ")
+  s.agents.g1.status = "DONE"
+  t.eq(ui.relay_available("a2"), false, "終わった箱には出さない（Q21）")
+  t.eq(ui.relay_available("ROOT"), false, "ROOT には出さない")
+  config.get().steer.relay = "always"
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.steer_relay"), "relay = always なら親経由が先")
+  config.get().steer.relay = "never"
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(#menus[#menus].items, 2, "relay = never なら出さない")
+  config.get().steer.relay = nil
+end)
+
+-- 端末への送信（Enter を遅らせて 1 行ずつ）が全部終わるまで待つ
+local term_mod = require("agentmap.term")
+local function settle()
+  vim.wait(5000, function() return term_mod.pending(tj1) == 0 end, 20)
+  vim.wait(100)
+end
+
+local A1_EN = '[AgentMap] Tell sub-agent [1] "調査：既存設定の確認" (agent id a1) this, with SendMessage: '
+local A1_JA = "[AgentMap] サブエージェント [1]「調査：既存設定の確認」（agent id a1）に SendMessage で次を伝えてください："
+
+t.run("relay send", function()
+  notes = {}
+  settle()
+  local before = #read(out1)
+  t.eq(ui.steer_send("a1", "use docs/v3,\nnot v2", nil, { route = "relay" }), "relayed", "親経由で打った")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN .. "use docs/v3, not v2", "§4.2 の英語の文が 1 行で届いた")
+  local c = last("request")
+  t.eq({ c.agent_id, c.text, c.opts.via, c.opts.kind, c.opts.relay_line },
+    { "a1", "use docs/v3,\nnot v2", "relay", "steer", A1_EN .. "use docs/v3, not v2" },
+    "宛先は子・本文はそのまま・via relay・relay_line は打った全文")
+  t.eq(last("sent").id, c.id, "打てたので mark_steer_sent")
+  t.ok(noted(ui._st("ui.steer_relay_sent")), "端末を一瞥するよう知らせた")
+  t.ok(vim.api.nvim_get_current_buf() == ui.buf, "カーソルは図のまま")
+  -- 日本語の UI
+  i18n.setup("ja")
+  settle()
+  before = #read(out1)
+  t.eq(ui.steer_send("a1", "v3 を読むこと", nil, { route = "relay" }), "relayed", "日本語")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_JA .. "v3 を読むこと", "§4.2 の日本語の文")
+  i18n.setup("en")
+  -- 窓から（s → 2 番）
+  menus, picks = {}, { 2 }
+  ui.steer_menu("a1")
+  local b = input_buf()
+  t.ok(b ~= nil, "親経由の窓が開いた")
+  t.eq(vim.b[b].agentmap_steer_kind, "relay", "窓の種類は relay")
+  vim.api.nvim_buf_set_lines(b, 1, -1, false, { "from the window" })
+  settle()
+  before = #read(out1)
+  vim.cmd("write")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN .. "from the window", "窓から送った")
+  -- :AgentMapSteer 1 relay <本文>
+  settle()
+  before = #read(out1)
+  vim.cmd("AgentMapSteer 1 relay by command")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN .. "by command", ":AgentMapSteer 1 relay <本文>")
+  t.eq(last("request").opts.via, "relay", "via relay")
+  -- 断る：孫・終わった箱
+  notes = {}
+  local n0 = #calls
+  t.eq(ui.steer_send("a2", "x", nil, { route = "relay" }), "not_target", "終わった箱は親経由にしない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(ui._st("ui.steer_relay_not_target")), "知らせた")
+  -- hooks の登録が古くても親経由は送れる（端末の経路）
+  hooks_status = "outdated"
+  t.eq(ui.steer_send("a1", "hooks do not matter", nil, { route = "relay" }), "relayed", "登録が古くても送れる")
+  hooks_status = "installed"
 end)
 
 -- 6c. 終わった実行（SessionEnd 済み）：ROOT・やり直しは端末へ送らない（同じフォルダの別の会話に入る）
@@ -291,6 +403,7 @@ t.run("run ended", function()
   menus = {}
   s.ended_at = "2026-09-28T05:00:00.000Z"
   local n0 = #calls
+  settle()
   local before = #read(out1)
   ui.steer_menu("ROOT")
   t.eq(#menus, 0, "終わった実行の ROOT にはメニューを出さない")
@@ -359,6 +472,7 @@ t.run("notice to parent", function()
   -- a1（親は ROOT）に届いた → ROOT の端末へ知らせ
   s.steers["n1"] = { id = "n1", agent_id = "a1", kind = "steer", status = "DELIVERED", text = "use docs/v3" }
   s.steer_order[#s.steer_order + 1] = "n1"
+  settle()
   local before = #read(out1)
   t.eq(ui.notify_parents(), 1, "親への知らせを 1 件作った")
   local c = last("request")
@@ -404,6 +518,55 @@ t.run("notice to parent", function()
   t.eq(#read(out1), before2, "端末にも打たない")
   events.request_steer = orig_req
   s.steers, s.steer_order = {}, {}
+end)
+
+-- 8c. 親経由の指示：親への知らせは作らない（V44）。「親が渡した」「渡さずに番を終えた」「終わり際に届いた」を 1 回ずつ知らせる
+t.run("relay notices", function()
+  s.steers, s.steer_order = {}, {}
+  ui._seed_expired()
+  s.steers["r1"] = { id = "r1", agent_id = "a1", kind = "steer", via = "relay", status = "DELIVERED", text = "x",
+    delivered_via = "terminal" }
+  local n0 = #calls
+  t.eq(ui.notify_parents(), 0, "親経由の指示から親への知らせは作らない")
+  t.eq(#calls, n0, "記録もしない")
+  notes = {}
+  t.eq(ui.notify_relays(), 0, "打っただけではまだ知らせない")
+  s.steers.r1.relayed_at = "2026-09-28T04:31:05.000Z"
+  s.steers.r1.delivered_via = "SendMessage"
+  t.eq(ui.notify_relays(), 1, "親が渡したら 1 回")
+  t.ok(noted(ui._st("ui.steer_relayed", { label = ui._steer_label("a1") })), "「親が渡しました」")
+  t.eq(ui.notify_relays(), 0, "2 回目は知らせない")
+  -- 渡さずに番を終えた
+  s.steers["r2"] = { id = "r2", agent_id = "a1", kind = "steer", via = "relay", status = "EXPIRED", end_reason = "not_relayed" }
+  notes = {}
+  ui.notify_expired()
+  t.ok(noted(ui._st("ui.steer_not_relayed", { label = ui._steer_label("a1") })), "「渡さずに番を終えました」")
+  t.ok(not noted(T("ui.steer_expired_notice", { label = ui._steer_label("a1") })), "普通の「届かなかった」は出さない")
+  -- 終わり際に届いた（hook、mode block）
+  s.steers["h1"] = { id = "h1", agent_id = "a1", kind = "steer", via = "hook", status = "DELIVERED", mode = "block",
+    delivered_via = "SubagentStop" }
+  s.steers["h2"] = { id = "h2", agent_id = "a1", kind = "steer", via = "hook", status = "DELIVERED", mode = "deny",
+    delivered_via = "PreToolUse:Write" }
+  notes = {}
+  t.eq(ui.notify_relays(), 1, "終わり際の配達だけ知らせる（次の道具での配達は知らせない）")
+  t.ok(noted(ui._st("ui.steer_delivered_stop", { label = ui._steer_label("a1") })), "「終わり際で届き、続きを始めました」")
+  s.steers, s.steer_order = {}, {}
+  ui._seed_expired()
+end)
+
+-- 8d. 残り時間の目安（進み具合の推定があるときだけ）
+t.run("eta", function()
+  local progress = require("agentmap.progress")
+  local orig = progress.compute
+  progress.compute = function() return { pct = 40, estimated = true, basis = "time", expected_ms = 300000, cur_elapsed_ms = 60000 } end
+  t.eq(ui._eta_suffix("a1"), ui._st("ui.steer_queued_eta", { left = "4 min" }), "時間の推定から残り 4 min")
+  progress.compute = function() return { pct = 40, estimated = true, basis = "tasks", n = 3, k = 1, f = 0.5, expected_ms = 20000 } end
+  t.eq(ui._eta_suffix("a1"), ui._st("ui.steer_queued_eta", { left = "30 s" }), "手順の推定から残り 30 s")
+  progress.compute = function() return { pct = 66.6, estimated = false, basis = "tasks", n = 3, k = 2, f = 0 } end
+  t.eq(ui._eta_suffix("a1"), "", "推定が無ければ付けない")
+  progress.compute = function() return { pct = 95, estimated = true, basis = "time", expected_ms = 1000, cur_elapsed_ms = 5000, over = true } end
+  t.eq(ui._eta_suffix("a1"), "", "典型時間を超えていれば付けない")
+  progress.compute = orig
 end)
 
 -- 9. 届かなかった指示の知らせ（1 回だけ）

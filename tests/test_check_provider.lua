@@ -333,4 +333,33 @@ do
   end
 end
 
+-- ---------- 親経由の修正指示：PostToolUse の SendMessage（v0.1.2。DESIGN-v0.1.2-steer2 §6.3） ----------
+local S2 = {}
+for i, l in ipairs(vim.fn.readfile(FIX .. "/hooks_steer2.jsonl")) do S2[i] = dec(l) end
+t.eq(S2[6].tool_name, "SendMessage", "fixture hooks_steer2 の 6 行目は SendMessage")
+local sm = claude.normalize_hook(S2[6])
+t.eq(#sm, 2, "SendMessage → tool_used と message_sent の 2 件")
+t.eq(sm[1].event, "tool_used", "1 件目は tool_used（今までどおり）")
+t.eq(sm[1].tool_name, "SendMessage", "tool_used の tool_name")
+t.eq(sm[2].event, "message_sent", "2 件目は message_sent")
+t.eq(sm[2].agent_id, "ROOT", "送った側（agent_id の無い行）は ROOT")
+t.eq(sm[2].to, "afeed000000000030", "to = 宛先の agent id")
+t.eq(sm[2].head, "The word hello is outdated. The file a.txt must contain the word GOODBYE instead.", "head = 本文の先頭")
+t.eq(sm[2].summary, "Change a.txt content to GOODBYE", "summary")
+t.eq(sm[2].tool_use_id, "toolu_relay0000000000001", "tool_use_id")
+t.eq(sm[2].prompt_id, S2[6].prompt_id, "prompt_id が付く")
+local sm_child = vim.deepcopy(S2[6])
+sm_child.agent_id = "a9"
+t.eq(claude.normalize_hook(sm_child)[2].agent_id, "a9", "子が送ったら agent_id = その子")
+local sm_noto = vim.deepcopy(S2[6])
+sm_noto.tool_input = { head = "x" }
+local evs_noto = claude.normalize_hook(sm_noto)
+t.eq(#evs_noto, 1, "to の無い SendMessage は tool_used だけ")
+t.eq(#claude.normalize_hook({ session_id = "s", hook_event_name = "PostToolUse", tool_name = "SendMessage", tool_use_id = "x" }), 1,
+  "tool_input の無い SendMessage も tool_used だけ")
+-- 同じ id の 2 回目の SubagentStart（再開）も agent_started になる
+local st1, st2 = claude.normalize_hook(S2[1]), claude.normalize_hook(S2[7])
+t.eq({ st1[1].event, st1[1].agent_id, st2[1].event, st2[1].agent_id },
+  { "agent_started", "afeed000000000030", "agent_started", "afeed000000000030" }, "再開の SubagentStart も agent_started（同じ id）")
+
 t.done()

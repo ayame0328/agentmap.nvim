@@ -1,12 +1,12 @@
 -- agentmap/health.lua ... :checkhealth agentmap (DESIGN §8, DESIGN-v0.2 §4.2, DESIGN-v0.2-steer §8.2,
---   DESIGN-v0.1.2-pause §8.2).
+--   DESIGN-v0.1.2-pause §8.2, DESIGN-v0.1.2-steer2 §9.2).
 --   Read-only except for one temp file in the record store (writability check);
 --   the progress statistics are loaded without writing stats.json.
 --   Never calls hooks.install().
 local M = {}
 
 --- Claude Code version the hook payloads were last verified with.
-M.VERIFIED_CLAUDE_CODE = "2.1.289"
+M.VERIFIED_CLAUDE_CODE = "2.1.291"
 
 local function t(key, vars)
   return require("agentmap.i18n").t(key, vars)
@@ -74,20 +74,65 @@ local function registered_commands(path)
   return out
 end
 
---- Whether the registered steering hooks match the steer settings (DESIGN-v0.2-steer §8.2 row 13).
----@return boolean ok
+--- Whether the registered steering hooks match the steer settings (DESIGN-v0.1.2-steer2 §9.2 row 13).
+--- Every delivery hook (--steer) must carry the configured --mode (none = "stop", as the collector reads it)
+--- and the SubagentStop / Stop hooks must be there. Mode "deny" / "context" also needs the PreToolUse guard
+--- and --at-stop on the stop hooks (mode "stop" delivers only at the end, so the guard is not required).
+---@param path string settings.json
+---@param scfg table config.get().steer
+---@return boolean ok, string|nil registered the --mode found on the registered delivery hooks (first one)
 function M.steer_registration_ok(path, scfg)
-  local cmds = registered_commands(path)
-  local guard, mode_ok, at_stop_seen = false, true, false
-  for _, c in ipairs(cmds) do
+  local want = (type(scfg) == "table" and scfg.mode) or "stop"
+  local guard, at_stop, mode_ok, stop_hooks, stop_at = false, false, true, 0, 0
+  local registered
+  for _, c in ipairs(registered_commands(path)) do
     if c.command:find("--steer", 1, true) then
-      if c.event == "PreToolUse" then guard = true end
-      local m = c.command:match("%-%-mode%s+([%w_]+)")
-      if m ~= (scfg.mode or "deny") then mode_ok = false end
-      if c.command:find("--at-stop", 1, true) then at_stop_seen = true end
+      local m = c.command:match("%-%-mode%s+'?([%w_]+)") or "stop"
+      registered = registered or m
+      if m ~= want then mode_ok = false end
+      if c.event == "PreToolUse" then
+        guard = true
+      elseif c.event == "SubagentStop" or c.event == "Stop" then
+        stop_hooks = stop_hooks + 1
+        if c.command:find("--at-stop", 1, true) then stop_at = stop_at + 1 end
+      end
     end
   end
-  return guard and mode_ok and (at_stop_seen == (scfg.at_stop ~= false))
+  at_stop = stop_hooks > 0 and stop_at == stop_hooks
+  if not mode_ok or stop_hooks == 0 then return false, registered end
+  if want == "stop" then return true, registered end
+  return guard and at_stop, registered
+end
+
+--- Whether one of our PostToolUse hooks lists SendMessage in its matcher (DESIGN-v0.1.2-steer2 §9.2 row 18).
+---@param path string settings.json
+---@return boolean
+function M.sendmessage_recorded(path)
+  local util = require("agentmap.util")
+  local js = util.json_decode(util.read_file(path))
+  if type(js) ~= "table" or type(js.hooks) ~= "table" then return false end
+  local ok_h, hooks = pcall(require, "agentmap.hooks")
+  local function ours(h)
+    if ok_h and type(hooks.is_ours) == "function" then
+      local ok, r = pcall(hooks.is_ours, h)
+      if ok then return r and true or false end
+    end
+    return type(h.command) == "string" and h.command:find("agentmap-collect", 1, true) ~= nil
+  end
+  for _, g in ipairs(type(js.hooks.PostToolUse) == "table" and js.hooks.PostToolUse or {}) do
+    if type(g) == "table" and type(g.matcher) == "string" then
+      local has = false
+      for tool in g.matcher:gmatch("[^|]+") do
+        if vim.trim(tool) == "SendMessage" then has = true end
+      end
+      if has then
+        for _, h in ipairs(type(g.hooks) == "table" and g.hooks or {}) do
+          if type(h) == "table" and ours(h) then return true end
+        end
+      end
+    end
+  end
+  return false
 end
 
 -- 未配達の指示ファイル（.delivered.json と書きかけを除く）の数
@@ -326,14 +371,23 @@ function M.check()
     end
   end
 
-  -- 13. 修正指示の登録（DESIGN-v0.2-steer §8.2）
+  -- 13. 修正指示の登録（DESIGN-v0.1.2-steer2 §9.2）
   local scfg = config.get().steer or {}
+  local smode = scfg.mode or "stop"
   if scfg.enabled == false then
     h.info(t("health.steer_off"))
-  elseif M.steer_registration_ok(spath, scfg) then
-    h.ok(t("health.steer_on", { mode = scfg.mode or "deny", at_stop = scfg.at_stop == false and "off" or "on" }))
   else
-    h.warn(t("health.steer_outdated"))
+    if M.steer_registration_ok(spath, scfg) then
+      h.ok(t("health.steer_on", { mode = smode }))
+    else
+      h.warn(t("health.steer_outdated"))
+    end
+    if smode == "deny" or smode == "context" then
+      h.info(t("health.steer_mode_tool_result", { mode = smode }))
+    end
+  end
+  if type(config.steer_at_stop_given) == "function" and config.steer_at_stop_given() then
+    h.info(t("health.steer_at_stop_ignored"))
   end
 
   -- 14. 未配達の印（health は書かないので、古い印も消さない）
@@ -385,6 +439,13 @@ function M.check()
     end
   else
     h.ok(t("health.pause_flag_ok"))
+  end
+
+  -- 18. SendMessage の記録（親経由の確認。DESIGN-v0.1.2-steer2 §9.2）
+  if M.sendmessage_recorded(spath) then
+    h.ok(t("health.sendmessage_ok"))
+  else
+    h.warn(t("health.sendmessage_missing"))
   end
 end
 

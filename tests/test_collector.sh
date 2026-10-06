@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
 #  test_collector.sh -- tests for bin/agentmap-collect (the hook recorder)
-#    - 実物の hook の中身 29 件（パスは匿名化済み）を 1 件ずつ流して、終了コード 0・画面出力なし
-#      （2.1.283 の 14 件＋2.1.288 の手順表 TaskCreate/TaskUpdate/TaskList の session 11 件＋修正指示の payload 4 件）
+#    - 実物の hook の中身 36 件（パスは匿名化済み）を 1 件ずつ流して、終了コード 0・画面出力なし
+#      （2.1.283 の 14 件＋2.1.288 の手順表 TaskCreate/TaskUpdate/TaskList の session 11 件＋修正指示の payload 4 件
+#        ＋2.1.291 の親経由（SendMessage）・終わった子の再開（同じ id の 2 回目の SubagentStart）・内部 Agent の SubagentStop 7 件）
 #    - 手順表（TaskCreate/TaskUpdate/TaskList）は決めた項目だけ残す（description は保存しない）
-#    - --steer：未配達の修正指示を配達する（deny / context / 終わりで block、二重配達しない、記録 1 行）
+#    - --steer：未配達の修正指示を配達する（既定 mode stop＝終わり際の block だけ、deny / context、二重配達しない、記録 1 行）
+#    - PostToolUse の SendMessage は to / head / summary だけ残す（DESIGN-v0.1.2-steer2 §4.5）
 #    - --pause：止まれファイルがある間 hook の中で待つ（期限・--max-wait・再開・指示つき再開・SIGTERM・壊れたファイル）
 #    - 保存場所（projects/<slug>/runs/<sid>/hooks.jsonl, project.json）
 #    - 残す項目だけ残っているか（依頼文の全文・permission_mode などが無いこと）
@@ -39,7 +41,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ -z "$out" ] || ng "payload $n printed to stdout"
   [ -s "$TMP/err" ] && ng "payload $n printed to stderr: $(cat "$TMP/err")"
 done < "$RAW"
-[ $n -eq 29 ] && ok "29 payloads fed, exit 0, silent" || ng "expected 29 payloads, got $n"
+[ $n -eq 36 ] && ok "36 payloads fed, exit 0, silent" || ng "expected 36 payloads, got $n"
 
 # 2) 置き場所と中身
 python3 - "$AGENTMAP_DIR" "$RAW" <<'PY' || FAIL=1
@@ -103,6 +105,24 @@ check(tl and tl[0].get("tool_response") == {"tasks": [{"id": "1", "subject": "al
                                                        {"id": "2", "subject": "beta", "status": "in_progress"}]},
       "TaskList: tasks id/subject/status (blockedBy dropped)")
 check(all("agent_id" not in r for r in tc + tu + tl), "Task records of ROOT have no agent_id")
+
+# 親経由（2.1.291 の SendMessage）と終わった子の再開。別の session
+rsid = "c0ffee30-0000-4000-8000-000000000030"
+rp = os.path.join(root, "projects", slug, "runs", rsid, "hooks.jsonl")
+rrecs = [json.loads(l) for l in open(rp)] if os.path.isfile(rp) else []
+rtext = open(rp, encoding="utf-8").read() if os.path.isfile(rp) else ""
+sm = [r for r in rrecs if r.get("tool_name") == "SendMessage"]
+check(len(sm) == 1 and sm[0].get("tool_input") == {"to": "afeed000000000030",
+      "head": "The word hello is outdated. The file a.txt must contain the word GOODBYE instead.",
+      "summary": "Change a.txt content to GOODBYE"}, "SendMessage: tool_input = to / head / summary")
+check(sm and "tool_response" not in sm[0] and "queued for delivery" not in rtext and '"recipient"' not in rtext and '"content"' not in rtext,
+      "SendMessage: tool_response / recipient / content not stored")
+check(sm and "agent_id" not in sm[0] and sm[0].get("tool_use_id") == "toolu_relay0000000000001", "SendMessage by ROOT: no agent_id, tool_use_id kept")
+starts = [r for r in rrecs if r["hook_event_name"] == "SubagentStart" and r.get("agent_id") == "afeed000000000030"]
+check(len(starts) == 2, "a resumed child: two SubagentStart records with the same agent_id")
+check("scratchpad_dir" not in rtext, "SubagentStart: scratchpad_dir not stored")
+ups = [r for r in rrecs if r["hook_event_name"] == "UserPromptSubmit"]
+check(ups and ups[0].get("prompt_head", "").startswith("[AgentMap] Tell sub-agent [1] "), "relay prompt_head kept")
 sys.exit(1 if bad else 0)
 PY
 
@@ -444,9 +464,50 @@ check(out == "", "Stop with nothing pending: no answer (the turn ends normally)"
 
 # 本文は 4000 文字で切る
 put(CH + "-1791100000010.json", "あ" * 5000)
-code, out, err = call(pre_child, "--steer")
+code, out, err = call(pre_child, "--steer", "--mode", "deny")
 r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
-check(r.count("あ") == 4000, "text cut to 4000 chars; default mode is deny")
+check(r.count("あ") == 4000, "text cut to 4000 chars")
+
+# mode stop（0.1.2 の既定。DESIGN-v0.1.2-steer2 §3.2・§3.3）
+STOP_HEAD = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
+             "It reaches you now, just before you finish:\n")
+STOP_TAIL = "Apply it now, continue your task, then finish again."
+CHILD_TAIL = " Mention this instruction and what you changed because of it in your final report."
+for args, label in ((["--steer"], "no --mode (default stop)"), (["--steer", "--mode", "stop"], "--mode stop"),
+                    (["--steer", "--mode", "bogus"], "unknown --mode (stop)")):
+    sid = CH + "-17911000001%02d" % len(lines())
+    put(sid + ".json", "write b.txt, not a.txt")
+    n0 = len(lines())
+    code, out, err = call(pre_child, *args)
+    check(code == 0 and out == "" and err == "" and len(lines()) == n0 and os.path.exists(os.path.join(sdir, sid + ".json")),
+          "%s, PreToolUse: stdout empty, file kept, no steer line" % label)
+    code, out, err = call(stop_first, *args)
+    o = json.loads(out) if out else {}
+    r = o.get("reason") or ""
+    check(o.get("decision") == "block" and r == STOP_HEAD + "write b.txt, not a.txt\n" + STOP_TAIL + CHILD_TAIL,
+          "%s, SubagentStop (no --at-stop): block with the at-its-end text + final-report sentence" % label)
+    check("this is not a tool error" not in r and "Do not treat this as a test" not in r, "%s: no tool-error wording at the stop" % label)
+    check(lines()[-1].get("steer") == {"ids": [sid], "mode": "block", "target": CH}, "%s: steer line mode block" % label)
+# ROOT の Stop（agent_id 無し）→ 同じ文で末尾の頼みは無し
+stop_root = {k: v for k, v in stop_first.items() if k not in ("agent_id", "agent_type", "agent_transcript_path")}
+stop_root["hook_event_name"] = "Stop"
+put("ROOT-1791100000200.json", "for root at its end")
+code, out, err = call(stop_root, "--steer", "--mode", "stop")
+o = json.loads(out) if out else {}
+check(o.get("decision") == "block" and o.get("reason") == STOP_HEAD + "for root at its end\n" + STOP_TAIL,
+      "--mode stop, ROOT's Stop: block, at-its-end text, no final-report sentence")
+# v0.1.1 の登録（--mode deny --at-stop）でも終わり際は block（文は終わり際用）
+put(CH + "-1791100000201.json", "old registration")
+code, out, err = call(stop_first, "--steer", "--mode", "deny", "--at-stop")
+o = json.loads(out) if out else {}
+check(o.get("decision") == "block" and (o.get("reason") or "").startswith(STOP_HEAD) and "old registration" in o.get("reason", ""),
+      "--mode deny --at-stop (v0.1.1 words): block with the at-its-end text")
+# 2 件は空行で区切って 1 通
+put(CH + "-1791100000202.json", "one")
+put(CH + "-1791100000203.json", "two")
+code, out, err = call(stop_again, "--steer")
+r = (json.loads(out) if out else {}).get("reason") or ""
+check(r == STOP_HEAD + "one\n\ntwo\n" + STOP_TAIL + CHILD_TAIL, "--mode stop: two pending at the stop, one message, blank line between")
 sys.exit(1 if bad else 0)
 PY
 
@@ -658,6 +719,41 @@ for name, body in (("too big", json.dumps({"id": "x", "pad": "x" * 5000})), ("br
     os.remove(PF)
 log = os.path.join(root, "collector.log")
 check(os.path.isfile(log) and "pause file too big" in open(log).read(), "(j) the reason goes to collector.log")
+
+# (g') mode stop（既定）：止まれ＋未配達、PreToolUse で 0.3 秒後に rm → 何も出さず抜ける（道具の直前には配達しない）。
+#      released に steer_ids は無く、ファイルは残る → 続く SubagentStop で block＋steer 行（止まっていた時間の行は無し）
+SARGS = ["--steer", "--mode", "stop", "--pause"]
+put_pause()
+sid6 = put_steer("write b.txt instead", 1791300000020)
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *SARGS, "--max-wait", "10", later=(0.3, rm(PF)))
+new = lines()[n0:]
+check(code == 0 and out == "" and err == "" and dt < 0.9, "(g') mode stop: resumed at PreToolUse, stdout empty (%.2f s)" % dt)
+check([l["pause"]["phase"] for l in new if "pause" in l] == ["hit", "released"] and not any("steer" in l for l in new),
+      "(g') mode stop: hit + released, no steer line")
+check(new and "steer_ids" not in new[-1].get("pause", {}) and new[-1]["pause"].get("reason") == "user", "(g') released: reason user, no steer_ids")
+check(os.path.exists(os.path.join(sdir, sid6 + ".json")), "(g') the instruction file stays for the stop")
+n0 = len(lines())
+code, out, err, dt = call(stop_first, *SARGS, "--max-wait", "10", "--record")
+o = json.loads(out) if out else {}
+new = lines()[n0:]
+check(o.get("decision") == "block" and "write b.txt instead" in o.get("reason", "") and "You were paused" not in o.get("reason", ""),
+      "(g') then SubagentStop: block, no paused-for line (this hook did not wait)")
+check([("steer" in l and "steer") or ("pause" in l and "pause") or "record" for l in new] == ["record", "steer"]
+      and new[-1]["steer"]["ids"] == [sid6], "(g') SubagentStop: record, then the steer line")
+# 関門（SubagentStop で待つ）＋未配達、mode stop → rm でその場で block＋止まっていた時間の行
+put_pause(at="stop", kind="gate")
+sid7 = put_steer("fix the tests too", 1791300000021)
+n0 = len(lines())
+code, out, err, dt = call(stop_first, *SARGS, "--max-wait", "10", "--record", later=(0.3, rm(PF)))
+o = json.loads(out) if out else {}
+r = o.get("reason") or ""
+new = lines()[n0:]
+check(o.get("decision") == "block" and r.startswith("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
+      "It reaches you now, just before you finish:\n(You were paused by the user for 0 s before this instruction.)\nfix the tests too\n"),
+      "(gate) mode stop: the gate fix arrives at once, at-its-end text with the paused-for line")
+check([("pause" in l and l["pause"]["phase"]) or ("steer" in l and "steer") or "record" for l in new] == ["record", "hit", "released", "steer"]
+      and new[2]["pause"].get("steer_ids") == [sid7], "(gate) record, hit, released (steer_ids), steer")
 
 # ROOT 宛て（agent_id の無い payload）は ROOT.json を見る
 os.makedirs(pdir, exist_ok=True)

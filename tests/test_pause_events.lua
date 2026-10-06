@@ -308,6 +308,47 @@ if vim.fn.executable("python3") == 1 and vim.fn.executable("bash") == 1 then
   t.ok(not exists(PDIR .. "/" .. G .. ".json"), "past deadline: the hook removed the pause file")
   events.sweep_pauses(run)
   t.ok(not exists(FLAG), "flag removed after the hook released the last pause")
+  -- mode stop（0.1.2 の既定。DESIGN-v0.1.2-steer2 §5・E4）：止まれ＋指示 → resume_pause(steer_id) → 門番は何も出さず抜け、
+  -- ファイルは残る。続く SubagentStop の hook がその指示を block で届ける
+  local rec = "python3 " .. hooks.quote(hooks.collector_path()) .. " --root " .. hooks.quote(ROOT)
+  local guard_s, stop_s = hooks.steer_cmd({ record = rec, root = ROOT, mode = "stop", pause = { auto_resume_s = 5 } })
+  t.matches(guard_s, "%-%-mode stop %-%-pause %-%-max%-wait 5$", "mode stop: the guard command")
+  local ip4 = events.request_pause(run, G)
+  n0 = #util.json_lines(run_dir .. "/hooks.jsonl", 0)
+  job = vim.system({ "bash", "-c", guard_s }, { stdin = payload, text = true })
+  t.ok(wait_hit(n0), "mode stop round trip: hit")
+  local sid4 = events.request_steer(run, G, "write b.txt instead", { via = "hook" })
+  t.eq((function()
+    for _, e in ipairs(util.json_lines(run_dir .. "/events.jsonl", 0)) do
+      if e.event == "steer_requested" and e.steer_id == sid4 then return e.expect end
+    end
+  end)(), "stop", "mode stop round trip: expect = stop")
+  t1 = vim.uv.hrtime()
+  events.resume_pause(run, G, { steer_id = sid4 })
+  r = job:wait(3000)
+  ms = (vim.uv.hrtime() - t1) / 1e6
+  t.eq({ r.code, r.stdout }, { 0, "" }, "mode stop round trip: the guard exits 0 and prints nothing (no delivery before a tool)")
+  t.ok(ms < 1000, ("mode stop round trip: released within 1 s (%d ms)"):format(ms))
+  t.ok(exists(run_dir .. "/steer/" .. sid4 .. ".json"), "mode stop round trip: the instruction file stays")
+  local rel
+  for _, l in ipairs(util.json_lines(run_dir .. "/hooks.jsonl", n0 > 0 and 0 or 0)) do
+    if l.pause and l.pause.phase == "released" and l.pause.id == ip4 then rel = l.pause end
+  end
+  t.ok(rel ~= nil and rel.steer_ids == nil, "mode stop round trip: released line without steer_ids")
+  events.poll(run)
+  t.eq(run.state.pauses[ip4].status, "RESUMED", "mode stop round trip: RESUMED")
+  t.eq(run.state.steers[sid4].status, "PENDING", "mode stop round trip: the steer is still PENDING (arrives at its end)")
+  local stop_payload = vim.json.encode({ session_id = SID, cwd = "/tmp/agentmap-test/pause", hook_event_name = "SubagentStop",
+    transcript_path = "/tmp/agentmap-test/claude/projects/" .. SLUG .. "/" .. SID .. ".jsonl",
+    agent_id = G, agent_type = "general-purpose", prompt_id = P, stop_hook_active = false, last_assistant_message = "a.txt written." })
+  r = vim.system({ "bash", "-c", stop_s }, { stdin = stop_payload, text = true }):wait(3000)
+  o = r.stdout ~= "" and vim.json.decode(r.stdout) or {}
+  t.eq(o.decision, "block", "mode stop round trip: SubagentStop → decision block")
+  t.matches(o.reason or "", "just before you finish:\nwrite b.txt instead\nApply it now", "mode stop round trip: the at-its-end text")
+  t.ok(not (o.reason or ""):find("You were paused", 1, true), "mode stop round trip: no paused-for line (this hook did not wait)")
+  events.poll(run)
+  t.eq(run.state.steers[sid4].status, "DELIVERED", "mode stop round trip: DELIVERED at SubagentStop")
+  t.eq(run.state.agents[G].status, "RUNNING", "mode stop round trip: the child keeps working (block reopens it)")
 else
   t.skip("python3 / bash not found: collector round trip")
 end

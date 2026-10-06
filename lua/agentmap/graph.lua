@@ -891,21 +891,28 @@ M.steers_of = steers_of
 
 M.STEER_RECENT_S = 60 -- 配達済みの印 ✎ を出しておく秒数
 
---- Steering marks on line 4 of a box (DESIGN-v0.2-steer §6.3):
---- " ✎n" pending (purple), " ✎!" not delivered before the agent finished (red),
---- " ✎" delivered within the last 60 s (green), otherwise nothing.
+--- True for a relay (via the main agent) that is typed or read but not yet passed on with SendMessage
+--- (DESIGN-v0.1.2-steer2 §6.4, the same rule as state.relay_pending: no relayed_at, not EXPIRED / CANCELLED).
+function M.relay_waiting(x)
+  return type(x) == "table" and x.via == "relay" and x.relayed_at == nil
+    and x.status ~= "EXPIRED" and x.status ~= "CANCELLED"
+end
+
+--- Steering marks on line 4 of a box (DESIGN-v0.2-steer §6.3, DESIGN-v0.1.2-steer2 §7.2):
+--- " ✎n" pending, or a relay not passed on yet (purple), " ✎!" not delivered / not relayed (red),
+--- " ✎" delivered (or relayed) within the last 60 s (green), otherwise nothing.
 function M.steer_marks(state, a, now)
   if not a or type(state) ~= "table" or type(state.steers) ~= "table" then return {} end
   now = now or os.time()
   local pending, expired, recent = 0, false, false
   for _, sid in ipairs(steers_of(state, a.id)) do
     local x = state.steers[sid]
-    if x.status == "PENDING" then
+    if x.status == "PENDING" or M.relay_waiting(x) then
       pending = pending + 1
     elseif x.status == "EXPIRED" then
       expired = true
     elseif x.status == "DELIVERED" then
-      local t = H.parse_iso(x.delivered_at)
+      local t = H.parse_iso(x.relayed_at or x.delivered_at)
       if t and now - t <= M.STEER_RECENT_S then recent = true end
     end
   end

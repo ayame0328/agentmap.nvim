@@ -8,6 +8,10 @@
 --     SubagentStop / Stop は同期で --steer --record（DESIGN-v0.2 §2.2、DESIGN-v0.2-steer §7）
 --   ・v0.1.2：配達の 2 種に --pause --max-wait <auto_resume_s> と timeout auto_resume_s + 30（既定 630）。
 --     門番は pause.pending も見る。status() は機能語と timeout も見る（DESIGN-v0.1.2-pause §7）
+--   ・v0.1.2（steer2）：既定の mode は stop。門番は pause.pending だけ、終わりの command に --at-stop は書かない。
+--     mode deny / context は v0.1.1 と同じ語。pause 無効かつ stop なら PreToolUse の配達の組は登録しない。
+--     PostToolUse に SendMessage。features() に mode / at_stop / sendmessage。status() は mode も見る
+--     （DESIGN-v0.1.2-steer2 §8）
 local t = require("t")
 local J = require("agentmap.jsonfmt")
 local hooks = require("agentmap.hooks")
@@ -116,7 +120,8 @@ t.eq(J.encode(J.decode(real_like)) .. "\n", real_like, "設定の例も書式が
 -- 2. merge（表の上だけ）
 local desired = hooks.desired(CMD)
 t.eq(#J.keys(desired), 9, "登録するイベントは 9 個")
-t.eq(desired.PostToolUse[1].matcher, "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList", "PostToolUse の対象（手順表の 3 つを含む）")
+t.eq(desired.PostToolUse[1].matcher, "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList|SendMessage", "PostToolUse の対象（手順表の 3 つと SendMessage を含む）")
+t.eq(hooks._steer_cfg(nil).mode, "stop", "既定の steer.mode は stop（0.1.2）")
 t.eq(desired.PreToolUse[1].matcher, "Agent|AskUserQuestion", "PreToolUse の 1 組目は Agent と AskUserQuestion（記録）")
 t.eq(#desired.PreToolUse, 2, "PreToolUse は 2 組（記録・配達）")
 t.eq(desired.PreToolUse[2].matcher, nil, "配達の組は matcher 無し（全部の道具）")
@@ -124,13 +129,13 @@ t.eq(desired.PreToolUse[2].hooks[1].async, false, "配達の組は同期（止�
 t.eq(desired.PreToolUse[1].hooks[1].async, true, "記録の組は async のまま")
 local root0 = require("agentmap.config").root()
 t.eq(desired.PreToolUse[2].hooks[1].command,
-  "[ -e " .. hooks.quote(root0 .. "/steer.pending") .. " ] || [ -e " .. hooks.quote(root0 .. "/pause.pending")
-    .. " ] || exit 0; exec " .. CMD .. " --steer --mode deny --pause --max-wait 600",
-  "配達の command はシェルの門番（印 2 つ）→ exec で collector --steer --pause")
-t.eq(desired.SubagentStop[1].hooks[1].command, CMD .. " --steer --mode deny --at-stop --pause --max-wait 600 --record",
-  "SubagentStop は記録＋配達＋一時停止")
+  "[ -e " .. hooks.quote(root0 .. "/pause.pending") .. " ] || exit 0; exec " .. CMD .. " --steer --mode stop --pause --max-wait 600",
+  "門番の command（mode stop）は pause.pending だけ見る → exec で collector --steer --mode stop --pause")
+t.ok(not desired.PreToolUse[2].hooks[1].command:find("steer.pending", 1, true), "mode stop の門番は steer.pending を見ない")
+t.eq(desired.SubagentStop[1].hooks[1].command, CMD .. " --steer --mode stop --pause --max-wait 600 --record",
+  "SubagentStop は記録＋終わり際の配達＋一時停止（--at-stop は書かない）")
 t.eq(desired.SubagentStop[1].hooks[1].async, false, "SubagentStop は同期")
-t.eq(desired.Stop[1].hooks[1].command, CMD .. " --steer --mode deny --at-stop --pause --max-wait 600 --record", "Stop も記録＋配達＋一時停止")
+t.eq(desired.Stop[1].hooks[1].command, CMD .. " --steer --mode stop --pause --max-wait 600 --record", "Stop も記録＋終わり際の配達＋一時停止")
 t.eq(desired.SessionEnd[1].hooks[1].command, CMD, "SessionEnd は記録だけ")
 t.eq(desired.PreToolUse[2].hooks[1].timeout, 630, "配達の門番の timeout は 630（auto_resume_s + 30）")
 t.eq(desired.SubagentStop[1].hooks[1].timeout, 630, "SubagentStop の timeout は 630")
@@ -143,10 +148,13 @@ local function ev_opts(list, name)
   for _, e in ipairs(list) do if e[1] == name then return e[3] or {} end end
   return {}
 end
-t.eq(ev_opts(hooks.events({ enabled = true, at_stop = false }, false), "SubagentStop").steer or false, false,
-  "at_stop = false・pause 無効なら SubagentStop は記録だけ")
-t.eq(ev_opts(hooks.events({ enabled = true, at_stop = false }, { enabled = true }), "SubagentStop").steer, true,
-  "at_stop = false でも pause 有効なら SubagentStop は配達＋待ち")
+t.eq(ev_opts(hooks.events({ enabled = true, at_stop = false }, false), "SubagentStop").steer, true,
+  "at_stop は廃止：false でも steer 有効なら SubagentStop は配達する（常に on）")
+t.eq(#hooks.events({ enabled = true, mode = "stop" }, false), 9, "mode stop・pause 無効なら PreToolUse の配達の組は登録しない（9 件）")
+t.eq(#hooks.events({ enabled = true, mode = "deny" }, false), 10, "mode deny なら pause 無効でも PreToolUse の配達の組は残る（10 件）")
+t.eq(#hooks.events({ enabled = true, mode = "context" }, false), 10, "mode context も同じ（10 件）")
+t.eq(ev_opts(hooks.events({ enabled = false }, false), "SubagentStop").steer or false, false,
+  "steer も pause も無効なら SubagentStop は記録だけ")
 t.eq(desired.SessionStart[1].matcher, nil, "SessionStart に matcher は付けない")
 t.eq(desired.Stop[1].hooks[1].async, false, "Stop は同期（終了時の取りこぼし防止）")
 t.eq(desired.SessionEnd[1].hooks[1].async, false, "SessionEnd は同期")
@@ -339,7 +347,7 @@ t.ok(ok8 and not info8.changed, "同じ root なら 2 回目は変更なし")
 local ok9, info9 = hooks.install({ path = path7, root = false, yes = true, quiet = true })
 t.ok(ok9 and info9.changed, "root を外すと変更あり")
 t.ok(not J.decode(read(path7)).hooks.SessionEnd[1].hooks[1].command:find("--root", 1, true), "root = false なら --root 無し")
-t.matches(saved.hooks.PreToolUse[2].hooks[1].command, "^%[ %-e /tmp/agentmap%-test/store/steer%.pending %] ", "門番は --root の保存先の印を見る")
+t.matches(saved.hooks.PreToolUse[2].hooks[1].command, "^%[ %-e /tmp/agentmap%-test/store/pause%.pending %] ", "門番は --root の保存先の印を見る")
 
 -- 6b. v0.1.0 の登録（PreToolUse 1 組・Task の matcher 無し）は outdated、登録し直すと installed
 local v01 = J.decode(J.encode(J.obj({ { "hooks", hooks.desired(CMD, { steer = false }) } })))
@@ -382,15 +390,25 @@ t.eq(off.hooks.SubagentStop[1].hooks[1].timeout, 10, "記録だけに戻れば t
 t.eq(off.hooks.SubagentStop[1].hooks[1].async, true, "steer = false なら SubagentStop は async に戻る")
 t.eq(off.hooks.Stop[1].hooks[1].async, false, "steer = false でも Stop は同期（記録の取りこぼし防止）")
 t.eq(hooks.status(dir .. "/v01.json"), "installed", "steer = false で登録し直すと installed")
--- mode = context / at_stop = false
+-- mode = context（at_stop = false は 0.1.2 から無視）
 config0.setup({ steer = { mode = "context", at_stop = false }, pause = false })
 local dctx = hooks.desired(CMD)
-t.matches(dctx.PreToolUse[2].hooks[1].command, " %-%-steer %-%-mode context$", "mode = context が門番の command に入る")
-t.eq(dctx.SubagentStop[1].hooks[1].command, CMD, "at_stop = false（pause 無効）なら SubagentStop は記録だけ")
-t.eq(#hooks.events(), 10, "at_stop = false でも PreToolUse の配達は残る")
+t.eq(dctx.PreToolUse[2].hooks[1].command, "[ -e " .. hooks.quote(root0 .. "/steer.pending") .. " ] || exit 0; exec "
+  .. CMD .. " --steer --mode context", "mode = context：門番は steer.pending を見て --mode context（v0.1.1 の語）")
+t.eq(dctx.SubagentStop[1].hooks[1].command, CMD .. " --steer --mode context --at-stop --record",
+  "mode = context：at_stop = false は無視、SubagentStop は --at-stop 付きで配達")
+t.eq(#hooks.events(), 10, "mode = context・pause 無効でも PreToolUse の配達は残る")
 config0.setup({ steer = { at_stop = false } })
-t.eq(hooks.desired(CMD).SubagentStop[1].hooks[1].command, CMD .. " --steer --mode deny --pause --max-wait 600 --record",
-  "at_stop = false でも pause 有効なら SubagentStop は待つ（--at-stop は付けない）")
+t.eq(hooks.desired(CMD).SubagentStop[1].hooks[1].command, CMD .. " --steer --mode stop --pause --max-wait 600 --record",
+  "at_stop = false を書いても既定の mode stop の command のまま")
+config0.setup({ steer = { mode = "stop" }, pause = false })
+local dstop = hooks.desired(CMD)
+t.eq(#dstop.PreToolUse, 1, "mode stop・pause 無効：PreToolUse は記録の 1 組だけ")
+t.eq(dstop.SubagentStop[1].hooks[1].command, CMD .. " --steer --mode stop --record", "mode stop・pause 無効：SubagentStop は --steer --mode stop --record")
+t.eq(dstop.SubagentStop[1].hooks[1].timeout, 10, "mode stop・pause 無効：timeout 10")
+local gs = hooks.steer_cmd({ record = CMD, root = "/r", mode = "stop", pause = false })
+t.eq(gs, "exit 0; exec " .. CMD .. " --steer --mode stop", "steer_cmd（stop・pause 無効）：門番は exit 0 だけ（登録されない）")
+config0.setup({})
 local g2, s2 = hooks.steer_cmd({ record = CMD, root = "/r x", mode = "deny", at_stop = true, pause = false })
 t.eq(g2, "[ -e '/r x/steer.pending' ] || exit 0; exec " .. CMD .. " --steer --mode deny",
   "steer_cmd（pause 無効）: v0.1.1 と同じ門番（空白を含む root は囲む）")
@@ -403,11 +421,17 @@ config0.setup({})
 
 -- 6b2. 一時停止の登録（DESIGN-v0.1.2-pause §7・§10）
 -- pause.enabled = false なら command も timeout も v0.1.1 と同じ
-local d_off = hooks.desired(CMD, { pause = false })
+local d_off = hooks.desired(CMD, { steer = { mode = "deny" }, pause = false })
 t.eq(d_off.PreToolUse[2].hooks[1].command, "[ -e " .. hooks.quote(root0 .. "/steer.pending") .. " ] || exit 0; exec "
-  .. CMD .. " --steer --mode deny", "pause 無効：門番は v0.1.1 と同じ文字列")
-t.eq(d_off.Stop[1].hooks[1].command, CMD .. " --steer --mode deny --at-stop --record", "pause 無効：Stop も v0.1.1 と同じ")
+  .. CMD .. " --steer --mode deny", "mode deny・pause 無効：門番は v0.1.1 と同じ文字列")
+t.eq(d_off.Stop[1].hooks[1].command, CMD .. " --steer --mode deny --at-stop --record", "mode deny・pause 無効：Stop も v0.1.1 と同じ")
 t.eq(d_off.Stop[1].hooks[1].timeout, 10, "pause 無効：timeout 10")
+local d_deny = hooks.desired(CMD, { steer = { mode = "deny" } })
+t.eq(d_deny.PreToolUse[2].hooks[1].command, "[ -e " .. hooks.quote(root0 .. "/steer.pending") .. " ] || [ -e "
+  .. hooks.quote(root0 .. "/pause.pending") .. " ] || exit 0; exec " .. CMD .. " --steer --mode deny --pause --max-wait 600",
+  "mode deny・pause 有効：門番は印を 2 つ見る（v0.1.2 の作業中の語）")
+t.eq(d_deny.SubagentStop[1].hooks[1].command, CMD .. " --steer --mode deny --at-stop --pause --max-wait 600 --record",
+  "mode deny・pause 有効：SubagentStop は --at-stop 付き")
 -- auto_resume_s = 1200 → timeout 1230、--max-wait 1200
 local d12 = hooks.desired(CMD, { pause = { auto_resume_s = 1200 } })
 t.eq(d12.PreToolUse[2].hooks[1].timeout, 1230, "auto_resume_s 1200 → 門番の timeout 1230")
@@ -419,17 +443,49 @@ t.eq(hooks.timeout_for({ "SessionEnd", nil, { sync = true } }), 10, "timeout_for
 -- features()
 local fpath = dir .. "/v012.json"
 write(fpath, J.encode(J.obj({ { "hooks", hooks.desired(CMD) } })) .. "\n")
-t.eq(hooks.features(fpath), { steer = true, pause = true, max_wait = 600, guard_timeout = 630, stop_timeout = 630 },
-  "features()：v0.1.2 の登録は --steer・--pause・--max-wait 600・timeout 630")
+t.eq(hooks.features(fpath), { steer = true, pause = true, max_wait = 600, guard_timeout = 630, stop_timeout = 630,
+  mode = "stop", at_stop = true, sendmessage = true },
+  "features()：v0.1.2 の登録は --steer・--pause・--max-wait 600・timeout 630・mode stop・SendMessage")
 t.eq(hooks.status(fpath), "installed", "v0.1.2 の登録は installed")
--- v0.1.1 の形（--pause 無し・timeout 10）→ outdated。pause を切っていれば installed
+-- v0.1.1 の形（mode deny --at-stop・--pause 無し・timeout 10・SendMessage 無し）→ outdated
+local V011_MATCHER = "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList"
+local function v011_hooks(cmd)
+  local h = J.decode(J.encode(hooks.desired(cmd, { steer = { mode = "deny" }, pause = false })))
+  h.PostToolUse[1].matcher = V011_MATCHER
+  return h
+end
 local v011 = dir .. "/v011.json"
-write(v011, J.encode(J.obj({ { "hooks", hooks.desired(CMD, { pause = false }) } })) .. "\n")
-t.eq(hooks.features(v011), { steer = true, pause = false, guard_timeout = 10, stop_timeout = 10 },
-  "features()：v0.1.1 の登録は --pause 無し・timeout 10")
-t.eq(hooks.status(v011), "outdated", "v0.1.1 の登録は outdated（組は同じでも --pause が無い）")
-t.eq(hooks.status(v011, nil, false), "installed", "pause を切っていれば v0.1.1 の登録で installed")
-t.eq(hooks.status(fpath, nil, false), "installed", "pause を切っていても --pause 付きの登録は installed（害が無い）")
+write(v011, J.encode(J.obj({ { "hooks", v011_hooks(CMD) } })) .. "\n")
+t.eq(hooks.features(v011), { steer = true, pause = false, guard_timeout = 10, stop_timeout = 10, mode = "deny", at_stop = true,
+  sendmessage = false }, "features()：v0.1.1 の登録は mode deny・--at-stop・--pause 無し・timeout 10・SendMessage 無し")
+t.eq(hooks.status(v011), "outdated", "v0.1.1 の登録は outdated")
+t.eq(hooks.status(v011, { mode = "deny" }, false), "outdated", "pause を切り mode deny でも、SendMessage が無いので outdated")
+local v011b = J.decode(read(v011))
+v011b.hooks.PostToolUse[1].matcher = V011_MATCHER .. "|SendMessage"
+write(dir .. "/v011b.json", J.encode(v011b) .. "\n")
+t.eq(hooks.status(dir .. "/v011b.json", { mode = "deny" }, false), "installed", "mode deny・pause 無効の設定なら deny の登録（SendMessage あり）は installed")
+t.eq(hooks.status(dir .. "/v011b.json", { mode = "stop" }, { enabled = false }), "outdated",
+  "mode stop の設定で deny の登録は outdated（組が同じでも mode が違う。pause 無効なら門番の組も余る）")
+-- v0.1.2 の作業中の登録（deny --at-stop --pause、SendMessage 無し）→ outdated、mode は deny
+local wip = J.decode(J.encode(J.obj({ { "hooks", hooks.desired(CMD, { steer = { mode = "deny" } }) } })))
+wip.hooks.PostToolUse[1].matcher = V011_MATCHER
+write(dir .. "/wip.json", J.encode(wip) .. "\n")
+t.eq(hooks.features(dir .. "/wip.json").mode, "deny", "features()：v0.1.2 作業中の登録は mode deny")
+t.eq(hooks.status(dir .. "/wip.json"), "outdated", "v0.1.2 作業中の登録は outdated")
+-- mode だけ違う（matcher は新しい）→ outdated
+local only_mode = J.decode(J.encode(J.obj({ { "hooks", hooks.desired(CMD, { steer = { mode = "deny" } }) } })))
+write(dir .. "/only_mode.json", J.encode(only_mode) .. "\n")
+t.eq(hooks.status(dir .. "/only_mode.json"), "outdated", "mode だけ違っても outdated（steer 有効のとき）")
+t.eq(hooks.status(dir .. "/only_mode.json", { mode = "deny" }), "installed", "設定も deny なら installed")
+t.eq(hooks.status(dir .. "/only_mode.json", { enabled = false }), "installed", "steer 無効なら mode は比べない")
+t.eq(hooks.status(fpath, nil, false), "outdated", "pause を切ると、門番の組が余るので outdated（mode stop）")
+t.eq(hooks.status(fpath, { mode = "deny" }, false), "outdated", "mode deny の設定で stop の登録は outdated")
+-- --mode の無い登録（古い形）は collector の既定 stop とみなす
+local nomode = J.decode(J.encode(J.obj({ { "hooks", hooks.desired(CMD) } })))
+nomode.hooks.Stop[1].hooks[1].command = CMD .. " --steer --pause --max-wait 600 --record"
+nomode.hooks.SubagentStop[1].hooks[1].command = CMD .. " --steer --pause --max-wait 600 --record"
+write(dir .. "/nomode.json", J.encode(nomode) .. "\n")
+t.eq(hooks.features(dir .. "/nomode.json").mode, "stop", "features()：--mode の無い終わりの command は stop")
 -- --pause はあるが timeout が足りない（auto_resume_s を伸ばしたのに登録し直していない）
 t.eq(hooks.status(fpath, nil, { auto_resume_s = 1200 }), "outdated", "auto_resume_s を伸ばすと timeout 不足で outdated")
 local short = J.decode(read(fpath))
@@ -437,11 +493,15 @@ short.hooks.Stop[1].hooks[1].timeout = 10
 write(dir .. "/short.json", J.encode(short) .. "\n")
 t.eq(hooks.status(dir .. "/short.json"), "outdated", "Stop の timeout だけ 10 でも outdated")
 t.eq(hooks.features(dir .. "/short.json").stop_timeout, 10, "features()：stop_timeout は小さい方")
-t.eq(hooks.features(dir .. "/nothing.json"), { steer = false, pause = false }, "features()：ファイルが無ければ両方 false")
+t.eq(hooks.features(dir .. "/nothing.json"), { steer = false, pause = false, at_stop = false, sendmessage = false },
+  "features()：ファイルが無ければ全部 false（mode は nil）")
 -- 登録し直すと installed、2 回目は変更なし
 local okp, infop = hooks.install({ path = v011, cmd = CMD, yes = true, quiet = true })
 t.ok(okp and infop.changed, "v0.1.1 の登録から登録し直せる")
 t.eq(hooks.status(v011), "installed", "登録し直すと installed")
+t.eq(hooks.features(v011).mode, "stop", "登録し直すと mode stop")
+t.ok(not read(v011):find("--at-stop", 1, true), "登録し直すと --at-stop は無い")
+t.eq(J.decode(read(v011)).hooks.PostToolUse[1].matcher, V011_MATCHER .. "|SendMessage", "登録し直すと PostToolUse に SendMessage")
 local okp2, infop2 = hooks.install({ path = v011, cmd = CMD, yes = true, quiet = true })
 t.ok(okp2 and not infop2.changed, "2 回目は変更なし")
 
@@ -478,6 +538,21 @@ if vim.fn.executable("bash") == 1 and vim.fn.executable("python3") == 1 then
   local r3 = job:wait(3000)
   t.eq({ r3.code, r3.stdout }, { 0, "" }, "門番：止まれを消すと抜ける（何も出さない）")
   t.eq(vim.uv.fs_stat(pdir .. "/a1.hit.json"), nil, "門番：抜けるとき .hit.json を消す")
+  os.remove(sroot .. "/pause.pending")
+  -- mode stop の門番：steer.pending だけでは Python を起動しない。pause.pending があれば起動するが、道具の直前には配達しない
+  local guard_s = hooks.steer_cmd({ record = "python3 " .. hooks.quote(hooks.collector_path()) .. " --root " .. hooks.quote(sroot),
+    root = sroot, mode = "stop", pause = { auto_resume_s = 600 } })
+  write(sroot .. "/steer.pending", "")
+  write(sdir .. "/a1-1790000000001.json", vim.json.encode({ id = "a1-1790000000001", agent_id = "a1", text = "use v4" }))
+  local hp = sroot .. "/projects/-tmp-g/runs/sg/hooks.jsonl"
+  local n_before = #vim.fn.readfile(hp)
+  local r4 = vim.system({ "bash", "-c", guard_s }, { stdin = payload, text = true }):wait()
+  t.eq({ r4.code, r4.stdout, r4.stderr }, { 0, "", "" }, "門番（stop）：steer.pending だけなら exit 0・何も出さない")
+  t.eq(#vim.fn.readfile(hp), n_before, "門番（stop）：steer.pending だけなら Python は動かない（記録も増えない）")
+  write(sroot .. "/pause.pending", "")
+  local r5 = vim.system({ "bash", "-c", guard_s }, { stdin = payload, text = true }):wait()
+  t.eq({ r5.code, r5.stdout }, { 0, "" }, "門番（stop）：pause.pending があっても道具の直前には配達しない")
+  t.ok(vim.uv.fs_stat(sdir .. "/a1-1790000000001.json") ~= nil, "門番（stop）：未配達のファイルはそのまま（終わり際に届く）")
 else
   t.skip("bash / python3 が無い")
 end

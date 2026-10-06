@@ -370,7 +370,7 @@ do
     listed_at = "2026-10-04T09:00:30.000Z", items = { { n = 1, text = "root step" } } } }))
   ok(state.flow_view(s, P1).agents.ROOT.steps ~= nil, "flow_view: ROOT steps listed in flow 1 shown in flow 1")
   eq(state.flow_view(s, P2).agents.ROOT.steps, nil, "flow_view: … and not in flow 2")
-  eq(state.SV, 10, "SV = 10")
+  eq(state.SV, 11, "SV = 11")
 end
 
 -- ---------- 11) 修正指示（steer。DESIGN-v0.2-steer §5.2） ----------
@@ -651,7 +651,131 @@ do
   eq(v2.agents.ROOT.pause, nil, "… but it is not ROOT's live pause")
   eq(state.pause_of(v2, "ROOT"), nil, "pause_of(ROOT) in flow 2 = nil")
   eq(s.pauses[A .. "-10"].owner_id, nil, "flow_view does not change the original")
-  eq(state.SV, 10, "SV = 10")
+  eq(state.SV, 11, "SV = 11")
+end
+
+-- ---------- 14) 親経由の修正指示（relay）と、終わった子の再開（DESIGN-v0.1.2-steer2 §6.4、E3c） ----------
+print("[14] relay / resumed agent")
+do
+  local FX2 = here .. "/fixtures/hooks_steer2.jsonl"
+  local recs = util.json_lines(FX2, 0)
+  eq(#recs, 9, "fixture hooks_steer2: 9 lines")
+  local CH = "afeed000000000030"
+  local P1, P2 = "c0ffee31-0000-4000-8000-000000000031", "c0ffee32-0000-4000-8000-000000000032"
+  local function U(event, ts, f)
+    local e = { v = 1, event = event, ts = "2026-10-06T09:" .. ts .. ".000Z", src = "user" }
+    for k, v in pairs(f or {}) do e[k] = v end
+    return e
+  end
+  local s = state.new("r13")
+  local function feed(i) for _, e in ipairs(claude.normalize_hook(recs[i])) do state.apply(s, e) end end
+  state.apply(s, U("run_prompt", "00:00", { prompt_id = P1, prompt_head = "start a probe child", src = "hook" }))
+  -- 終わり際（stop）の指示：SubagentStop → block の配達 → 続けて働く → もう一度 SubagentStop
+  state.apply(s, U("steer_requested", "00:05", { steer_id = CH .. "-1791265400000", agent_id = CH, text = "Write b.txt instead of a.txt.",
+    via = "hook", expect = "stop", prompt_id = P1, kind = "steer" }))
+  eq(s.steers[CH .. "-1791265400000"].expect, "stop", "steer_requested: expect = stop kept")
+  feed(1)
+  eq(s.agents[CH].status, "RUNNING", "SubagentStart → RUNNING")
+  feed(2)
+  eq(s.agents[CH].status, "DONE", "SubagentStop (record) → DONE")
+  feed(3)
+  eq(s.steers[CH .. "-1791265400000"].status, "DELIVERED", "steer line (mode block) → DELIVERED")
+  eq(s.steers[CH .. "-1791265400000"].delivered_via, "SubagentStop", "delivered_via = SubagentStop")
+  eq(s.agents[CH].status, "RUNNING", "block at its end → back to RUNNING (it continues)")
+  feed(4)
+  eq(s.agents[CH].status, "DONE", "second SubagentStop → DONE")
+  eq(#s.agents[CH].attempts, 1, "block at the end does not open a new attempt")
+
+  -- 親経由：要求 → 端末に打った（DELIVERED/terminal）→ Claude Code が読んだ → ROOT が SendMessage で渡した
+  local RL = '[AgentMap] Tell sub-agent [1] "probe child" (agent id ' .. CH .. ') this, with SendMessage: '
+    .. "The word hello is outdated. The file a.txt must contain the word GOODBYE instead."
+  local R1 = CH .. "-1791265410000"
+  state.apply(s, U("steer_requested", "00:13", { steer_id = R1, agent_id = CH, via = "relay", expect = "parent", relay_line = RL,
+    text = "The word hello is outdated. The file a.txt must contain the word GOODBYE instead.", prompt_id = P1, kind = "steer" }))
+  local st = s.steers[R1]
+  eq(st.status, "PENDING", "relay steer_requested → PENDING")
+  eq(st.expect .. "|" .. st.relay_line, "parent|" .. RL, "relay: expect and relay_line kept")
+  eq(state.relay_pending(s, CH), 1, "relay_pending = 1 (requested)")
+  state.apply(s, U("steer_delivered", "00:13", { steer_id = R1, agent_id = CH, via = "terminal" }))
+  eq(st.status .. "/" .. st.delivered_via, "DELIVERED/terminal", "typed into the terminal → DELIVERED/terminal (SENT)")
+  eq(state.relay_pending(s, CH), 1, "relay_pending still 1 (typed, not passed on)")
+  feed(5) -- UserPromptSubmit "[AgentMap] Tell sub-agent …"
+  eq(st.delivered_via, "UserPromptSubmit", "run_prompt with the relay line → READ (UserPromptSubmit)")
+  eq(st.confirmed_at, "2026-10-06T09:00:20.000Z", "confirmed_at = the prompt's time")
+  eq(#s.flows, 1, "the relay prompt does not start a new flow")
+  -- 宛先の違う SendMessage は何もしない
+  state.apply(s, U("message_sent", "00:19", { agent_id = "ROOT", to = "someone-else", head = "x", tool_use_id = "tz", src = "hook" }))
+  eq(st.relayed_at, nil, "message_sent to another id: nothing")
+  feed(6) -- PostToolUse SendMessage → tool_used + message_sent
+  eq(st.status .. "/" .. st.delivered_via, "DELIVERED/SendMessage", "message_sent → DELIVERED/SendMessage (RELAYED)")
+  eq(st.relayed_at, "2026-10-06T09:00:26.000Z", "relayed_at = the SendMessage time")
+  eq(st.relayed_by, "ROOT", "relayed_by = ROOT")
+  eq(st.relay_head, "The word hello is outdated. The file a.txt must contain the word GOODBYE instead.", "relay_head = what ROOT sent")
+  eq(st.relay_tool_use_id, "toolu_relay0000000000001", "relay_tool_use_id")
+  eq(state.relay_pending(s, CH), 0, "relay_pending = 0 after it was passed on")
+  eq(s.agents.ROOT.tool_counts.SendMessage, 1, "SendMessage still counted as ROOT's tool")
+  -- 同じ id の 2 回目の SubagentStart（終わった子が再開した）→ RUNNING、回が 2 つ → 終わると DONE
+  feed(7)
+  eq(s.agents[CH].status, "RUNNING", "second SubagentStart of the same id → RUNNING (DONE → RUNNING)")
+  eq(#s.agents[CH].attempts, 2, "a new attempt is opened")
+  eq(s.agents[CH].attempts[2].trigger, "resumed", "the new attempt's trigger = resumed")
+  eq(s.agents[CH].finished_at, nil, "finished_at cleared while it runs again")
+  feed(8)
+  eq(s.agents[CH].status, "DONE", "then SubagentStop → DONE")
+  eq(s.agents[CH].attempts[2].finished_at, "2026-10-06T09:00:40.000Z", "the second attempt closes at the second end")
+  eq(#s.agents[CH].attempts, 2, "two attempts")
+  -- 内部の Agent（SubagentStart も agent_type も無い SubagentStop）は箱を作らない（E8）
+  local n_order = #s.order
+  feed(9)
+  eq(#s.order, n_order, "an unknown SubagentStop (agent_type \"\") makes no box")
+  eq(s.phantoms and s.phantoms["afeed000000000039"] ~= nil, true, "… it is kept as a phantom")
+
+  -- not_relayed：READ のあと渡されずに → steer_expired(not_relayed) は DELIVERED からでも EXPIRED
+  local R2 = CH .. "-1791265450000"
+  state.apply(s, U("steer_requested", "00:50", { steer_id = R2, agent_id = CH, via = "relay", expect = "parent", relay_line = "[AgentMap] Tell … second",
+    text = "second", prompt_id = P1 }))
+  state.apply(s, U("steer_delivered", "00:50", { steer_id = R2, agent_id = CH, via = "terminal" }))
+  state.apply(s, U("steer_expired", "00:51", { steer_id = R2, reason = "agent_finished" }))
+  eq(s.steers[R2].status, "DELIVERED", "another expiry reason does not touch a DELIVERED relay")
+  state.apply(s, U("steer_expired", "00:59", { steer_id = R2, reason = "not_relayed" }))
+  eq(s.steers[R2].status .. "/" .. tostring(s.steers[R2].end_reason), "EXPIRED/not_relayed", "not_relayed → EXPIRED from DELIVERED")
+  eq(state.relay_pending(s, CH), 0, "relay_pending excludes EXPIRED")
+  -- 期限切れの後に SendMessage の記録が届いた → 渡したのが事実なので DELIVERED に戻る
+  state.apply(s, U("message_sent", "01:00", { agent_id = "ROOT", to = CH, head = "second", tool_use_id = "t2", src = "hook" }))
+  eq(s.steers[R2].status .. "/" .. tostring(s.steers[R2].delivered_via), "DELIVERED/SendMessage", "a late SendMessage wins over not_relayed")
+  eq(s.steers[R2].end_reason, nil, "end_reason cleared")
+  -- 期限切れと生きているものが両方あれば、生きている方に結びつける
+  local R6, R7 = CH .. "-1791265460000", CH .. "-1791265461000"
+  state.apply(s, U("steer_requested", "01:01", { steer_id = R6, agent_id = CH, via = "relay", relay_line = "a", text = "a", prompt_id = P1 }))
+  state.apply(s, U("steer_delivered", "01:01", { steer_id = R6, agent_id = CH, via = "terminal" }))
+  state.apply(s, U("steer_expired", "01:02", { steer_id = R6, reason = "not_relayed" }))
+  state.apply(s, U("steer_requested", "01:03", { steer_id = R7, agent_id = CH, via = "relay", relay_line = "b", text = "b", prompt_id = P1 }))
+  state.apply(s, U("message_sent", "01:04", { agent_id = "ROOT", to = CH, head = "b", tool_use_id = "t6", src = "hook" }))
+  eq((s.steers[R6].relayed_at and "R6" or "-") .. (s.steers[R7].relayed_at and "R7" or "-"), "-R7",
+    "an expired (not_relayed) one and a live one: the live one is linked")
+  -- 手で打った伝言（該当の relay が無い）は何もしない。頼む前の SendMessage は結びつけない
+  local R3 = CH .. "-1791265470000"
+  state.apply(s, U("message_sent", "01:05", { agent_id = "ROOT", to = CH, head = "manual", tool_use_id = "t3", src = "hook" }))
+  state.apply(s, U("steer_requested", "01:10", { steer_id = R3, agent_id = CH, via = "relay", relay_line = "x", text = "third", prompt_id = P1 }))
+  eq(s.steers[R3].relayed_at, nil, "a SendMessage before the request is not linked")
+  -- 2 件あれば古い方から
+  local R4 = CH .. "-1791265480000"
+  state.apply(s, U("steer_requested", "01:11", { steer_id = R4, agent_id = CH, via = "relay", relay_line = "y", text = "fourth", prompt_id = P1 }))
+  state.apply(s, U("message_sent", "01:20", { agent_id = "ROOT", to = CH, head = "third", tool_use_id = "t4", src = "hook" }))
+  eq((s.steers[R3].relayed_at and "R3" or "-") .. (s.steers[R4].relayed_at and "R4" or "-"), "R3-", "two waiting: the oldest is passed on first")
+  -- 取り消した relay は結びつけない
+  state.apply(s, U("steer_cancelled", "01:21", { steer_id = R4 }))
+  state.apply(s, U("message_sent", "01:22", { agent_id = "ROOT", to = CH, head = "fourth", tool_use_id = "t5", src = "hook" }))
+  eq(s.steers[R4].status, "CANCELLED", "a cancelled relay stays CANCELLED")
+  -- prompt_head が 200 文字で切れて本文が入っていなくても、端末に打った文の先頭が一致すれば READ
+  local long = string.rep("n", 150)
+  local R5 = CH .. "-1791265490000"
+  local RL5 = '[AgentMap] Tell sub-agent [1] "' .. long .. '" (agent id ' .. CH .. ') this, with SendMessage: use docs/v3 please'
+  state.apply(s, U("steer_requested", "01:30", { steer_id = R5, agent_id = CH, via = "relay", relay_line = RL5, text = "use docs/v3 please", prompt_id = P1 }))
+  state.apply(s, U("steer_delivered", "01:30", { steer_id = R5, agent_id = CH, via = "terminal" }))
+  state.apply(s, U("run_prompt", "01:31", { prompt_id = "pX", prompt_head = RL5:sub(1, 200), src = "hook" }))
+  eq(s.steers[R5].confirmed_at, "2026-10-06T09:01:31.000Z", "relay READ by the typed line's head (prompt_head cut at 200)")
+  eq(state.SV, 11, "SV = 11")
 end
 
 vim.fn.delete(TMP, "rf")

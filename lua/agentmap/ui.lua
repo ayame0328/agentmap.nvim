@@ -34,6 +34,7 @@ local log_marks = {} -- { ["<sid>:<id>"] = { last = 秒, running = bool } } 推�
 local expired_seen = {} -- { [sid] = { [steer_id] = true } } 「届かなかった」と知らせ済み
 local notice_done = {} -- { [sid] = { [steer_id] = true } } 親への知らせを作った（または作らないと決めた）指示
 local pause_seen = {} -- { [sid] = { [pause_id] = status } } 一時停止の状態の変わり目を知らせ済み
+local relay_seen = {} -- { [sid] = { [steer_id] = true } } 「親が渡した」「終わり際に届いた」を知らせ済み
 
 local VIEWS = {
   detail = "agentmap.views.detail",
@@ -1123,23 +1124,67 @@ function M.tick()
 end
 
 -- ------------------------------------------------------------
--- 修正指示（steer。DESIGN-v0.2-steer.md §2・§4・§6）
+-- 修正指示（steer。DESIGN-v0.2-steer.md §2・§4・§6、v0.1.2 は DESIGN-v0.1.2-steer2：終わり際＋親経由）
 -- ------------------------------------------------------------
+-- v0.1.2（DESIGN-v0.1.2-steer2 §9.1）: 子への既定は終わり際（mode stop）。at_stop は廃止（常に on）。
+-- no_terminal = "hook" は "stop" の別名
 local STEER_DEFAULTS = {
-  enabled = true, mode = "deny", at_stop = true, root_via = "terminal", no_terminal = "hook",
+  enabled = true, mode = "stop", relay = "menu", root_via = "terminal", no_terminal = "stop",
   submit_delay_ms = 300, input = "window", text_max = 4000,
 }
 local STEER_PREFIX = "[AgentMap] " -- 端末へ送る文の先頭（固定。state が「流れの続き」の判定に使う）
 local FINISHED = { DONE = true, REWORK = true, FAILED = true }
 
+-- 修正指示の新しい文（DESIGN-v0.1.2-steer2 付録 A）。鍵が言語ファイルに無いあいだは英語の既定の文を使う
+local STEER_TEXT = {
+  ["ui.steer_write_resume"] = "Write an instruction (resumes it; arrives when it finishes)",
+  ["ui.steer_write_gate"] = "Write an instruction (it continues now)",
+  ["ui.steer_write_root_stop"] = "Write an instruction (arrives at the end of its turn)",
+  ["ui.steer_relay"] = "Write and relay now through the main agent",
+  ["ui.steer_prompt_stop"] = "Steer %{label} (at its end)",
+  ["ui.steer_prompt_relay"] = "Steer %{label} (relay via the main agent)",
+  ["ui.steer_prompt_resume"] = "Steer %{label} (resumes; at its end)",
+  ["ui.steer_queued_eta"] = " (about %{left} left at the usual pace)",
+  ["ui.steer_resumed_stop"] = "%{label} resumed; the instruction arrives when it tries to finish (x pauses it again)",
+  ["ui.steer_queued_root_stop"] = "Steer for the main agent queued; it arrives at the end of its turn (no Claude terminal here)",
+  ["ui.steer_relay_sent"] = "Relay typed into the main agent's terminal; it passes the text on with SendMessage (glance at the terminal)",
+  ["ui.steer_relay_not_target"] = "Relay works only for a running sub-agent started by the main agent (use the normal route)",
+  ["ui.steer_relay_no_terminal"] = "No Claude terminal found; relay is not possible (use the normal route)",
+  ["ui.steer_relayed"] = "The main agent passed your instruction on to %{label} (SendMessage)",
+  ["ui.steer_not_relayed"] = "The main agent ended its turn without passing your instruction on to %{label}",
+  ["ui.steer_delivered_stop"] = "%{label} received your instruction at its end and continues",
+  ["steer.relay_en"] = '[AgentMap] Tell sub-agent [%{index}] "%{name}" (agent id %{id}) this, with SendMessage: %{text}',
+  ["steer.relay_ja"] = "[AgentMap] サブエージェント [%{index}]「%{name}」（agent id %{id}）に SendMessage で次を伝えてください：%{text}",
+}
+local function st_text(key, vars)
+  if i18n.has(key) or i18n.has(key, "en") then return t(key, vars) end
+  local s = STEER_TEXT[key] or key
+  return (s:gsub("%%{([%w_]+)}", function(k)
+    local v = vars and vars[k]
+    if v == nil then return nil end
+    return tostring(v)
+  end))
+end
+M._st = st_text
+
 --- Effective steering settings (config.get().steer; false = { enabled = false }).
+--- `no_terminal = "hook"` is read as "stop" (its name before 0.1.2); `at_stop` is ignored.
 function M.steer_cfg()
   local ok, config = pcall(require, "agentmap.config")
   local raw = nil
   if ok then raw = config.get().steer end
-  if raw == false then return vim.tbl_extend("force", STEER_DEFAULTS, { enabled = false }) end
-  if type(raw) ~= "table" then return vim.deepcopy(STEER_DEFAULTS) end
-  return vim.tbl_extend("force", STEER_DEFAULTS, raw)
+  local cfg
+  if raw == false then
+    cfg = vim.tbl_extend("force", STEER_DEFAULTS, { enabled = false })
+  elseif type(raw) ~= "table" then
+    cfg = vim.deepcopy(STEER_DEFAULTS)
+  else
+    cfg = vim.tbl_extend("force", STEER_DEFAULTS, raw)
+  end
+  if cfg.no_terminal == "hook" then cfg.no_terminal = "stop" end
+  if cfg.relay ~= "never" and cfg.relay ~= "always" then cfg.relay = "menu" end
+  cfg.at_stop = nil
+  return cfg
 end
 
 --- The agent a steering instruction for map id `id` goes to, or nil when the box cannot take one
@@ -1163,13 +1208,19 @@ end
 M._steer_label = label_of
 
 --- How a steering instruction to `id` is delivered: "root" (the terminal), "redo" (a finished
---- agent: ask the main agent in the terminal to redo it) or "hook" (a running agent: its next tool call).
----   An agent held by a pause takes it through the hook that holds it (DESIGN-v0.1.2-pause §5.4):
----   ROOT with a pause placed or waiting, and a sub-agent waiting at its end (the gate; its stop is
----   already recorded, so it looks finished) both get "hook".
+--- agent: ask the main agent in the terminal to redo it) or "hook" (a file a hook hands over when
+--- the agent tries to finish; DESIGN-v0.1.2-steer2 §2).
+---   A sub-agent held by a pause gets "hook" (also one waiting at its end at the gate: its stop is
+---   already recorded, so it looks finished). ROOT paused before a tool call gets "root" (the pause
+---   is lifted first, then the terminal; Q23); ROOT paused at its end or with a pause placed gets
+---   "hook" (its Stop hook hands the text over).
 function M.steer_kind(id)
   local p = M._live_pause(id)
-  if id == "ROOT" then return p and "hook" or "root" end
+  if id == "ROOT" then
+    if not p then return "root" end
+    if p.status == "PAUSED" and tostring(p.hit_via or ""):sub(1, 10) == "PreToolUse" then return "root" end
+    return "hook"
+  end
   if p and p.status == "PAUSED" then return "hook" end
   local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
   if a and FINISHED[a.status] then return "redo" end
@@ -1237,19 +1288,28 @@ local function events_mod()
   return ev
 end
 
---- True when the hooks registered in Claude Code's settings.json are the current ones. An
---- instruction that goes through hooks (a running sub-agent, or ROOT with `steer.root_via = "hook"`)
---- reaches the agent only then: the v0.1.0 registration has no delivery hook, so the file would
---- wait unread. The terminal route does not depend on the hooks and is not checked.
+--- True when the hooks registered in Claude Code's settings.json are the current ones and deliver
+--- with the configured `steer.mode`. An instruction that goes through hooks (a sub-agent, or ROOT
+--- without a terminal) reaches the agent only then: the v0.1.0 registration has no delivery hook,
+--- and the v0.1.1 one (`--mode deny`) hands the file over at the next tool call as a tool error,
+--- which current models may ignore, so nothing is left for the agent's end (DESIGN-v0.1.2-steer2
+--- §8.2, Q22). The terminal routes (ROOT, redo, relay) do not depend on the hooks and are not checked.
 --- True as well when the check itself is not possible (hooks module missing).
 function M.steer_hooks_ok()
   local hooks = try_require("agentmap.hooks")
   if not hooks or type(hooks.status) ~= "function" then return true end
-  -- 修正指示は一時停止の有無に関係なく届く（v0.1.1 の登録のままでも動く。DESIGN-v0.1.2-pause §7.2）ので、
-  -- 一時停止の条件（--pause と長い timeout）は見ない
+  -- 一時停止の条件（--pause と長い timeout）は見ない（修正指示だけなら要らない）
   local ok, st = pcall(hooks.status, nil, nil, false)
   if not ok then return true end
-  return st == "installed"
+  if st ~= "installed" then return false end
+  -- 届け方（--mode）が設定と同じか。features().mode が無い（読めない）ときは組の一致だけで決める
+  if type(hooks.features) == "function" then
+    local okf, f = pcall(hooks.features)
+    if okf and type(f) == "table" and type(f.mode) == "string" and f.mode ~= M.steer_cfg().mode then
+      return false
+    end
+  end
+  return true
 end
 
 --- True when the run on screen has ended (SessionEnd recorded). Its Claude is gone; a terminal
@@ -1269,16 +1329,18 @@ local function after_steer()
   pcall(M.refresh, { aux = true })
 end
 
--- 端末が無いとき（steer.no_terminal）
-local function no_terminal(ev, cfg, agent_id, hook_text, line, opts)
-  local how = cfg.no_terminal or "hook"
-  if how == "hook" then
+-- 端末が無いとき（steer.no_terminal）。pre(steer_id) は指示を置いた直後に 1 回呼ぶ（止まっている ROOT を解く）
+local function no_terminal(ev, cfg, agent_id, hook_text, line, opts, pre)
+  local how = cfg.no_terminal or "stop"
+  if how == "stop" or how == "hook" then
     if not M.steer_hooks_ok() then
-      notify(t("ui.steer_hooks_outdated"), vim.log.levels.WARN)
+      notify(st_text("ui.steer_hooks_outdated"), vim.log.levels.WARN)
       return "outdated"
     end
     local id = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "hook" }))
-    notify(t("ui.steer_no_terminal_hook"))
+    if id and pre then pre(id) end
+    local own = agent_id == "ROOT" and (opts.kind or "steer") == "steer"
+    notify(st_text(own and "ui.steer_queued_root_stop" or "ui.steer_no_terminal_hook"))
     after_steer()
     return id and "fallback_hook" or nil
   elseif how == "clipboard" then
@@ -1286,6 +1348,7 @@ local function no_terminal(ev, cfg, agent_id, hook_text, line, opts)
     pcall(vim.fn.setreg, '"', line)
     -- 送れたかは分からないので PENDING のまま（作者が s → 取り消しで消す）
     request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
+    if pre then pre(nil) end -- 貼り付けた文が読まれるように、止まっている ROOT は解く
     notify(t("ui.steer_no_terminal_clip"))
     after_steer()
     return "clipboard"
@@ -1294,17 +1357,56 @@ local function no_terminal(ev, cfg, agent_id, hook_text, line, opts)
   return "none"
 end
 
--- 端末へ送る。cb(result) は同点の端末を選ばせたときも最後に 1 回呼ぶ。
--- no_pick = true（自動で送る親への知らせ）なら、同点でも選ばせずに落とし先へ
-local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick)
+-- ROOT の Claude の端末を選ぶ。found(cand, term) か none(cancelled) を 1 回だけ呼ぶ。
+-- 同点なら選ばせる（no_pick = true なら選ばせずに none）。前に選んだ端末がまだあればそれを使う
+local function pick_terminal(found, none, no_pick)
   local term = try_require("agentmap.term")
-  local line = STEER_PREFIX .. hook_text
+  if not term then return none(false) end
   local s = M.run and M.run.state or {}
-  local cwd = s.cwd or vim.fn.getcwd()
-  local function send_to(cand)
+  local cand, list, tied = term.find(s.cwd or vim.fn.getcwd())
+  local sid = M.run and M.run.sid or "?"
+  local remembered = M.term_choice[sid]
+  if remembered then
+    for _, c in ipairs(list or {}) do
+      if c.buf == remembered then cand, tied = c, false end
+    end
+  end
+  if cand then return found(cand, term) end
+  if tied and list and #list > 0 and not no_pick then
+    vim.ui.select(list, {
+      prompt = t("ui.steer_pick_terminal"),
+      format_item = function(c) return vim.api.nvim_buf_get_name(c.buf) end,
+    }, function(choice)
+      if not choice then return none(true) end
+      M.term_choice[sid] = choice.buf
+      found(choice, term)
+    end)
+    return
+  end
+  return none(false)
+end
+
+--- True when this Neovim has a :terminal running Claude for the run on screen (the best match,
+--- or several to pick from). Used to offer "send to the terminal" and "relay" (DESIGN-v0.1.2-steer2 §4.1).
+function M.terminal_present()
+  local term = try_require("agentmap.term")
+  if not term or type(term.find) ~= "function" then return false end
+  local s = M.run and M.run.state or {}
+  local ok, cand, list = pcall(term.find, s.cwd or vim.fn.getcwd())
+  if not ok then return false end
+  return cand ~= nil or (type(list) == "table" and #list > 0)
+end
+
+-- 端末へ送る。cb(result) は同点の端末を選ばせたときも最後に 1 回呼ぶ。
+-- no_pick = true（自動で送る親への知らせ）なら、同点でも選ばせずに落とし先へ。
+-- pre(steer_id) は打つ直前（端末が無ければ落とし先で指示を置いた直後）に呼ぶ
+local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick, pre)
+  local line = STEER_PREFIX .. hook_text
+  pick_terminal(function(cand, term)
     local id, err = request(ev, agent_id, hook_text, vim.tbl_extend("force", opts, { via = "terminal" }))
     -- 同じ指示の知らせが（別の Neovim で）もう作られていた：端末にも打たない
     if not id and err == "duplicate" then return cb(nil) end
+    if pre then pre(nil) end
     local ok = term.send(cand.job, line, { delay_ms = cfg.submit_delay_ms })
     if ok then
       if id and ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, id) end
@@ -1314,42 +1416,120 @@ local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick)
     end
     -- 送れなかった（端末が直前に終わった）。置いた要求は取り消して、落とし先へ
     if id and ev.cancel_steer then pcall(ev.cancel_steer, M.run, id) end
-    return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts))
-  end
-  if not term then return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts)) end
-  local cand, list, tied = term.find(cwd)
-  local sid = M.run and M.run.sid or "?"
-  -- 前に選んだ端末がまだあれば、それを使う
-  local remembered = M.term_choice[sid]
-  if remembered then
-    for _, c in ipairs(list or {}) do
-      if c.buf == remembered then cand, tied = c, false end
+    return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts, pre))
+  end, function(cancelled)
+    if cancelled then return cb(nil) end
+    return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts, pre))
+  end, no_pick)
+end
+
+--- True when box `id` may be steered through the main agent (relay; DESIGN-v0.1.2-steer2 §4.1,
+--- V41, Q19/Q21): `steer.relay` is not "never", the run has not ended, and the box is a direct
+--- sub-agent of ROOT that has not finished (a grandchild, ROOT itself, a finished box and a box
+--- waiting at the gate are not offered). The terminal is checked separately (terminal_present).
+function M.relay_target_ok(id)
+  if M.steer_cfg().relay == "never" then return false end
+  if type(id) ~= "string" or id == "ROOT" or run_ended() then return false end
+  local a = M.run and M.run.state and M.run.state.agents and M.run.state.agents[id]
+  if type(a) ~= "table" or a.parent_id ~= "ROOT" or FINISHED[a.status] then return false end
+  local p = M._live_pause(id)
+  if p and p.kind == "gate" and p.status == "PAUSED" then return false end
+  return true
+end
+
+--- True when the `s` menu offers "relay now through the main agent" for box `id`.
+function M.relay_available(id)
+  return M.relay_target_ok(id) and M.terminal_present()
+end
+
+--- The line typed into the main agent's terminal for a relay, without the leading "[AgentMap] "
+--- (steer.relay_en / steer.relay_ja by the UI language; DESIGN-v0.1.2-steer2 §4.2).
+function M.relay_text(id, text)
+  local a = (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id]) or agent_of(id) or {}
+  local term = try_require("agentmap.term")
+  local body = term and term.sanitize(text) or tostring(text or "")
+  local vars = { index = a.index or "?", name = graph.util.truncate(a.name or a.task or id, 40), id = id, text = body }
+  local out = st_text("steer.relay_" .. (i18n.lang == "ja" and "ja" or "en"), vars)
+  if out:sub(1, #STEER_PREFIX) == STEER_PREFIX then out = out:sub(#STEER_PREFIX + 1) end
+  return out
+end
+
+-- 残りの時間の目安（進み具合の推定が時間を出せるときだけ。DESIGN-v0.1.2-steer2 §7.5）。無ければ ""
+local function eta_suffix(aid)
+  local s = M.run and M.run.state
+  local progress = try_require("agentmap.progress")
+  if type(s) ~= "table" or not progress or type(progress.compute) ~= "function" then return "" end
+  local ok, r = pcall(progress.compute, s, aid, {
+    now = M.clock(), stats = M.view and M.view.stats, config = M.progress_cfg(), flow_id = M.flow_id,
+  })
+  if not ok or type(r) ~= "table" or not r.estimated or r.over then return "" end
+  local d, left = tonumber(r.expected_ms), nil
+  if d and d > 0 then
+    if r.basis == "time" and tonumber(r.cur_elapsed_ms) then
+      left = d - r.cur_elapsed_ms
+    elseif (r.basis == "tasks" or r.basis == "steps") and tonumber(r.n) and tonumber(r.k) then
+      left = (r.n - r.k - (tonumber(r.f) or 0)) * d
     end
   end
-  if cand then return send_to(cand) end
-  if tied and list and #list > 0 and not no_pick then
-    vim.ui.select(list, {
-      prompt = t("ui.steer_pick_terminal"),
-      format_item = function(c) return vim.api.nvim_buf_get_name(c.buf) end,
-    }, function(choice)
-      if not choice then return cb(nil) end
-      M.term_choice[sid] = choice.buf
-      send_to(choice)
-    end)
-    return
+  if not left or left < 1000 then return "" end
+  local secs = math.floor(left / 1000 + 0.5)
+  local txt = secs < 60 and (secs .. " s") or (math.floor(secs / 60 + 0.5) .. " min")
+  return st_text("ui.steer_queued_eta", { left = txt })
+end
+M._eta_suffix = eta_suffix
+
+-- 親経由（relay）：ROOT の端末に「子へ SendMessage で伝えて」と打つ（DESIGN-v0.1.2-steer2 §4）
+local function via_relay(ev, cfg, aid, text, prompt_id, done)
+  if not M.relay_target_ok(aid) then
+    if run_ended() then
+      notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
+      return done("ended")
+    end
+    notify(st_text("ui.steer_relay_not_target"), vim.log.levels.WARN)
+    return done("not_target")
   end
-  return cb(no_terminal(ev, cfg, agent_id, hook_text, line, opts))
+  pick_terminal(function(cand, term)
+    local line = term.sanitize(STEER_PREFIX .. M.relay_text(aid, text))
+    local sid = request(ev, aid, text, { via = "relay", relay_line = line, kind = "steer", prompt_id = prompt_id })
+    if not sid then
+      notify(t("ui.steer_disabled"), vim.log.levels.WARN)
+      return done(nil)
+    end
+    if not term.send(cand.job, line, { delay_ms = cfg.submit_delay_ms }) then
+      if ev.cancel_steer then pcall(ev.cancel_steer, M.run, sid) end
+      notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN)
+      return done("no_terminal")
+    end
+    if ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, sid) end
+    -- 止まっている子は、伝言を次の道具の切れ目で受け取れるように止まれを解く
+    local p = M._live_pause(aid)
+    if p and p.status == "PAUSED" and p.kind ~= "gate" then M._resume_raw(aid, { reason = "user" }) end
+    notify(st_text("ui.steer_relay_sent"))
+    after_steer()
+    return done("relayed")
+  end, function(cancelled)
+    if cancelled then return done(nil) end
+    notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN)
+    return done("no_terminal")
+  end)
 end
 
 --- Send a steering instruction `text` for box `id`, choosing the route from the box
---- (running agent: hooks; ROOT: terminal; finished agent: ask ROOT in the terminal to redo it).
+--- (DESIGN-v0.1.2-steer2 §2): a sub-agent gets it when it tries to finish (a file its SubagentStop
+--- hook hands over; a paused one is resumed first, one waiting at the gate gets it right away);
+--- ROOT gets it in its terminal (a ROOT paused before a tool call is resumed first; without a
+--- terminal, at the end of its turn); a finished agent is redone by asking ROOT in its terminal.
+--- With `opts.route = "relay"` it is typed into ROOT's terminal for ROOT to pass on with SendMessage.
 ---@param id string agent id (gate: ids are accepted)
 ---@param text string
----@param cb? fun(result: string|nil) "queued" | "sent" | "fallback_hook" | "clipboard" | "none" | "empty"
----   | "outdated" (hooks route, but the registered hooks are outdated: nothing sent)
----   | "ended" (terminal route, but the run has ended: nothing sent) | nil
+---@param cb? fun(result: string|nil) "queued" | "sent" | "relayed" | "fallback_hook" | "clipboard"
+---   | "none" | "empty" | "outdated" (hooks route, but the registered hooks are outdated or use another
+---   mode: nothing sent) | "ended" (terminal route, but the run has ended: nothing sent)
+---   | "no_terminal" / "not_target" (relay not possible) | nil
+---@param opts? { route?: "relay" }
 ---@return string|nil result (nil while waiting for the user to pick a terminal)
-function M.steer_send(id, text, cb)
+function M.steer_send(id, text, cb, opts)
+  opts = opts or {}
   local result
   local function done(r)
     result = r
@@ -1380,11 +1560,15 @@ function M.steer_send(id, text, cb)
   end
   local s = M.run.state
   local prompt_id = M.flow_id or (s and state_mod.latest_flow_id(s)) or nil
+  if opts.route == "relay" then
+    via_relay(ev, cfg, aid, text, prompt_id, done)
+    return result
+  end
   local kind = M.steer_kind(aid)
-  -- hooks で届ける経路：登録が古ければ届かないので、送らずに知らせる（端末へ送る経路は関係ない）
+  -- hooks で届ける経路：登録が古い・届け方が違うと終わり際に届かないので、送らずに知らせる（Q22。端末へ送る経路は関係ない）
   if kind == "hook" or (kind == "root" and cfg.root_via == "hook") then
     if not M.steer_hooks_ok() then
-      notify(t("ui.steer_hooks_outdated"), vim.log.levels.WARN)
+      notify(st_text("ui.steer_hooks_outdated"), vim.log.levels.WARN)
       return done("outdated")
     end
   end
@@ -1396,30 +1580,48 @@ function M.steer_send(id, text, cb)
   if kind == "hook" then
     local held = M._live_pause(aid)
     local held_status = held and held.status
+    -- 関門・ROOT の Stop で止まっている：待っている hook がその場で渡す。PreToolUse で止まっている子：解いて続けさせ、終わり際に届く
+    local at_end = held and (held.kind == "gate" or not tostring(held.hit_via or ""):find("^PreToolUse"))
     local sid = request(ev, aid, text, { via = "hook", kind = "steer", prompt_id = prompt_id })
     if not sid then
       notify(t("ui.steer_disabled"), vim.log.levels.WARN)
       return done(nil)
     end
-    -- 止まれのある宛先：指示のファイルを置いた**後で**止まれを消す（hook は止まれが消えた後に指示を取りに行く）。
-    -- 止まっていた（PAUSED）なら、その場で指示つきで再開する。まだ止まっていない（REQUESTED）なら止まる意味が無くなる
+    -- 止まれのある宛先：指示のファイルを置いた**後で**止まれを消す（hook は止まれが消えた後に指示を取りに行く）
     if held and M._resume_raw(aid, { reason = "user", steer_id = sid }) and held_status == "PAUSED" then
-      notify(pt("ui.pause_resumed_with", { label = label_of(aid) }))
+      if at_end then
+        notify(pt("ui.pause_resumed_with", { label = label_of(aid) }))
+      else
+        notify(st_text("ui.steer_resumed_stop", { label = label_of(aid) }))
+      end
     else
-      notify(t("ui.steer_queued", { label = label_of(aid) }))
+      notify(st_text("ui.steer_queued", { label = label_of(aid) }) .. eta_suffix(aid))
     end
     after_steer()
     return done("queued")
   end
   if kind == "root" then
-    local opts = { kind = "steer", prompt_id = prompt_id }
+    local opts2 = { kind = "steer", prompt_id = prompt_id }
+    -- 次の道具の直前で止まっている ROOT（Q23）：止まれを解いてから端末へ打つ（端末が無ければ指示を置いてから解く → 番の終わりに届く）
+    local pre
+    if M._live_pause("ROOT") then
+      local released = false
+      pre = function(steer_id)
+        if released then return end
+        released = true
+        if M._resume_raw("ROOT", { reason = "user", steer_id = steer_id }) then
+          notify(pt("ui.pause_resumed", { label = "ROOT" }))
+        end
+      end
+    end
     if cfg.root_via == "hook" then
-      request(ev, "ROOT", text, vim.tbl_extend("force", opts, { via = "hook" }))
-      notify(t("ui.steer_queued", { label = "ROOT" }))
+      local sid = request(ev, "ROOT", text, vim.tbl_extend("force", opts2, { via = "hook" }))
+      if sid and pre then pre(sid) end
+      notify(st_text("ui.steer_queued", { label = "ROOT" }))
       after_steer()
       return done("queued")
     end
-    via_terminal(ev, cfg, "ROOT", text, opts, done)
+    via_terminal(ev, cfg, "ROOT", text, opts2, done, false, pre)
     return result
   end
   -- 終わった箱：親（ROOT）の端末へやり直しの依頼。差し戻し（REWORK）は記録しない（親が決める）
@@ -1429,21 +1631,53 @@ end
 
 local input_seq = 0
 
+-- 止まれが「終わり際」で握っているか（関門・ROOT の Stop）。PreToolUse で止まっているなら false
+local function held_at_end(p)
+  return p ~= nil and p.status == "PAUSED" and (p.kind == "gate" or not tostring(p.hit_via or ""):find("^PreToolUse"))
+end
+
+-- 入力の窓の題（DESIGN-v0.1.2-steer2 §7.1）
+local function input_title(aid, kind, route)
+  local label = label_of(aid)
+  if route == "relay" then return st_text("ui.steer_prompt_relay", { label = label }) end
+  if kind == "root" then
+    if M.steer_cfg().root_via ~= "hook" and M.terminal_present() then
+      return t("ui.steer_prompt", { label = "ROOT (terminal)" })
+    end
+    return st_text("ui.steer_prompt_stop", { label = "ROOT" })
+  end
+  if kind == "redo" then return t("ui.steer_prompt", { label = label }) end
+  local p = M._live_pause(aid)
+  if held_at_end(p) then return t("ui.steer_prompt", { label = label }) end
+  if p and p.status == "PAUSED" then return st_text("ui.steer_prompt_resume", { label = label }) end
+  return st_text("ui.steer_prompt_stop", { label = label })
+end
+
 --- Open the instruction editor for `id` (a small floating window; steer.input = "line" uses
 --- vim.ui.input). <C-s>, :w or <CR> in normal mode sends, q / <Esc> cancels.
----@param on_submit? fun(text: string) default: M.steer_send(id, text)
+---@param on_submit? fun(text: string) default: M.steer_send(id, text, nil, { route = route })
+---@param route? "relay" relay through the main agent (DESIGN-v0.1.2-steer2 §4); refused when not possible
 ---@return integer|nil buf, integer|nil win
-function M.steer_input(id, on_submit)
+function M.steer_input(id, on_submit, route)
   local aid = M.steer_target(id)
   if not aid then
     notify(t("ui.steer_not_target"), vim.log.levels.WARN)
     return nil
   end
-  on_submit = on_submit or function(text) M.steer_send(aid, text) end
+  if route == "relay" then
+    if not M.relay_target_ok(aid) then
+      notify(st_text(run_ended() and "ui.steer_run_ended" or "ui.steer_relay_not_target"), vim.log.levels.WARN)
+      return nil
+    end
+    if not M.terminal_present() then
+      notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN)
+      return nil
+    end
+  end
+  on_submit = on_submit or function(text) M.steer_send(aid, text, nil, { route = route }) end
   local cfg = M.steer_cfg()
   local kind = M.steer_kind(aid)
-  local title = (aid == "ROOT" and kind == "root") and t("ui.steer_prompt", { label = "ROOT (terminal)" })
-    or t("ui.steer_prompt", { label = label_of(aid) })
+  local title = input_title(aid, kind, route)
   if cfg.input == "line" then
     vim.ui.input({ prompt = title .. ": " }, function(text)
       if text == nil then return end
@@ -1463,7 +1697,7 @@ function M.steer_input(id, on_submit)
   vim.bo[b].modified = false
   pcall(vim.api.nvim_buf_set_extmark, b, renderer.ns, 0, 0, { end_col = #hint, hl_group = "AgentMapDim" })
   vim.b[b].agentmap_steer_target = aid
-  vim.b[b].agentmap_steer_kind = kind
+  vim.b[b].agentmap_steer_kind = route == "relay" and "relay" or kind
   local width = math.max(20, math.min(80, vim.o.columns - 4))
   local height = math.max(3, math.min(6, vim.o.lines - 4))
   local win = vim.api.nvim_open_win(b, true, {
@@ -1520,8 +1754,11 @@ function M.steer_input(id, on_submit)
   return b, win
 end
 
---- `s` on a box: write an instruction / ask the parent to redo / send to the terminal,
---- cancel pending instructions, or show the steering history.
+--- `s` on a box (DESIGN-v0.1.2-steer2 §7.1, Q19): write an instruction (a sub-agent gets it when it
+--- tries to finish; a paused one is resumed; ROOT gets it in its terminal, or at the end of its turn
+--- without one) or ask the parent to redo a finished box; for a running direct sub-agent of ROOT,
+--- when ROOT's terminal is here, also "relay now through the main agent" (first with
+--- steer.relay = "always"); cancel pending instructions; show the steering history.
 function M.steer_menu(id)
   local cfg = M.steer_cfg()
   if not cfg.enabled then
@@ -1539,10 +1776,34 @@ function M.steer_menu(id)
     notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
     return
   end
-  local first = kind == "redo" and t("ui.steer_redo")
-    or (kind == "root" and cfg.root_via ~= "hook") and t("ui.steer_terminal")
-    or t("ui.steer_write")
+  local first
+  if kind == "redo" then
+    first = t("ui.steer_redo")
+  elseif kind == "root" then
+    local term_ok = cfg.root_via ~= "hook" and M.terminal_present()
+    first = (term_ok or cfg.no_terminal ~= "stop") and t("ui.steer_terminal") or st_text("ui.steer_write_root_stop")
+  else
+    local p = M._live_pause(aid)
+    if held_at_end(p) then
+      first = st_text("ui.steer_write_gate")
+    elseif p and p.status == "PAUSED" then
+      first = st_text("ui.steer_write_resume")
+    elseif aid == "ROOT" then
+      first = st_text("ui.steer_write_root_stop")
+    else
+      first = t("ui.steer_write")
+    end
+  end
   local items, acts = { first }, { "write" }
+  if M.relay_available(aid) then
+    if cfg.relay == "always" then
+      table.insert(items, 1, st_text("ui.steer_relay"))
+      table.insert(acts, 1, "relay")
+    else
+      items[#items + 1] = st_text("ui.steer_relay")
+      acts[#acts + 1] = "relay"
+    end
+  end
   local pend = pending_of(aid)
   if #pend > 0 then
     items[#items + 1] = t("ui.steer_cancel_n", { n = #pend })
@@ -1554,6 +1815,8 @@ function M.steer_menu(id)
     local act = idx and acts[idx]
     if act == "write" then
       M.steer_input(aid)
+    elseif act == "relay" then
+      M.steer_input(aid, nil, "relay")
     elseif act == "cancel" then
       M.steer_cancel(aid)
     elseif act == "show" then
@@ -1591,14 +1854,16 @@ function M._seed_expired()
   local s = M.run and M.run.state
   local sid = M.run and M.run.sid
   if not sid then return end
-  local seen, done = {}, {}
+  local seen, done, relayed = {}, {}, {}
   for k, st in pairs(s and type(s.steers) == "table" and s.steers or {}) do
     if st.status == "EXPIRED" then seen[k] = true end
     -- 開いた時点でもう届いていた指示の知らせは、今さら作らない（見ていない間のことは分からない）
     if st.status == "DELIVERED" then done[k] = true end
+    if st.relayed_at or (st.status == "DELIVERED" and st.via ~= "relay") then relayed[k] = true end
   end
   expired_seen[sid] = seen
   notice_done[sid] = done
+  relay_seen[sid] = relayed
 end
 
 --- Notify (once each) steering instructions that expired without being delivered.
@@ -1614,9 +1879,52 @@ function M.notify_expired()
   for k, st in pairs(s.steers) do
     if st.status == "EXPIRED" and not seen[k] then
       seen[k] = true
-      notify(t("ui.steer_expired_notice", { label = label_of(st.redo_of or st.agent_id) }), vim.log.levels.WARN)
+      if st.end_reason == "not_relayed" then
+        notify(st_text("ui.steer_not_relayed", { label = label_of(st.agent_id) }), vim.log.levels.WARN)
+      else
+        notify(t("ui.steer_expired_notice", { label = label_of(st.redo_of or st.agent_id) }), vim.log.levels.WARN)
+      end
     end
   end
+end
+
+-- 終わり際の配達（Stop / SubagentStop の hook が渡した）か
+local function delivered_at_end(st)
+  if st.mode == "block" then return true end
+  local v = tostring(st.delivered_via or "")
+  return v == "Stop" or v == "SubagentStop" or v:find("Stop$") ~= nil
+end
+
+--- Notify (once each) what the records show about instructions since the map was opened
+--- (DESIGN-v0.1.2-steer2 §7.5): the main agent passed a relayed instruction on (SendMessage), and
+--- a sub-agent's instruction was handed over at its end. Silent for what happened before opening.
+---@return integer number of notices
+function M.notify_relays()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not s or not sid or type(s.steers) ~= "table" then return 0 end
+  local seen = relay_seen[sid]
+  if not seen then
+    M._seed_expired()
+    return 0
+  end
+  local n = 0
+  for k, st in pairs(s.steers) do
+    if type(st) == "table" and not seen[k] then
+      if st.via == "relay" and st.relayed_at then
+        seen[k] = true
+        notify(st_text("ui.steer_relayed", { label = label_of(st.agent_id) }))
+        n = n + 1
+      elseif st.via ~= "relay" and st.status == "DELIVERED" then
+        seen[k] = true
+        if st.via == "hook" and (st.kind or "steer") == "steer" and delivered_at_end(st) then
+          notify(st_text("ui.steer_delivered_stop", { label = label_of(st.agent_id) }))
+          n = n + 1
+        end
+      end
+    end
+  end
+  return n
 end
 
 -- 親への知らせの文（i18n の鍵が無ければ英語の既定の文）。先頭の [AgentMap] は送るときに付ける
@@ -1675,7 +1983,8 @@ function M.notify_parents()
   end
   local n = 0
   for k, st in pairs(s.steers) do
-    if st.status == "DELIVERED" and not done[k] then
+    -- 親経由（relay）は親自身が渡したので知らせない（V44）
+    if st.status == "DELIVERED" and not done[k] and st.via ~= "relay" then
       done[k] = true
       local child = st.agent_id
       local kind = st.kind or "steer"
@@ -1716,6 +2025,7 @@ function M.sweep_steers()
     changed = ok and r == true
   end
   M.notify_expired()
+  pcall(M.notify_relays)
   local ok, n = pcall(M.notify_parents)
   if ok and n and n > 0 then changed = true end
   return changed
@@ -1726,7 +2036,8 @@ end
 --   x  = 止める（次の道具の直前か終わる直前の早い方）／もう 1 回で再開。メニューは出さない。
 --        関門で終わる前に止まっている箱（[GATE]）だけ「通す／直す」のメニュー。
 --   X  = 見ている run の関門の入／切。
---   止まっている宛先に s で書いた指示は、止まれを外してその場で届く（steer_send）。
+--   止まっている子に s で書いた指示は、止まれを外して続けさせ、終わり際に届く（関門で止まっている子・
+--   Stop で止まっている ROOT にはその場で届く。DESIGN-v0.1.2-steer2 §5）。
 -- ------------------------------------------------------------
 local PAUSE_DEFAULTS = { enabled = true, auto_resume_s = 600, gate = false, release_on_exit = false, notify = true }
 local LIVE_PAUSE = { REQUESTED = true, PAUSED = true }

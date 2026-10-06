@@ -312,6 +312,38 @@ local trow
 for _, l in ipairs(Lt.lines) do if l:find("[2]", 1, true) then trow = l end end
 ok(trow and trow:find(mk .. "1", 1, true) ~= nil, "一覧でも ✎1")
 
+-- 11b. 親経由の印（DESIGN-v0.1.2-steer2 §7.2）：打ったがまだ渡っていない → ✎1、渡した → ✎、渡らず → ✎!
+local Lr = graph.layout(with_steers({ { status = "DELIVERED", via = "relay", delivered_at = iso(NOW - 300), delivered_via = "terminal" } }),
+  { width = 200, now = NOW })
+local lr4, hlr = line4_marks(Lr, "a2")
+ok(lr4:find("[REWORK] " .. mk .. "1", 1, true) == 1, "relay 打った・未中継 → ✎1（実際: " .. lr4 .. "）")
+ok(vim.tbl_contains(hlr, "AgentMapWaiting"), "relay 未中継の ✎1 は紫")
+local Lrr = graph.layout(with_steers({ { status = "DELIVERED", via = "relay", delivered_at = iso(NOW - 300), confirmed_at = iso(NOW - 299),
+  delivered_via = "UserPromptSubmit" } }), { width = 200, now = NOW })
+ok(Lrr.nodes.a2.lines[4]:find("[REWORK] " .. mk .. "1", 1, true) == 1, "relay 読まれた・未中継 → ✎1")
+local Lrd = graph.layout(with_steers({ { status = "DELIVERED", via = "relay", delivered_at = iso(NOW - 300), relayed_at = iso(NOW - 5),
+  delivered_via = "SendMessage" } }), { width = 200, now = NOW })
+local lrd4, hlrd = line4_marks(Lrd, "a2")
+ok(lrd4:find("[REWORK] " .. mk .. " ", 1, true) == 1, "relay 渡した（60 秒以内、打ったのは 5 分前）→ ✎（実際: " .. lrd4 .. "）")
+ok(vim.tbl_contains(hlrd, "AgentMapDone"), "渡した ✎ は緑")
+local Lro = graph.layout(with_steers({ { status = "DELIVERED", via = "relay", delivered_at = iso(NOW - 300), relayed_at = iso(NOW - 120),
+  delivered_via = "SendMessage" } }), { width = 200, now = NOW })
+ok(not Lro.nodes.a2.lines[4]:find(mk, 1, true), "渡してから 60 秒を過ぎたら印は消える")
+local Lrx = graph.layout(with_steers({ { status = "EXPIRED", via = "relay", delivered_at = iso(NOW - 300), confirmed_at = iso(NOW - 299),
+  end_reason = "not_relayed" } }), { width = 200, now = NOW })
+local lrx4, hlrx = line4_marks(Lrx, "a2")
+ok(lrx4:find("[REWORK] " .. mk .. "!", 1, true) == 1, "not_relayed → ✎!（実際: " .. lrx4 .. "）")
+ok(vim.tbl_contains(hlrx, "AgentMapRework"), "✎! は赤")
+local Lrc = graph.layout(with_steers({ { status = "CANCELLED", via = "relay" }, { status = "PENDING", via = "relay" } }), { width = 200, now = NOW })
+ok(Lrc.nodes.a2.lines[4]:find("[REWORK] " .. mk .. "1", 1, true) == 1, "取り消した relay は数えず、打つ前の relay は ✎1")
+ok(graph.relay_waiting({ via = "relay", status = "DELIVERED" }) and not graph.relay_waiting({ via = "hook", status = "PENDING" })
+  and not graph.relay_waiting({ via = "relay", status = "DELIVERED", relayed_at = "x" }), "relay_waiting の規則")
+for id, nd in pairs(Lr.nodes) do
+  if nd.lines then
+    for _, l in ipairs(nd.lines) do ok(vim.fn.strdisplaywidth(l) <= 24, "箱の内側は 24 桁: " .. id .. " " .. l) end
+  end
+end
+
 -- 12. 一時停止（DESIGN-v0.1.2-pause §6.3）：札・橙・枠・印・凡例・一覧・止まっていた時間を引いた %
 local pmk = graph.pause_mark()
 -- fixture に止まれが入っていても入っていなくても同じ結果になるよう、毎回作り直す

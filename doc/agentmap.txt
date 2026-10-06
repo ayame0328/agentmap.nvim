@@ -34,10 +34,10 @@ Claude Code calls a small recorder (`bin/agentmap-collect`, Python 3) through
 its hooks. The recorder appends one short line per event to a file in the
 record folder; Neovim reads that file. The recorder never fails and never
 changes what Claude Code does, except to deliver a steering instruction you
-wrote (|agentmap-steer|).
+wrote (|agentmap-steer|) and to hold an agent you paused (|agentmap-pause|).
 
 Requirements: Neovim 0.10+, Python 3, Claude Code (verified with 2.1.283 to
-2.1.289). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
+2.1.291). Optional: git, oil.nvim, a Chromium-based browser for PDF export.
 Windows-native Neovim is experimental.
 
 ==============================================================================
@@ -54,10 +54,16 @@ Install with your plugin manager. `setup()` is optional. Then once:
 Claude Code in a container: see `docs/containers.md` in the plugin folder.
 
 After upgrading from 0.1.0, run |:AgentMapInstallHooks| again: 0.1.1 records
-TaskCreate / TaskUpdate / TaskList, adds a synchronous PreToolUse hook that
-delivers steering, and makes SubagentStop synchronous. `:checkhealth agentmap`
-says "outdated" until then. Run it again after changing `steer.mode` or
-`steer.at_stop`.
+TaskCreate / TaskUpdate / TaskList, adds a synchronous PreToolUse hook, and
+makes SubagentStop synchronous. `:checkhealth agentmap` says "outdated" until
+then. Run it again after changing `steer.mode`.
+
+After upgrading from 0.1.1 to 0.1.2, run it again as well: the delivery hooks
+get `--pause` and a 630 s timeout, steering is delivered when an agent tries
+to finish (the 0.1.1 registration hands it over at the next tool call as a
+tool error, which current models may ignore), and SendMessage is recorded.
+Until then `x`, `X` and `s` on a sub-agent refuse; recording and the terminal
+routes keep working.
 
 ==============================================================================
 3. COMMANDS                                                 *agentmap-commands*
@@ -90,9 +96,12 @@ says "outdated" until then. Run it again after changing `steer.mode` or
         Import a run from Claude Code's transcript (default: the newest
         session of the current folder).
 
-:AgentMapSteer {n|id} [{text}]                                *:AgentMapSteer*
+:AgentMapSteer {n|id} [relay] [{text}]                        *:AgentMapSteer*
         Send a steering instruction to agent number {n} (or ROOT, or the
-        agent {id}). Without {text} the editor window opens. See
+        agent {id}). Without {text} the editor window opens. With `relay`
+        first, the text is typed into the main agent's terminal for it to
+        pass on with SendMessage right away (a running direct sub-agent of
+        the main agent only; refused without a Claude terminal). See
         |agentmap-steer|.
 
 :AgentMapPause {n|id} [next|stop]                             *:AgentMapPause*
@@ -166,10 +175,12 @@ Detail, transcript and diff views:
     },
     steer = {                 -- false: { enabled = false }
       enabled = true,
-      mode = "deny",          -- "deny" | "context"
-      at_stop = true,         -- also deliver when the agent tries to finish
+      mode = "stop",          -- "stop" (when the agent tries to finish)
+                              -- | "deny" | "context" (also at its next tool
+                              -- call; current models may ignore it)
+      relay = "menu",         -- "menu" | "always" | "never"
       root_via = "terminal",  -- "terminal" | "hook"
-      no_terminal = "hook",   -- "hook" | "clipboard" | "none"
+      no_terminal = "stop",   -- "stop" | "clipboard" | "none" ("hook": "stop")
       submit_delay_ms = 300,   -- Enter this many ms after the text (0: one write)
       input = "window",       -- "window" | "line"
       text_max = 4000,
@@ -183,9 +194,10 @@ Detail, transcript and diff views:
     },
   })
 <
-The full list with defaults is in the README. `steer.mode`, `steer.at_stop`
-and `pause.auto_resume_s` are written into the hook command (the last one
-also into its timeout); run |:AgentMapInstallHooks| after changing them.
+The full list with defaults is in the README. `steer.mode` and
+`pause.auto_resume_s` are written into the hook command (the latter also into
+its timeout); run |:AgentMapInstallHooks| after changing them.
+`steer.at_stop` is ignored since 0.1.2 (delivery at the end is always on).
 
 ==============================================================================
 6. WRITING CONVENTION                                     *agentmap-convention*
@@ -294,33 +306,55 @@ checking (`progress.log`); `:checkhealth agentmap` shows the median error.
 ==============================================================================
 12. STEERING                                                  *agentmap-steer*
 
-`s` on a box (or |:AgentMapSteer|) opens a small window: write the
-instruction, send with <C-s>, `:w` or <CR> in normal mode, cancel with `q`.
+`s` on a box (or |:AgentMapSteer|) opens a menu, then a small window: write
+the instruction, send with <C-s>, `:w` or <CR> in normal mode, cancel with
+`q`.
 
-  Running sub-agent    delivered through hooks: the PreToolUse hook stops
-                       its next tool call and returns the text as the
-                       reason; SubagentStop stops it once if it tries to
-                       finish first (`steer.at_stop`). The model sees
-                       `PreToolUse:<Tool> hook error: [AgentMap] ...`.
+  Running sub-agent    delivered when it tries to finish: its SubagentStop
+                       hook holds the end once and hands it the text; it
+                       applies it, continues and finishes again. Until then
+                       it works on the old plan. Paused before a tool call:
+                       the pause is lifted and the text arrives at its end.
+                       Waiting at its end (the gate): the text arrives now.
+  Relay (menu item 2)  only for a running direct sub-agent of the main
+                       agent when its terminal is in this Neovim: typed into
+                       the main agent's terminal as `[AgentMap] Tell
+                       sub-agent [3] "<name>" (agent id <id>) this, with
+                       SendMessage: <text>`; the main agent passes it on
+                       with SendMessage and the sub-agent gets it at its
+                       next tool call. Immediate, but followed less
+                       reliably than an instruction at its end.
   Main agent (ROOT)    typed into the |terminal| running `claude` in this
-                       Neovim as `[AgentMap] <text>` and Enter. The one in
-                       the run's folder (or a parent) is used; with several,
-                       or only ones in other folders, you pick one. Without
-                       such a terminal: `steer.no_terminal` ("hook",
-                       "clipboard" or "none").
+                       Neovim as `[AgentMap] <text>` and Enter (a pause
+                       before a tool call is lifted first). The one in the
+                       run's folder (or a parent) is used; with several, or
+                       only ones in other folders, you pick one. Without
+                       such a terminal: `steer.no_terminal` ("stop": at the
+                       end of its turn through its Stop hook, "clipboard"
+                       or "none").
   Finished agent       a redo request is typed into the main agent's
                        terminal; nothing is marked as rework automatically.
 
-When an instruction reaches a sub-agent, its parent is told once, by the
-same route as any instruction for that parent (not when it has finished).
+At its end the model sees `Stop hook feedback:` followed by `[AgentMap]
+Instruction from the user, typed in Neovim (AgentMap) while you were working.
+It reaches you now, just before you finish: ...`. With Claude Code 2.1.291
+sub-agents followed it 17 times out of 17 and the main agent 9 out of 9.
+`steer.mode = "deny"` or "context" also delivers at the next tool call as a
+tool result (`PreToolUse:<Tool> hook error: ...`); current models may ignore
+that, so it is not the default.
 
-The box shows ` ✎1` while instructions wait, ` ✎` after delivery and ` ✎!`
-when the agent finished first. The detail view lists every instruction with
-its full text; `s` -> "Cancel pending" withdraws one not yet delivered.
-Undelivered text waits in `<run>/steer/<agent>-<ms>.json` (mode 0600) with
-the flag `<root>/steer.pending`. An agent usually follows the instruction,
-but it is not guaranteed (the main agent on Haiku ignored hook-delivered
-instructions in tests).
+When an instruction reaches a sub-agent at its end, its parent is told once,
+by the same route as any instruction for that parent (not when it has
+finished, and not for a relay).
+
+The box shows ` ✎1` while instructions wait (a relay: until the main agent
+passes it on), ` ✎` after delivery and ` ✎!` when the agent finished first or
+the main agent ended its turn without passing a relay on. The detail view
+lists every instruction with its full text and, for a relay, SENT / READ /
+RELAYED (the main agent's SendMessage is recorded; whether the sub-agent read
+it is not); `s` -> "Cancel pending" withdraws one not yet delivered.
+Undelivered text waits in `<run>/steer/<agent>-<ms>.json` (mode 0600). An
+agent usually follows the instruction, but it is not guaranteed.
 
 The text goes into the terminal as one line and Enter follows
 `steer.submit_delay_ms` (300 ms) later: Claude Code 2.1.289 treats a long
@@ -329,10 +363,11 @@ paste and leaves it unsent in its input box. The detail view shows SENT until
 Claude Code reads the line, then DELIVERED (read by Claude Code).
 
 Nothing is sent, and a message says why, when the registered hooks are
-outdated (`s` on a running agent: run |:AgentMapInstallHooks| first; the
-terminal route is not affected) or when the run has ended (`s` on the main
-agent or a finished agent would reach another conversation's terminal in the
-same folder; give new instructions in Claude Code itself).
+outdated or use another `steer.mode` (`s` on a sub-agent: run
+|:AgentMapInstallHooks| first; the terminal routes, relay included, are not
+affected) or when the run has ended (`s` on the main agent or a finished
+agent would reach another conversation's terminal in the same folder; give
+new instructions in Claude Code itself).
 
 ==============================================================================
 13. PAUSING AND THE GATE                                      *agentmap-pause*
@@ -342,13 +377,15 @@ resumes it. Nothing is cancelled: the agent stops at its next tool call or
 when it tries to finish, whichever comes first, and waits there. ROOT can be
 paused too. Only that agent stops; other sub-agents go on.
 
-The synchronous hooks that deliver steering (PreToolUse, SubagentStop, Stop)
-find the pause file `<run>/pause/<agent>.json` and wait inside Claude Code,
-checking it every 100 ms, until Neovim removes it. Resumed without an
-instruction, the agent sees nothing (the held tool call just runs). `s` on a
-paused box resumes it with the instruction on the spot, through that hook
-(ROOT included): the agent gets the usual steering text with one more line,
-`(You were paused by the user for 2 min 31 s before this instruction.)`.
+The synchronous hooks (PreToolUse, SubagentStop, Stop) find the pause file
+`<run>/pause/<agent>.json` and wait inside Claude Code, checking it every
+100 ms, until Neovim removes it. Resumed without an instruction, the agent
+sees nothing (the held tool call just runs). `s` on a box paused before a
+tool call resumes it; the instruction arrives when it tries to finish (ROOT:
+the pause is lifted, then the text is typed into its terminal). At the gate,
+"Fix" (or `s` on a box paused at its end) hands the text over on the spot,
+with one more line, `(You were paused by the user for 2 min 31 s before this
+instruction.)`.
 
 The box shows [PAUSED] (orange, `AgentMapPaused`) while the agent waits and
 ` ⏸` (`||` where it is drawn wide) while the pause waits to be reached; the
@@ -361,7 +398,8 @@ closed or the computer sleeps. Claude Code stops a hook after its `timeout`
 (600 s when none is set) and then runs the tool silently, so the delivery
 hooks are registered with `auto_resume_s + 30` (630 s). Run
 |:AgentMapInstallHooks| after upgrading to 0.1.2: with the old registration
-`x` and `X` refuse, while recording and steering keep working.
+`x`, `X` and `s` on a sub-agent refuse, while recording and the terminal
+routes keep working.
 
 Esc in Claude Code interrupts the main agent's turn only; a pause on ROOT
 stays placed and stops it again at its next tool call. Closing Neovim does

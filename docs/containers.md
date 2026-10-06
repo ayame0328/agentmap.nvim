@@ -64,11 +64,18 @@ If the container's `settings.json` is not visible from the host, run the same `i
 Neovim inside the container, or add the `hooks` block by hand: run the dry run against a copy
 of the file and paste the result.
 
-**Give `root` as the container sees the record folder, too.** Since 0.1.1 a second, synchronous
-`PreToolUse` hook delivers steering instructions; it first tests `<root>/steer.pending` (and, since
-0.1.2, `<root>/pause.pending`) with a tiny shell check. Without `root`, that path is taken from your
-host's Neovim (`config.root()`), the container cannot see it, and steering instructions and pauses
-never arrive (recording still works).
+**Give `root` as the container sees the record folder, too.** Since 0.1.2 the synchronous
+`SubagentStop` / `Stop` hooks hand steering instructions over when an agent tries to finish, and a
+synchronous `PreToolUse` hook first tests `<root>/pause.pending` (with `steer.mode = "deny"` or
+`"context"` also `<root>/steer.pending`) with a tiny shell check. Without `root`, those paths are
+taken from your host's Neovim (`config.root()`), the container cannot see them, and steering
+instructions and pauses never arrive (recording still works).
+
+Steering the main agent and relaying through it type into a Claude terminal in your Neovim. If
+`claude` runs in the container through a host `:terminal` (for example `docker exec -it … claude`),
+the terminal's folder is the host folder while the run's folder is the container's, so agentmap.nvim
+does not pick it by itself: you choose it once per run. Without such a terminal, instructions for
+the main agent arrive at the end of its turn and relay is not offered.
 
 Instead of `--root`, the record folder can also be set as an environment variable in the
 container's `settings.json` (`"env": { "AGENTMAP_DIR": "/workspace/.shared/agentmap/records" }`)

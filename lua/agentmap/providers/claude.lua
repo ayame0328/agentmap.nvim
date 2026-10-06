@@ -260,6 +260,18 @@ function M.normalize_hook(rec)
         agent_id = who, tool_name = rec.tool_name, target = rec.target,
         tool_use_id = rec.tool_use_id, duration_ms = rec.duration_ms, cwd = rec.cwd,
       })
+      -- 親経由の修正指示が渡った事実（ROOT などが SendMessage を使った。宛先 to が無ければ作らない。
+      -- DESIGN-v0.1.2-steer2 §6.3）。子が読んだかは記録に無いので追わない
+      if rec.tool_name == "SendMessage" then
+        local ti = rec.tool_input or {}
+        local to = type(ti.to) == "string" and ti.to ~= "" and ti.to or nil
+        if to then
+          add("message_sent", {
+            agent_id = who, to = to, head = type(ti.head) == "string" and ti.head or nil,
+            summary = type(ti.summary) == "string" and ti.summary or nil, tool_use_id = rec.tool_use_id,
+          })
+        end
+      end
       -- 手順表（TaskCreate / TaskUpdate / TaskList）。進み具合の事実（DESIGN-v0.2 §2.2）
       local ti = rec.tool_input or {}
       if rec.tool_name == "TaskCreate" then

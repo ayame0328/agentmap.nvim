@@ -124,7 +124,7 @@ return {
   ["export.steer_line"] = "- %{label} — %{time} \"%{text}\" → %{outcome}",
   ["export.steer_delivered"] = "delivered %{time} at %{via}",
   ["export.steer_sent"] = "sent to the terminal %{time}",
-  ["export.steer_pending"] = "pending at export time",
+  ["export.steer_pending"] = "pending at export time (arrives when the agent finishes)",
   ["export.steer_expired"] = "not delivered: %{reason}",
   ["export.steer_cancelled"] = "cancelled",
   ["export.steer_none"] = "(no steering instructions)",
@@ -152,4 +152,9 @@ return {
   ["export.ov_pauses"] = "%{n} (%{waiting} waiting)",
   ["export.ov_gate_label"] = "Gate",
   ["export.ov_gate"] = "on",
+  -- v0.1.2: steering at the end of an agent and relay through the main agent (DESIGN-v0.1.2-steer2 appendix A)
+  ["export.steer_pending_next"] = "pending at export time (arrives at its next tool call)",
+  ["export.steer_relay_sent"] = "sent to the main agent's terminal %{time}, not relayed yet",
+  ["export.steer_relayed"] = "relayed %{time} by %{parent} (SendMessage)",
+  ["export.steer_not_relayed"] = "not relayed: the main agent ended its turn",
 }

@@ -9,7 +9,7 @@
 --  親が分からない Agent は parent_id = nil のまま（推測で埋めない）。
 --  進み具合の事実は手順表だけ（a.tasks = TaskCreate/TaskUpdate/TaskList、a.steps = "## Steps" の目印）。
 --  % の数字は state に保存しない（progress.lua が毎回計算する。progress_facts がその材料）。
---  修正指示（steer）は s.steers に持つ（DESIGN-v0.2-steer §5.2）。
+--  修正指示（steer）は s.steers に持つ（DESIGN-v0.2-steer §5.2、親経由は DESIGN-v0.1.2-steer2 §6.4）。
 --  一時停止（pause）は s.pauses に持つ（DESIGN-v0.1.2-pause §5.2）。a.status は変えず、表示だけ display_status。
 -- ============================================================
 local util = require("agentmap.util")
@@ -17,13 +17,16 @@ local brief = require("agentmap.brief")
 
 local M = {}
 
-M.SV = 10 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示、10 で一時停止が増えた
+M.SV = 11 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示、10 で一時停止、
+           -- 11 で親経由の修正指示（expect / relay_line / relayed_at …、DESIGN-v0.1.2-steer2 §6.4）が増えた
 
 M.STATUSES = { "PENDING", "RUNNING", "REVIEW", "DONE", "REWORK", "FAILED" }
 -- HUMAN CHECK（AskUserQuestion）の状態。Agent の状態とは別の箱で持つ（Agent の STATUSES は変えない）
 --   WAITING = 質問を出して答え待ち / ANSWERED = 答えが出た / ABANDONED = 答えが無いまま終わった
 M.CHECK_STATUSES = { "WAITING", "ANSWERED", "ABANDONED" }
 -- 修正指示（steer）の状態。PENDING = 未配達 / DELIVERED = 配達した（端末へ送った）/ CANCELLED = 取り消した / EXPIRED = 届かないまま終わった
+--   親経由（via = "relay"）は DELIVERED の中の段階を delivered_via で分ける：
+--   terminal（端末に打った）→ UserPromptSubmit（Claude Code が読んだ）→ SendMessage（親が子へ渡した。relayed_at）
 M.STEER_STATUSES = { "PENDING", "DELIVERED", "CANCELLED", "EXPIRED" }
 -- 一時停止（pause）の状態。REQUESTED = 止まれを置いた / PAUSED = hook が止めて待っている / RESUMED = 抜けた /
 -- EXPIRED = 止まらないまま宛先が終わった・取り下げた
@@ -528,18 +531,28 @@ local function squash(str)
 end
 
 --- 端末へ送った修正指示が Claude Code に受け取られた（UserPromptSubmit が来た）印を付ける。
----   本文の先頭 60 文字が "[AgentMap] " の後ろにあるものだけ（無ければ何もしない＝推測しない）
+---   本文の先頭 60 文字が "[AgentMap] " の後ろにあるものだけ（無ければ何もしない＝推測しない）。
+---   親経由（via = "relay"）は、端末に打った文（relay_line）の先頭が記録の prompt_head と一致するものも
+---   （prompt_head は 200 文字で切られるので、長い名前のときは本文が入りきらないことがある）
 local function confirm_terminal_steer(s, ev)
   local rest = squash(ev.prompt_head:sub(#M.STEER_PREFIX + 1))
   if rest == "" then return end
   for i = #(s.steer_order or {}), 1, -1 do
     local st = s.steers[s.steer_order[i]]
-    if st and st.via == "terminal" and st.status == "DELIVERED" and st.delivered_via == "terminal"
-        and not st.confirmed_at and type(st.text) == "string" then
+    local relay = st and st.via == "relay"
+    if st and (st.via == "terminal" or relay) and st.status == "DELIVERED" and not st.confirmed_at
+        and (st.delivered_via == "terminal" or (relay and st.delivered_via == "SendMessage")) and type(st.text) == "string" then
       local h = squash(brief.clip(st.text, 60))
-      -- 先頭が一致（ROOT への指示）か、やり直し依頼の文の中に本文がある（終わった箱のやり直し）
-      if h ~= "" and (rest:sub(1, #h) == h or rest:find(h, 1, true)) then
-        st.delivered_via = "UserPromptSubmit"
+      -- 先頭が一致（ROOT への指示）か、やり直し依頼・親経由の文の中に本文がある
+      local hit = h ~= "" and (rest:sub(1, #h) == h or rest:find(h, 1, true) ~= nil)
+      if not hit and relay and type(st.relay_line) == "string" then
+        local line = squash(st.relay_line)
+        if line:sub(1, #M.STEER_PREFIX) == M.STEER_PREFIX then line = squash(line:sub(#M.STEER_PREFIX + 1)) end
+        hit = #rest >= 20 and line:sub(1, #rest) == rest
+      end
+      if hit then
+        -- 親が先に渡していた（記録の届く順の入れ替わり）なら、段階は SendMessage のまま
+        if st.delivered_via == "terminal" then st.delivered_via = "UserPromptSubmit" end
         st.confirmed_at = ev.ts
         return
       end
@@ -671,8 +684,9 @@ function H.agent_started(s, ev)
   fill(a, "model", ev.model)
 
   if CLOSED[a.status] and a.started_at then
-    -- 一度終わった Agent がまた動き出した（再開・差し戻し後の再実行）
-    start_rework(s, a, ev.ts, nil, "activity")
+    -- 一度終わった Agent がまた動き出した：同じ id の 2 回目の SubagentStart（親の SendMessage で終わった子が
+    -- 再開した。DESIGN-v0.1.2-steer2 E3c・V45）や差し戻し後の再実行。新しい回を開いて RUNNING に戻す
+    start_rework(s, a, ev.ts, nil, "resumed")
   elseif #a.attempts == 0 then
     open_attempt(a, ev.ts)
     a.status = "RUNNING"
@@ -961,7 +975,7 @@ end
 function H.steer_requested(s, ev)
   if not ev.steer_id then return end
   local st = get_steer(s, ev.steer_id)
-  for _, k in ipairs({ "agent_id", "text", "via", "kind", "redo_of", "notice_of" }) do fill(st, k, ev[k]) end
+  for _, k in ipairs({ "agent_id", "text", "via", "kind", "redo_of", "notice_of", "expect", "relay_line" }) do fill(st, k, ev[k]) end
   fill(st, "requested_at", ev.ts)
   if st.prompt_id == nil and ev.prompt_id then st.prompt_id = resolve_pid(s, ev.prompt_id) end
   -- 親への知らせ（kind = "notice"）：元の指示に、知らせの id を付ける（同じ指示の知らせを二重に作らないため）
@@ -1023,10 +1037,49 @@ end
 
 function H.steer_expired(s, ev)
   local st = ev.steer_id and s.steers and s.steers[ev.steer_id]
-  if not st or st.status ~= "PENDING" then return end
+  if not st then return end
+  -- 期限切れは未配達からだけ。ただし親経由の「渡されなかった」（not_relayed）は、端末に打てた時点で DELIVERED に
+  -- なっているので、まだ親が渡していない（relayed_at の無い）ものに限って DELIVERED からも（DESIGN-v0.1.2-steer2 §6.4）
+  local relay_unpassed = ev.reason == "not_relayed" and st.via == "relay" and st.status == "DELIVERED" and not st.relayed_at
+  if st.status ~= "PENDING" and not relay_unpassed then return end
   st.status = "EXPIRED"
   st.ended_at = ev.ts
   st.end_reason = ev.reason
+end
+
+--- 親（や子）が SendMessage を使った（PostToolUse の記録。DESIGN-v0.1.2-steer2 §4.5）。
+---   宛先 to への親経由の指示のうち、送った時刻より前に頼んだ、まだ渡っていない一番古いもの 1 件を「渡した」にする
+---   （期限切れ not_relayed のものは、生きているものが無いときだけ。記録の読み込みが遅れて先に期限切れにした場合）。
+---   本文が言い換えられたかは比べない（relay_head を詳細に出して人が見る）。該当が無ければ何もしない（手で打った伝言は追わない）
+function H.message_sent(s, ev)
+  if type(ev.to) ~= "string" or ev.to == "" or type(s.steers) ~= "table" then return end
+  local t = secs(ev.ts)
+  local best, best_t
+  for i, sid in ipairs(s.steer_order or {}) do
+    local st = s.steers[sid]
+    if st and st.via == "relay" and st.agent_id == ev.to and st.status ~= "CANCELLED" and not st.relayed_at then
+      local rt = secs(st.requested_at)
+      if not (t and rt and rt > t) then
+        -- 生きているもの（EXPIRED でない）を先に。期限切れ（not_relayed）は生きているものが無いときだけ
+        local key = { st.status == "EXPIRED" and 1 or 0, rt or -math.huge, i }
+        local better = not best_t or key[1] < best_t[1] or (key[1] == best_t[1] and (key[2] < best_t[2]
+          or (key[2] == best_t[2] and key[3] < best_t[3])))
+        if better then best, best_t = { st = st, i = i }, key end
+      end
+    end
+  end
+  if not best then return end
+  local st = best.st
+  -- 渡したのは事実なので、先に期限切れ（not_relayed）にしていても戻す（配達は他の全部に勝つ）
+  st.status = "DELIVERED"
+  st.ended_at, st.end_reason = nil, nil
+  st.delivered_at = st.delivered_at or ev.ts
+  st.delivered_via = "SendMessage"
+  st.relayed_at = ev.ts
+  st.relayed_by = ev.agent_id or "ROOT"
+  st.relay_head = ev.head
+  st.relay_tool_use_id = ev.tool_use_id
+  attach_steer(s, st)
 end
 
 -- ---------- 一時停止（pause。DESIGN-v0.1.2-pause §5.2）----------
@@ -1863,6 +1916,18 @@ function M.pending_steers(s, id)
   local n = 0
   for _, sid in ipairs(M.steers_of(s, id)) do
     if s.steers[sid].status == "PENDING" then n = n + 1 end
+  end
+  return n
+end
+
+--- Number of relayed instructions for a box (via = "relay") that the main agent has not passed on yet:
+--- no relayed_at, not EXPIRED / CANCELLED (DESIGN-v0.1.2-steer2 §6.4; used for the box mark and notices).
+---@return integer
+function M.relay_pending(s, id)
+  local n = 0
+  for _, sid in ipairs(M.steers_of(s, id)) do
+    local st = s.steers[sid]
+    if st.via == "relay" and not st.relayed_at and st.status ~= "EXPIRED" and st.status ~= "CANCELLED" then n = n + 1 end
   end
   return n
 end

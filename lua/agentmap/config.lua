@@ -53,13 +53,16 @@ M.defaults = {
     back_ms = 3000,          -- 子が終わったあと、子→親へ流す時間
     max_paths = 40,          -- 同時に光らせる線の上限
   },
-  -- 動いている Agent への修正指示（DESIGN-v0.2-steer §8.1）。false を渡すと { enabled = false }
+  -- 動いている Agent への修正指示（DESIGN-v0.2-steer §8.1、DESIGN-v0.1.2-steer2 §9.1）。false を渡すと { enabled = false }
   steer = {
     enabled = true,          -- false: hooks に配達の登録を足さない。s は「無効」と知らせる
-    mode = "deny",           -- "deny": 次の道具を止めて理由として届ける | "context": 道具は進めて文脈として渡す
-    at_stop = true,          -- SubagentStop / Stop でも届ける（終わりを 1 回止めて続けさせる）
+    -- "stop": Agent が終わろうとした瞬間に届ける（SubagentStop / Stop の block。既定）。
+    -- "deny" / "context": 次の道具の直前にも届ける（止める／添える）。今のモデルは無視することがある。
+    -- 変えたら :AgentMapInstallHooks。at_stop は 0.1.2 で廃止（常に on。書いても無視し、health が知らせる）
+    mode = "stop",
+    relay = "menu",          -- 親経由: "menu"（ROOT の端末があれば s のメニューに出す）| "never" | "always"（先に出す）
     root_via = "terminal",   -- ROOT への経路 "terminal" | "hook"
-    no_terminal = "hook",    -- 端末が無いとき "hook" | "clipboard" | "none"
+    no_terminal = "stop",    -- 端末が無いとき "stop"（ROOT の番の終わりに block）| "clipboard" | "none"。"hook" は "stop" の別名
     -- 本文を送ってから Enter を送るまでの間（ms）。0 なら 1 回で送る。
     -- Claude Code 2.1.289 の実測：長い 1 行（親への知らせの長さ、約 250 文字）を Enter ごと 1 回で送ると
     -- 貼り付け扱いになって送信されず入力欄に残る。150 ms 以上空けると送信される（短い行はどちらでも送信される）
@@ -77,6 +80,10 @@ M.defaults = {
   },
 }
 
+local STEER_MODES = { stop = true, deny = true, context = true }
+local STEER_RELAY = { menu = true, never = true, always = true }
+local at_stop_given = false -- setup() の steer に at_stop があったか（0.1.2 で廃止。health 13 行目）
+
 -- setup({ progress = false }) / { progress = true } を表に直す（animation / steer / pause も同じ）
 local SWITCHABLE = { "progress", "animation", "steer", "pause" }
 local function normalize(opts)
@@ -87,6 +94,17 @@ local function normalize(opts)
     elseif out[k] == true then
       out[k] = { enabled = true }
     end
+  end
+  -- 修正指示（DESIGN-v0.1.2-steer2 §9.1）: at_stop は廃止（覚えておいて health で知らせる）、
+  -- no_terminal = "hook" は "stop" の別名、知らない mode / relay は既定に戻す
+  if type(out.steer) == "table" then
+    if out.steer.at_stop ~= nil then
+      at_stop_given = true
+      out.steer.at_stop = nil
+    end
+    if out.steer.no_terminal == "hook" then out.steer.no_terminal = "stop" end
+    if out.steer.mode ~= nil and not STEER_MODES[out.steer.mode] then out.steer.mode = nil end
+    if out.steer.relay ~= nil and not STEER_RELAY[out.steer.relay] then out.steer.relay = nil end
   end
   -- 自動再開の秒数は hook と同じ範囲（5〜86400）に収める。数でなければ既定に戻す
   if type(out.pause) == "table" and out.pause.auto_resume_s ~= nil then
@@ -120,12 +138,19 @@ end
 ---@return table the effective configuration
 function M.setup(opts)
   opts = opts or {}
+  at_stop_given = false
   current = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), normalize(opts))
   lang_given = opts.lang ~= nil
   if not lang_given and nonempty(vim.g.agentmap_lang) then
     current.lang = vim.g.agentmap_lang
   end
   return current
+end
+
+--- True when the last setup() passed steer.at_stop, which is ignored since 0.1.2 (always on).
+---@return boolean
+function M.steer_at_stop_given()
+  return at_stop_given
 end
 
 --- The effective configuration table (read only by convention).

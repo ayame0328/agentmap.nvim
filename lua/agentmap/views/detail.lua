@@ -406,8 +406,20 @@ function M.build(state, agent, extra)
     end
   end
 
-  -- 修正指示（DESIGN-v0.2-steer §6.4）。1 件以上あるときだけ
+  -- 修正指示（DESIGN-v0.2-steer §6.4、DESIGN-v0.1.2-steer2 §7.3）。1 件以上あるときだけ
+  local STEER_REASON = { agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
+    no_terminal = "detail.steer_reason_no_terminal", not_relayed = "detail.steer_reason_not_relayed" }
   local function steer_outcome(x)
+    if x.via == "relay" and x.status ~= "EXPIRED" and x.status ~= "CANCELLED" then
+      -- 親経由: 打った（SENT）→ Claude Code が読んだ（READ）→ ROOT が SendMessage で渡した（RELAYED）
+      if x.relayed_at then
+        return t("detail.steer_relayed", { time = H.fmt_clock(x.relayed_at),
+          parent = x.relayed_by and label_of(state, x.relayed_by) or "ROOT" }), "AgentMapDone"
+      elseif x.confirmed_at then
+        return t("detail.steer_relay_read", { time = H.fmt_clock(x.confirmed_at) }), "AgentMapWaiting"
+      end
+      return t("detail.steer_relay_sent", { time = H.fmt_clock(x.delivered_at or x.requested_at) }), "AgentMapWaiting"
+    end
     if x.status == "DELIVERED" then
       if x.delivered_via == "UserPromptSubmit" then
         return t("detail.steer_confirmed", { time = H.fmt_clock(x.confirmed_at or x.delivered_at) }), "AgentMapDone"
@@ -416,15 +428,22 @@ function M.build(state, agent, extra)
       end
       return t("detail.steer_delivered", { time = H.fmt_clock(x.delivered_at), via = or_dash(x.delivered_via) }), "AgentMapDone"
     elseif x.status == "EXPIRED" then
-      local rk = ({ agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
-        no_terminal = "detail.steer_reason_no_terminal" })[x.end_reason]
-      return t("detail.steer_expired", { reason = rk and t(rk) or or_dash(x.end_reason) }), "AgentMapRework"
+      local rk = STEER_REASON[x.end_reason]
+      local reason = rk and t(rk) or or_dash(x.end_reason)
+      if x.end_reason == "not_relayed" then return t("detail.steer_not_relayed", { reason = reason }), "AgentMapRework" end
+      return t("detail.steer_expired", { reason = reason }), "AgentMapRework"
     elseif x.status == "CANCELLED" then
       return t("detail.steer_cancelled", { time = H.fmt_clock(x.ended_at) }), "AgentMapDim"
     end
-    return t("detail.steer_pending"), "AgentMapWaiting"
+    -- 未配達: いつ届くかは要求時の expect（無い = v0.1.1 の記録 = 次の道具）
+    if x.expect == "stop" then return t("detail.steer_pending"), "AgentMapWaiting" end
+    return t("detail.steer_pending_next"), "AgentMapWaiting"
+  end
+  local function squash(v)
+    return vim.trim((tostring(v or "")):gsub("%s+", " "))
   end
   local sids = graph.steers_of(state, a.id)
+  local expanded = type(extra.steer_expanded) == "table" and extra.steer_expanded or {}
   if #sids > 0 then
     b:add("")
     b:add({ { t("detail.h_steers", { n = #sids }), "AgentMapHeader" } })
@@ -435,6 +454,21 @@ function M.build(state, agent, extra)
       local body = H.truncate(H.oneline(x.text or t("common.missing")), cfg.note_chars)
       b:add({ { "  " .. mk .. " ", hl }, { "#" .. (x.n or i) .. " " .. H.fmt_clock(x.requested_at) .. "  " },
         { outcome, hl }, { "  " .. t("common.quote", { text = body }), "AgentMapDim" } }, "steer:" .. sid)
+      -- ROOT が言い換えて渡したときだけ、渡した文の先頭（同じなら出さない。比べるのは先頭だけ）
+      local rh = x.relay_head and squash(x.relay_head) or ""
+      if rh ~= "" and squash(x.text):sub(1, #rh) ~= rh then
+        b:add({ { t("detail.steer_relay_as", { text = t("common.quote", { text = H.truncate(rh, cfg.note_chars) }) }),
+          "AgentMapDim" } }, "steer:" .. sid)
+      end
+      -- Enter で開いた指示：本文全体と、親経由なら端末に打った文
+      if expanded[sid] then
+        for _, l in ipairs(vim.split(tostring(x.text or ""), "\n", { plain = true })) do
+          b:add({ { "      " .. l, "AgentMapDim" } }, "steer:" .. sid)
+        end
+        if type(x.relay_line) == "string" and x.relay_line ~= "" then
+          b:add({ { t("detail.steer_relay_line", { text = H.oneline(x.relay_line) }), "AgentMapDim" } }, "steer:" .. sid)
+        end
+      end
       -- 親への知らせ（付録 E）：届いたか・未配達か
       local nt = graph.notice_of(state, sid)
       if nt then

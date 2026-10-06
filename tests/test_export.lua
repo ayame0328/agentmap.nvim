@@ -202,10 +202,10 @@ t.matches(mdp, "\n> Steps: 2/3 done · Progress: ~83%.3%%\n> ✓ 1%. Read the cu
   "最終成果物に手順の行")
 t.matches(mdp, "\"~\" marks an estimate", "progress_note の新しい文")
 t.matches(mdp, "\n## Steering instructions\n", "修正指示の見出し")
-t.matches(mdp, "\n%- %[2%] レビュー係 — %d%d:%d%d:%d%d \"テストも\" → not delivered: the agent finished before its next tool call\n", "届かないまま終了")
+t.matches(mdp, "\n%- %[2%] レビュー係 — %d%d:%d%d:%d%d \"テストも\" → not delivered: the agent finished before it could be delivered\n", "届かないまま終了")
 t.matches(mdp, "\n%- %[1%] 調査係 — %d%d:%d%d:%d%d \"資料は docs/v3 を読むこと。\" → delivered %d%d:%d%d:%d%d at PreToolUse:Write\n", "hook で配達")
 t.matches(mdp, "\n%- ROOT — %d%d:%d%d:%d%d \"急いで\" → sent to the terminal %d%d:%d%d:%d%d\n", "端末へ送信")
-t.matches(mdp, "→ pending at export time\n", "未配達")
+t.matches(mdp, "→ pending at export time %(arrives at its next tool call%)\n", "未配達（expect の無い v0.1.1 の記録は次の道具）")
 t.matches(mdp, "| Steering | 4 %(1 pending%) |", "概要の行")
 -- 親への知らせ（付録 E）：元の指示の下に 1 行。知らせは件数にも独立の行にも入れない
 local pn = prog_state()
@@ -216,6 +216,29 @@ local mdn = export.to_markdown(pn, { now = NOW, stats = STATS })
 t.matches(mdn, "→ delivered %d%d:%d%d:%d%d at PreToolUse:Write\n  %- told the parent ROOT: sent to the terminal %d%d:%d%d:%d%d\n", "親に知らせた行")
 t.ok(not mdn:find("[AgentMap] notice", 1, true), "知らせは独立の行にしない")
 t.matches(mdn, "| Steering | 4 %(1 pending%) |", "知らせは件数に入れない")
+-- 終わり際と親経由（DESIGN-v0.1.2-steer2 §7.4）：4 種の結果の語
+local pr = prog_state()
+pr.steers["a1-2"].expect = "stop"
+pr.steers["a1-3"] = { id = "a1-3", agent_id = "a1", text = "relayed", via = "relay", expect = "parent", status = "DELIVERED",
+  requested_at = iso(NOW - 80), delivered_at = iso(NOW - 79), confirmed_at = iso(NOW - 78), relayed_at = iso(NOW - 75),
+  relayed_by = "ROOT", delivered_via = "SendMessage", relay_line = "[AgentMap] Tell sub-agent …" }
+pr.steers["a1-4"] = { id = "a1-4", agent_id = "a1", text = "typed", via = "relay", expect = "parent", status = "DELIVERED",
+  requested_at = iso(NOW - 60), delivered_at = iso(NOW - 59), delivered_via = "terminal" }
+pr.steers["a1-5"] = { id = "a1-5", agent_id = "a1", text = "dropped", via = "relay", expect = "parent", status = "EXPIRED",
+  requested_at = iso(NOW - 50), delivered_at = iso(NOW - 49), confirmed_at = iso(NOW - 48), end_reason = "not_relayed" }
+vim.list_extend(pr.steer_order, { "a1-3", "a1-4", "a1-5" })
+local mdr = export.to_markdown(pr, { now = NOW, stats = STATS })
+t.matches(mdr, "\"まだ\" → pending at export time %(arrives when the agent finishes%)\n", "未配達（終わり際）")
+t.matches(mdr, "\"relayed\" → relayed " .. os.date("%H:%M:%S", NOW - 75) .. " by ROOT %(SendMessage%)\n", "親が渡した")
+t.matches(mdr, "\"typed\" → sent to the main agent's terminal " .. os.date("%H:%M:%S", NOW - 59) .. ", not relayed yet\n", "打った・まだ渡っていない")
+t.matches(mdr, "\"dropped\" → not relayed: the main agent ended its turn\n", "渡らなかった")
+t.matches(mdr, "| Steering | 7 %(1 pending%) |", "概要の行はそのまま（PENDING だけ数える）")
+require("agentmap.i18n").setup("ja")
+local mdrj = export.to_markdown(pr, { now = NOW, stats = STATS })
+t.matches(mdrj, "書き出し時点で未配達（終わる直前に届く）", "ja: 終わり際")
+t.matches(mdrj, "に ROOT が渡した（SendMessage）", "ja: 渡した")
+t.matches(mdrj, "渡らなかった: 親が番を終えた", "ja: 渡らなかった")
+require("agentmap.i18n").setup("en")
 -- 修正指示が 0 件
 t.matches(md, "\n## Steering instructions\n\n%(no steering instructions%)\n", "0 件の文")
 t.matches(md, "| Steering | 0 %(0 pending%) |", "0 件の概要")

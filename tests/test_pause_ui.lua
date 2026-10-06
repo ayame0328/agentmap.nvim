@@ -1,7 +1,9 @@
 -- Pausing from the map (DESIGN-v0.1.2-pause §5.4, §6.1, §6.5 and appendix D, the user's answers):
 -- `x` without a menu (place a pause / resume it), the Pass / Fix menu only for a box waiting at the
 -- gate, `X` (gate on / off), a steering instruction to a held agent (instruction first, then the
--- pause is removed), steer_kind for a held ROOT, the refusals, the notices of the state changes,
+-- pause is removed; a sub-agent paused before a tool call continues and gets it when it tries to
+-- finish, DESIGN-v0.1.2-steer2 §5), steer_kind for a held ROOT (paused before a tool call: the pause
+-- is lifted, then the terminal; Q23), the refusals, the notices of the state changes,
 -- the commands :AgentMapPause / :AgentMapResume / :AgentMapGate, the light's status map, and the
 -- VimLeavePre rule (pause.release_on_exit, default false). The events.* functions that write files
 -- are replaced with recorders; the pause state is written into the state directly (contract §13.2).
@@ -165,6 +167,7 @@ t.run("gate menu", function()
   vim.wait(200, function() return not vim.api.nvim_buf_is_valid(b) end, 10)
   t.eq(fns(n0), { "request_steer", "resume_pause" }, "指示のファイル → 止まれを消す、の順")
   t.eq(last("resume_pause").opts.steer_id, last("request_steer").id, "steer_id を渡す")
+  t.ok(noted(P("ui.pause_resumed_with", { label = L1 })), "関門の「直す」はその場で届く（指示つきで再開）")
   -- 待たせたまま報告を見る
   menus, picks = {}, { 3 }
   n0 = #calls
@@ -194,7 +197,8 @@ t.run("steer to a held agent", function()
   t.eq(fns(n0), { "request_steer", "resume_pause" }, "指示 → 止まれ解除の順")
   local r = last("resume_pause")
   t.eq({ r.agent_id, r.opts.reason, r.opts.steer_id }, { "a1", "user", last("request_steer").id }, "理由 user・steer_id")
-  t.ok(noted(P("ui.pause_resumed_with", { label = L1 })), "指示つきで再開したと知らせる")
+  t.ok(noted(ui._st("ui.steer_resumed_stop", { label = L1 })), "再開した、指示は終わる直前に届くと知らせる")
+  t.ok(not noted(P("ui.pause_resumed_with", { label = L1 })), "「指示つきで再開（その場で届く）」とは言わない")
   -- まだ止まっていない（REQUESTED）：同じ順。知らせは普通の「置いた」
   clear_pauses()
   set_pause("a1", "REQUESTED")
@@ -218,16 +222,71 @@ t.run("ROOT", function()
   ui.pause_toggle("ROOT")
   t.eq(last("request_pause").agent_id, "ROOT", "ROOT も止められる（Q17）")
   t.eq(fns(n0), { "request_pause" }, "置いた")
+  -- 次の道具の直前で止まっている ROOT（Q23）：止まれを解いてから端末へ。端末が無ければ指示を置いてから解く（番の終わりに届く）
   set_pause("ROOT", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "PreToolUse:Bash" })
-  t.eq(ui.steer_kind("ROOT"), "hook", "止まっている ROOT は hook")
+  t.eq(ui.steer_kind("ROOT"), "root", "PreToolUse で止まっている ROOT は端末")
   n0 = #calls
-  t.eq(ui.steer_send("ROOT", "止めた所から別の方針で"), "queued", "端末へは送らない")
+  t.eq(ui.steer_send("ROOT", "止めた所から別の方針で"), "fallback_hook", "端末が無いので番の終わりに")
   t.eq(fns(n0), { "request_steer", "resume_pause" }, "指示 → 解除")
   t.eq(last("request_steer").opts.via, "hook", "via hook")
+  t.eq(last("resume_pause").opts.steer_id, last("request_steer").id, "steer_id を渡す")
+  -- 端末がある（term の差し替え）：解除 → 打つ、の順
+  local term = require("agentmap.term")
+  local orig_find, orig_send = term.find, term.send
+  term.find = function() return { buf = 1, job = 1, score = 3 }, { { buf = 1, job = 1, score = 3 } }, false end
+  term.send = function(_, line)
+    rec({ fn = "term_send", line = line })
+    return true
+  end
+  events.mark_steer_sent = function() rec({ fn = "mark_steer_sent" }) end
+  notes = {}
+  n0 = #calls
+  t.eq(ui.steer_send("ROOT", "別の方針で"), "sent", "端末へ送った")
+  t.eq(fns(n0), { "request_steer", "resume_pause", "term_send", "mark_steer_sent" }, "記録 → 止まれを解く → 打つ")
+  t.eq(last("request_steer").opts.via, "terminal", "via terminal")
+  t.eq(last("resume_pause").opts.reason, "user", "理由 user")
+  t.ok(noted(P("ui.pause_resumed", { label = "ROOT" })), "再開を知らせる")
+  term.find, term.send = orig_find, orig_send
+  -- 終わり際（Stop）で止まっている ROOT：待っている hook がその場で渡す
+  clear_pauses()
+  set_pause("ROOT", "PAUSED", "pause", "stop", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "Stop" })
+  t.eq(ui.steer_kind("ROOT"), "hook", "Stop で止まっている ROOT は hook")
+  notes = {}
+  n0 = #calls
+  t.eq(ui.steer_send("ROOT", "ここで直して"), "queued", "hook で置く")
+  t.eq(fns(n0), { "request_steer", "resume_pause" }, "指示 → 解除")
+  t.ok(noted(P("ui.pause_resumed_with", { label = "ROOT" })), "その場で届く")
   clear_pauses()
   set_pause("ROOT", "REQUESTED")
-  t.eq(ui.steer_kind("ROOT"), "hook", "置いただけでも hook（止まる場所で受け取る）")
+  t.eq(ui.steer_kind("ROOT"), "hook", "置いただけなら hook（止まる場所で受け取る）")
   clear_pauses()
+end)
+
+-- 5b. 止まっている子に親経由（relay）：打った後で止まれを解く（伝言は次の道具の切れ目で届く）。関門の子には出さない
+t.run("relay to a paused child", function()
+  clear_pauses()
+  local term = require("agentmap.term")
+  local orig_find, orig_send = term.find, term.send
+  term.find = function() return { buf = 1, job = 1, score = 3 }, { { buf = 1, job = 1, score = 3 } }, false end
+  term.send = function(_, line)
+    rec({ fn = "term_send", line = line })
+    return true
+  end
+  events.mark_steer_sent = function() rec({ fn = "mark_steer_sent" }) end
+  set_pause("a1", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "PreToolUse:Read" })
+  t.eq(ui.relay_available("a1"), true, "PreToolUse で止まっている子には親経由を出す")
+  local n0 = #calls
+  t.eq(ui.steer_send("a1", "今すぐ v3 へ", nil, { route = "relay" }), "relayed", "親経由で打った")
+  t.eq(fns(n0), { "request_steer", "term_send", "mark_steer_sent", "resume_pause" }, "記録 → 打つ → 止まれを解く")
+  t.eq(last("request_steer").opts.via, "relay", "via relay")
+  t.eq(last("resume_pause").opts.steer_id, nil, "伝言は hook が渡さないので steer_id は付けない")
+  clear_pauses()
+  s.agents.a1.status = "DONE"
+  set_pause("a1", "PAUSED", "gate", "stop", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "SubagentStop" })
+  t.eq(ui.relay_available("a1"), false, "関門で止まっている子には出さない（s がその場で届く）")
+  s.agents.a1.status = "RUNNING"
+  clear_pauses()
+  term.find, term.send = orig_find, orig_send
 end)
 
 -- 6. 断る場合

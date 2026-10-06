@@ -3,13 +3,17 @@
 --   Idempotent (the second run reports "no change"). Shows a diff and asks before writing; keeps the
 --   original as .bak-<timestamp>. Never runs on its own at startup.
 --   Command format (DESIGN §4.2): '<python>' '<plugin>/bin/agentmap-collect' --root '<root>'
---   Steering (DESIGN-v0.2-steer §7): a second, synchronous PreToolUse hook (no matcher) guarded by a
---   shell test, so Python only starts while an instruction is pending:
---     [ -e '<root>/steer.pending' ] || exit 0; exec <record command> --steer --mode <mode>
---   SubagentStop / Stop run synchronously with "--steer --mode <mode> --at-stop --record".
---   Pausing (DESIGN-v0.1.2-pause §7): the guard also tests <root>/pause.pending and both delivery
---   commands carry "--pause --max-wait <auto_resume_s>"; their timeout is auto_resume_s + 30 (default 630)
---   so that the hook keeps its own deadline before Claude Code kills it.
+--   Steering (DESIGN-v0.1.2-steer2 §8): SubagentStop / Stop run synchronously with
+--   "--steer --mode <mode> --record" and deliver an instruction when the agent tries to finish.
+--   A second, synchronous PreToolUse hook (no matcher) is guarded by a shell test, so Python only
+--   starts while a pause (and, for mode deny / context, an instruction) is pending:
+--     mode stop (default): [ -e '<root>/pause.pending' ] || exit 0; exec <record command> --steer --mode stop ...
+--     mode deny / context: [ -e '<root>/steer.pending' ] || [ -e '<root>/pause.pending' ] || exit 0; exec ...
+--   (deny / context also keep "--at-stop" on the stop command, the v0.1.1 words).
+--   Pausing (DESIGN-v0.1.2-pause §7): the delivery commands carry "--pause --max-wait <auto_resume_s>";
+--   their timeout is auto_resume_s + 30 (default 630) so that the hook keeps its own deadline before
+--   Claude Code kills it. With mode stop and pausing off, the PreToolUse hook is not registered.
+--   PostToolUse records SendMessage (relay through the main agent, DESIGN-v0.1.2-steer2 §4.5).
 local J = require("agentmap.jsonfmt")
 local i18n = require("agentmap.i18n")
 
@@ -30,10 +34,11 @@ M.EVENTS = {
   -- 「許可の判断」を返せる PermissionRequest や、時刻しか増えない Notification は登録しない（設計書 §7.1）。
   -- PostToolUseFailure(AskUserQuestion) は Esc で取り消したとき何が来るか未確認なので、保険として登録だけする
   { "PreToolUse", "Agent|AskUserQuestion" },
-  -- 修正指示の配達（全道具・同期・シェルの門番つき。未配達が無ければ約 2 ms で抜ける）
+  -- 一時停止の待ち（と mode deny / context の配達）。全道具・同期・シェルの門番つき。印が無ければ約 2 ms で抜ける
   { "PreToolUse", nil, { sync = true, steer = true } },
-  -- TaskCreate / TaskUpdate / TaskList は手順表（進み具合の事実。DESIGN-v0.2 §2.2）
-  { "PostToolUse", "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList" },
+  -- TaskCreate / TaskUpdate / TaskList は手順表（進み具合の事実。DESIGN-v0.2 §2.2）。
+  -- SendMessage は親経由の修正指示が渡った事実（DESIGN-v0.1.2-steer2 §4.5）
+  { "PostToolUse", "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList|SendMessage" },
   { "PostToolUseFailure", "Agent|AskUserQuestion" },
   { "SubagentStart" },
   -- 記録＋配達（終わろうとした瞬間にも届けるため同期。配達しない設定なら今までの記録だけ）
@@ -47,7 +52,11 @@ M.EVENTS = {
 -- 配達をしないときの同期の要否（Stop は記録の取りこぼし防止で同期のまま。SubagentStop は元の async）
 local SYNC_WITHOUT_STEER = { Stop = true, SessionEnd = true }
 
---- 修正指示の設定（config.steer が無い版でも動くように既定を補う）
+local MODES = { stop = true, deny = true, context = true }
+
+--- 修正指示の設定（config.steer が無い版でも動くように既定を補う）。
+---   mode の既定は "stop"（0.1.2。DESIGN-v0.1.2-steer2 §9.1）。at_stop は 0.1.2 で廃止（常に on）：
+---   mode stop では意味が無く、deny / context では v0.1.1 と同じく --at-stop を付ける
 local function steer_cfg(scfg)
   if scfg == nil then
     local ok, c = pcall(function() return require("agentmap.config").get().steer end)
@@ -57,10 +66,10 @@ local function steer_cfg(scfg)
   if type(scfg) ~= "table" then scfg = {} end
   return {
     enabled = scfg.enabled ~= false,
-    mode = scfg.mode == "context" and "context" or "deny",
-    at_stop = scfg.at_stop ~= false,
+    mode = MODES[scfg.mode] and scfg.mode or "stop",
   }
 end
+M._steer_cfg = steer_cfg
 
 local PAUSE_AUTO, PAUSE_MIN, PAUSE_MAX = 600, 5, 86400
 M.PAUSE_MARGIN = 30 -- 秒。hook の timeout = auto_resume_s + これ（hook の起動と 100 ms の刻みの余裕）
@@ -81,8 +90,9 @@ end
 M._pause_cfg = pause_cfg
 
 --- The events to register for the given steering / pause settings (default: config.get().steer / .pause).
----   The delivery hook (PreToolUse, no matcher) is kept while steer.enabled or pause.enabled;
----   SubagentStop / Stop deliver (and wait) when (steer.enabled and steer.at_stop) or pause.enabled,
+---   The PreToolUse delivery hook (no matcher) is kept while pause.enabled, or while steer.enabled with
+---   mode deny / context (mode stop delivers nothing there, so without pausing it has nothing to do);
+---   SubagentStop / Stop deliver (and wait) when steer.enabled or pause.enabled,
 ---   otherwise they go back to recording only.
 ---@param scfg? table|false
 ---@param pcfg? table|false
@@ -96,12 +106,12 @@ function M.events(scfg, pcfg)
     if not o.steer then
       out[#out + 1] = e
     elseif o.record then
-      if (c.enabled and c.at_stop) or p.enabled then
+      if c.enabled or p.enabled then
         out[#out + 1] = e
       else
         out[#out + 1] = { e[1], e[2], { sync = SYNC_WITHOUT_STEER[e[1]] or nil } }
       end
-    elseif c.enabled or p.enabled then
+    elseif p.enabled or (c.enabled and c.mode ~= "stop") then
       out[#out + 1] = e
     end
   end
@@ -180,15 +190,21 @@ function M.default_cmd(opts)
   return table.concat(words, " ")
 end
 
---- Commands of the steering hooks, built from the recording command.
----   guard: [ -e '<root>/steer.pending' ] || [ -e '<root>/pause.pending' ] || exit 0;
----          exec <record> --steer --mode <mode> --pause --max-wait <s>                   (PreToolUse)
----   stop:  <record> --steer --mode <mode> [--at-stop] --pause --max-wait <s> --record    (SubagentStop / Stop)
----   With pause.enabled = false the pause test and "--pause --max-wait" are left out (the v0.1.1 strings).
+--- Commands of the steering hooks, built from the recording command (DESIGN-v0.1.2-steer2 §8.1).
+---   mode stop (default):
+---     guard: [ -e '<root>/pause.pending' ] || exit 0; exec <record> --steer --mode stop --pause --max-wait <s>
+---     stop:  <record> --steer --mode stop --pause --max-wait <s> --record          (SubagentStop / Stop)
+---   mode deny / context (the v0.1.1 words):
+---     guard: [ -e '<root>/steer.pending' ] || [ -e '<root>/pause.pending' ] || exit 0;
+---            exec <record> --steer --mode <mode> --pause --max-wait <s>
+---     stop:  <record> --steer --mode <mode> --at-stop --pause --max-wait <s> --record
+---   With pause.enabled = false the pause test and "--pause --max-wait" are left out (for deny / context:
+---   the v0.1.1 strings; for stop the guard is "exit 0" alone and M.events() does not register it).
 ---@param opts? { record?: string, root?: string|false, mode?: string, at_stop?: boolean, python?: string[], pause?: table|false }
 ---   record   the recording command (default: default_cmd({ root = opts.root, python = opts.python }))
 ---   root     record root whose steer.pending / pause.pending flags the guard tests (nil or false → config.root())
----   mode / at_stop  default: config.get().steer
+---   mode     "stop" | "deny" | "context" (default: config.get().steer.mode, else "stop")
+---   at_stop  deny / context only: false leaves out --at-stop (default true; ignored for mode stop)
 ---   pause    { enabled, auto_resume_s } (default: config.get().pause)
 ---@return string|nil guard, string|nil stop   nil when no Python was found
 function M.steer_cmd(opts)
@@ -198,15 +214,14 @@ function M.steer_cmd(opts)
     record = M.default_cmd({ root = opts.root, python = opts.python })
     if not record then return nil, nil end
   end
-  local c = steer_cfg(nil)
-  local mode = opts.mode or c.mode
-  local at_stop = c.at_stop
-  if opts.at_stop ~= nil then at_stop = opts.at_stop end
+  local mode = opts.mode
+  if not MODES[mode] then mode = steer_cfg(nil).mode end
+  local at_stop = mode ~= "stop" and opts.at_stop ~= false
   local root = opts.root
   if not root then root = config().root() end
   local p = pause_cfg(opts.pause)
-  local flag = M.quote(slashes(root) .. "/steer.pending")
-  local test = "[ -e " .. flag .. " ] || "
+  -- mode stop は道具の直前に配達しないので steer.pending は見ない（止まれの印だけ）
+  local test = mode == "stop" and "" or ("[ -e " .. M.quote(slashes(root) .. "/steer.pending") .. " ] || ")
   local pause = ""
   if p.enabled then
     test = test .. "[ -e " .. M.quote(slashes(root) .. "/pause.pending") .. " ] || "
@@ -226,7 +241,7 @@ function M.desired(cmd, opts)
   opts = opts or {}
   local c = steer_cfg(opts.steer)
   local p = pause_cfg(opts.pause)
-  local guard, stop = M.steer_cmd({ record = cmd, root = opts.root, mode = c.mode, at_stop = c.at_stop, pause = p })
+  local guard, stop = M.steer_cmd({ record = cmd, root = opts.root, mode = c.mode, pause = p })
   local hooks = J.object()
   for _, e in ipairs(M.events(opts.steer, p)) do
     local o = e[3] or {}
@@ -512,14 +527,26 @@ local function each_ours(hk, fn)
 end
 
 local function features_of(hk)
-  local f = { steer = false, pause = false }
+  local f = { steer = false, pause = false, at_stop = false, sendmessage = false }
   local delivery, with_pause = 0, 0
-  each_ours(hk, function(ev, _matcher, h)
+  each_ours(hk, function(ev, matcher, h)
     local cmd = h.command
+    if ev == "PostToolUse" and type(matcher) == "string" then
+      for w in matcher:gmatch("[^|]+") do
+        if w == "SendMessage" then f.sendmessage = true end
+      end
+    end
     if not cmd:find("%-%-steer") then return end
     f.steer = true
     delivery = delivery + 1
     if cmd:find("%-%-pause") then with_pause = with_pause + 1 end
+    if ev == "SubagentStop" or ev == "Stop" then
+      -- 終わり際の配達の mode（--mode X。無ければ collector の既定 stop）。v0.1.1 の登録は deny
+      local m = cmd:match("%-%-mode[ =]([%a]+)")
+      m = MODES[m] and m or "stop"
+      if not f.mode or (f.mode == "stop" and m ~= "stop") then f.mode = m end
+      if m == "stop" or cmd:find("%-%-at%-stop") then f.at_stop = true end
+    end
     local mw = tonumber(cmd:match("%-%-max%-wait[ =](%d+)"))
     if mw and (not f.max_wait or mw < f.max_wait) then f.max_wait = mw end
     local to = tonumber(h.timeout)
@@ -534,17 +561,21 @@ local function features_of(hk)
   return f
 end
 
---- Feature words of our registered delivery commands (DESIGN-v0.1.2-pause §7.1).
+--- Feature words of our registered delivery commands (DESIGN-v0.1.2-pause §7.1, DESIGN-v0.1.2-steer2 §8.1).
 ---   steer          one of ours carries --steer
 ---   pause          every one of ours that carries --steer also carries --pause
+---   mode           the --mode word of the SubagentStop / Stop delivery commands ("stop" | "deny" | "context";
+---                  "stop" when the word is missing; a non-stop word wins when they differ). nil when none
+---   at_stop        those commands deliver when the agent tries to finish (mode stop or --at-stop)
+---   sendmessage    one of our PostToolUse matchers lists SendMessage (relay confirmation)
 ---   max_wait       the smallest --max-wait N among them (nil when none)
 ---   guard_timeout  the timeout of the PreToolUse delivery hook (0 when it has none; nil when not registered)
 ---   stop_timeout   the smallest timeout of the SubagentStop / Stop delivery hooks (same rules)
 ---@param path? string default: default_path()
----@return table { steer: boolean, pause: boolean, max_wait?: integer, guard_timeout?: number, stop_timeout?: number }
+---@return table { steer: boolean, pause: boolean, at_stop: boolean, sendmessage: boolean, mode?: string, max_wait?: integer, guard_timeout?: number, stop_timeout?: number }
 function M.features(path)
   local hk = read_hooks(path)
-  if not hk then return { steer = false, pause = false } end
+  if not hk then return { steer = false, pause = false, at_stop = false, sendmessage = false } end
   return features_of(hk)
 end
 
@@ -552,8 +583,9 @@ end
 ---   "installed" the (event, matcher) pairs of ours equal those of M.events(), and (pause.enabled only)
 ---               the delivery commands carry --pause with a timeout of at least auto_resume_s + 30
 ---   "outdated"  every event has one of ours, but the (event, matcher) pairs differ from M.events()
----               (e.g. registered by v0.1.0: no TaskCreate matcher and no steering hook), or pausing is on
----               and the delivery commands lack --pause or have a smaller timeout (registered by v0.1.1)
+---               (e.g. registered by v0.1.0: no TaskCreate matcher and no steering hook; by v0.1.1: no
+---               SendMessage), or pausing is on and the delivery commands lack --pause or have a smaller
+---               timeout, or steering is on and the registered --mode differs from steer.mode
 ---   "partial"   some events have ours, some not
 ---   "missing"   none (or no / unreadable file)
 --- Other differences of the command text (paths, quoting) are not compared.
@@ -589,11 +621,15 @@ function M.status(path, scfg, pcfg)
   end
   -- 一時停止：機能語と timeout だけは見る（v0.1.1 の登録は組が同じなので、見ないと黙って止まらない）
   local p = pause_cfg(pcfg)
+  local f = features_of(hk)
   if p.enabled then
-    local f = features_of(hk)
     local need = p.auto_resume_s + M.PAUSE_MARGIN
-    if not f.pause or (f.guard_timeout or 0) < need or (f.stop_timeout or 0) < need then return "outdated" end
+    if not f.pause or (f.stop_timeout or 0) < need then return "outdated" end
+    if f.guard_timeout ~= nil and f.guard_timeout < need then return "outdated" end
   end
+  -- 修正指示：登録の mode が設定と違えば（v0.1.1 の deny の登録など）outdated（DESIGN-v0.1.2-steer2 §8.1）
+  local c = steer_cfg(scfg)
+  if c.enabled and f.steer and f.mode ~= nil and f.mode ~= c.mode then return "outdated" end
   return "installed"
 end
 

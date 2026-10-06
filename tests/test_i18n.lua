@@ -192,12 +192,59 @@ t.eq(holes(en["ui.pause_hit"]), { "label", "time", "via" }, "ui.pause_hit の差
 t.eq(holes(en["detail.pause_waiting"]), { "time", "until", "via" }, "detail.pause_waiting の差し込み口")
 t.matches(en["detail.footer"], "s steer  x pause  Enter", "footer に x pause")
 t.matches(en["keymaps.help_aux_tdwa"], "steer / pause$", "aux の一覧に pause")
-t.matches(en["health.hooks_outdated"], "v0%.1%.2 pauses agents and raises the hook timeout", "古い登録の文を差し替え")
+t.matches(en["health.hooks_outdated"], "v0%.1%.2 pauses agents, delivers steering when an agent finishes, and records SendMessage", "古い登録の文を差し替え（steer2）")
 -- 箱の札は英語のまま（S9）。日本語でも同じ
 i18n.setup("ja")
 t.eq(i18n.t("graph.legend_paused"), "[PAUSED] [GATE]", "ja でも札は英語")
 i18n.setup("en")
 -- 箱の 4 行目に並ぶ札と印は日本語より広くしない（札は英日で同じ。⏸ は言語に依らない）
 t.ok(vim.fn.strdisplaywidth("[PAUSED] ~62.4% 12:34") <= 24, "[PAUSED] ~62.4% 12:34 は内側 24 桁に収まる")
+
+-- ------------------------------------------------------------
+-- 6. v0.1.2 の終わり際の修正指示と親経由（DESIGN-v0.1.2-steer2 付録 A）
+-- ------------------------------------------------------------
+local STEER2_KEYS = {
+  "keymaps.help_steer", "ui.steer_write", "ui.steer_write_resume", "ui.steer_write_gate", "ui.steer_write_root_stop",
+  "ui.steer_relay", "ui.steer_relay_resume", "ui.steer_prompt_stop", "ui.steer_prompt_relay", "ui.steer_prompt_resume",
+  "ui.steer_queued", "ui.steer_queued_eta", "ui.steer_resumed_stop", "ui.steer_queued_root_stop", "ui.steer_relay_sent",
+  "ui.steer_relay_no_terminal", "ui.steer_relayed", "ui.steer_not_relayed", "ui.steer_delivered_stop",
+  "ui.steer_hooks_outdated", "ui.steer_no_terminal_hook",
+  "detail.steer_pending", "detail.steer_pending_next", "detail.steer_relay_sent", "detail.steer_relay_read",
+  "detail.steer_relayed", "detail.steer_relay_as", "detail.steer_relay_line", "detail.steer_reason_not_relayed",
+  "detail.steer_reason_finished", "detail.steer_not_relayed",
+  "export.steer_pending", "export.steer_pending_next", "export.steer_relay_sent", "export.steer_relayed", "export.steer_not_relayed",
+  "health.steer_on", "health.steer_mode_tool_result", "health.steer_at_stop_ignored", "health.steer_outdated",
+  "health.term_ok", "health.term_none", "health.sendmessage_ok", "health.sendmessage_missing", "health.hooks_outdated",
+  "steer.relay_en", "steer.relay_ja", "init.steer_usage",
+}
+local miss2 = {}
+for _, k in ipairs(STEER2_KEYS) do
+  if en[k] == nil or ja[k] == nil then miss2[#miss2 + 1] = k end
+end
+t.eq(miss2, {}, "steer2 付録 A の鍵が en と ja の両方にある")
+-- 親経由の文（§4.2）：先頭の [AgentMap] は固定、差し込み口は 4 つ、どちらの言語でも同じ文
+for _, k in ipairs({ "steer.relay_en", "steer.relay_ja" }) do
+  t.eq(holes(en[k]), { "id", "index", "name", "text" }, k .. " の差し込み口")
+  t.eq(en[k], ja[k], k .. " は全言語で同じ")
+  t.ok(en[k]:sub(1, 11) == "[AgentMap] ", k .. " は [AgentMap] で始まる")
+end
+t.eq(i18n.t("steer.relay_en", { index = 3, name = "probe child", id = "a1b2", text = "write b.txt instead" }),
+  '[AgentMap] Tell sub-agent [3] "probe child" (agent id a1b2) this, with SendMessage: write b.txt instead', "relay_en の全文（E3 の文）")
+t.matches(en["steer.relay_ja"], "SendMessage で次を伝えてください：%%{text}$", "relay_ja")
+-- 「終わる直前に届く」ことを正直に言う（届くまでに作業が進むことがある）
+t.matches(en["ui.steer_queued"], "arrives when the agent tries to finish", "置いたときの通知は終わり際と言う")
+t.matches(ja["ui.steer_queued"], "終わろうとした瞬間に届きます", "日本語も終わり際と言う")
+t.matches(en["detail.steer_pending"], "^PENDING %(arrives when the agent finishes%)$", "詳細の未配達（stop）")
+t.matches(en["detail.steer_pending_next"], "^PENDING %(arrives at its next tool call%)$", "詳細の未配達（deny/context）")
+t.eq(holes(en["detail.steer_relayed"]), { "parent", "time" }, "detail.steer_relayed の差し込み口")
+t.eq(en["init.steer_usage"], ":AgentMapSteer {n|id} [relay] [text]", "使い方に relay")
+-- 箱の印（✎1 / ✎ / ✎!）は変えない。凡例は箱の幅の中で日本語より広くしない
+do
+  local e = i18n.t("graph.legend_steer")
+  i18n.setup("ja")
+  local j = i18n.t("graph.legend_steer")
+  i18n.setup("en")
+  t.ok(vim.fn.strdisplaywidth(e) <= math.max(vim.fn.strdisplaywidth(j), 24), "graph.legend_steer の幅")
+end
 
 t.done()

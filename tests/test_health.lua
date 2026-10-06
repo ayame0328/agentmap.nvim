@@ -49,8 +49,21 @@ t.eq({ c.progress.enabled, c.progress.no_steps, c.progress.default_ms, c.progres
   { true, "time", 600000, 3, true, 1000 }, "progress の既定（手順表が無くても時間で推定）")
 t.eq({ c.animation.enabled, c.animation.frame_ms, c.animation.period, c.animation.tail, c.animation.back_ms, c.animation.max_paths },
   { true, 100, 6, 2, 3000, 40 }, "animation の既定")
-t.eq({ c.steer.enabled, c.steer.mode, c.steer.at_stop, c.steer.root_via, c.steer.no_terminal, c.steer.input },
-  { true, "deny", true, "terminal", "hook", "window" }, "steer の既定")
+t.eq({ c.steer.enabled, c.steer.mode, c.steer.relay, c.steer.root_via, c.steer.no_terminal, c.steer.input },
+  { true, "stop", "menu", "terminal", "stop", "window" }, "steer の既定（0.1.2: mode stop・relay menu・no_terminal stop）")
+t.eq(c.steer.at_stop, nil, "at_stop は既定に無い（0.1.2 で廃止）")
+t.eq(config.steer_at_stop_given(), false, "at_stop を渡していない")
+-- 0.1.2 の正規化（DESIGN-v0.1.2-steer2 §9.1）
+local cs = config.setup({ steer = { at_stop = false, no_terminal = "hook" } }).steer
+t.eq({ cs.at_stop, cs.no_terminal, cs.mode }, { nil, "stop", "stop" }, "at_stop は捨て、no_terminal = hook は stop の別名")
+t.eq(config.steer_at_stop_given(), true, "at_stop を渡したことは覚える（health で知らせる）")
+t.eq(config.setup({ steer = { mode = "deny" } }).steer.mode, "deny", "mode deny は任意で残る")
+t.eq(config.steer_at_stop_given(), false, "setup をやり直せば at_stop の記憶も消える")
+t.eq(config.setup({ steer = { mode = "context", relay = "never", no_terminal = "clipboard" } }).steer,
+  vim.tbl_extend("force", config.defaults.steer, { mode = "context", relay = "never", no_terminal = "clipboard" }), "context・never・clipboard")
+local cb = config.setup({ steer = { mode = "bogus", relay = "sometimes" } }).steer
+t.eq({ cb.mode, cb.relay }, { "stop", "menu" }, "知らない mode / relay は既定に戻す")
+config.setup({})
 local cf = config.setup({ progress = false, animation = false, steer = false })
 t.eq({ cf.progress.enabled, cf.animation.enabled, cf.steer.enabled }, { false, false, false }, "false は { enabled = false }")
 t.eq(cf.progress.no_steps, "time", "false でも他の既定は残る")
@@ -131,19 +144,23 @@ local function run_health()
   vim.health = real_health
   t.ok(okh, "health.check がエラー: " .. tostring(errh))
 end
+local HM0 = require("agentmap.health")
 local store = dir .. "/v2-store"
 vim.fn.mkdir(store, "p")
 vim.env.AGENTMAP_DIR, vim.env.AGENTFLOW_DIR = store, nil
 require("agentmap.stats").reset()
 config.setup({})
 run_health()
-t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.289", "確かめた Claude Code の版")
+t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.291", "確かめた Claude Code の版")
 t.ok(find("warn", "^Progress history: only 0 finished agents; estimates use the default 10:00 until records accumulate$"), "10: 記録が無ければ warn")
 t.ok(find("info", "^Estimate check: not enough samples yet %(0 of 20%)$"), "11: 標本が足りなければ info")
 t.ok(find("warn", "^Animation: low%-color terminal") or find("ok", "^Animation: on %(frame 100 ms, termguicolors o[nf]+%)$"), "12: 光の行")
 t.ok(find("warn", "^Steering settings differ from the registered hook"), "13: 配達の登録が無ければ warn")
 t.ok(find("ok", "^No pending steering instructions$"), "14: 未配達なし")
-t.ok(find("info", "^No :terminal running claude in this Neovim") or find("info", "^Claude terminal: term module missing"), "15: 端末なし")
+t.ok(find("info", "^No :terminal running claude in this Neovim; main%-agent steering goes to its Stop hook, relay is not offered$")
+  or find("info", "^Claude terminal: term module missing"), "15: 端末なし（親への指示は Stop hook、親経由は出さない）")
+t.ok(find("warn", "^SendMessage is not in the PostToolUse matcher: run :AgentMapInstallHooks %(relays cannot be confirmed%)$"),
+  "18: 登録が無ければ SendMessage は warn")
 t.eq(vim.fn.filereadable(store .. "/stats.json"), 0, "health は stats.json を書かない")
 
 -- 記録が 3 件以上・答え合わせの記録 off・光 off・修正指示 off
@@ -171,7 +188,7 @@ if okd and type(desired) == "table" then
   vim.fn.writefile({ vim.json.encode({ hooks = desired }) }, spath)
   config.setup({})
   run_health()
-  t.ok(find("ok", "^Steering: on %(mode deny, at stop on%); sync PreToolUse guard registered$"), "13: 登録が設定どおりなら ok")
+  t.ok(find("ok", "^Steering: on %(mode stop%); hooks registered with the same mode$"), "13: 既定の登録が設定どおりなら ok")
   config.setup({ steer = { mode = "context" } })
   run_health()
   t.ok(find("warn", "^Steering settings differ"), "13: mode が違えば warn")
@@ -189,6 +206,79 @@ vim.fn.writefile({ "{}" }, rdir .. "/steer/a1-1.json")
 vim.fn.writefile({ "{}" }, rdir .. "/steer/a1-0.delivered.json")
 run_health()
 t.ok(find("info", "^1 pending steering instruction%(s%)$"), "14: 未配達 1 件（配達済みは数えない）")
+
+-- 6b. v0.1.2 steer2 の 13・18 行目（DESIGN-v0.1.2-steer2 §9.2）。担当 W2
+--   settings.json は手で作る（hooks.lua の作業中でも試せるように、§3.2 / §8.1 の形そのもの）
+local spath2 = dir .. "/claude/settings.json"
+local function write_steer(mode, o)
+  o = o or {}
+  local base = "'python3' '/x/bin/agentmap-collect' --root '" .. store .. "'"
+  local stop_words = " --steer --mode " .. mode .. ((mode ~= "stop" or o.at_stop) and " --at-stop" or "") .. " --pause --max-wait 600 --record"
+  local test = mode == "stop" and ("[ -e '" .. store .. "/pause.pending' ]")
+    or ("[ -e '" .. store .. "/steer.pending' ] || [ -e '" .. store .. "/pause.pending' ]")
+  local guard = test .. " || exit 0; exec " .. base .. " --steer --mode " .. mode .. " --pause --max-wait 600"
+  local function one(command, to, matcher)
+    return { { matcher = matcher or "", hooks = { { type = "command", command = command, timeout = to } } } }
+  end
+  local hk = {
+    SubagentStop = one(base .. stop_words, 630),
+    Stop = one(base .. stop_words, 630),
+    PostToolUse = one(base, 10, o.matcher or "Agent|Write|TaskList|SendMessage"),
+  }
+  if not o.no_guard then hk.PreToolUse = { { hooks = { { type = "command", command = guard, timeout = 630 } } } } end
+  vim.fn.writefile({ vim.json.encode({ hooks = hk }) }, spath2)
+end
+write_steer("stop")
+config.setup({})
+t.eq(HM0.steer_registration_ok(spath2, config.get().steer), true, "13: mode stop の登録＋既定 → 合格")
+run_health()
+t.ok(find("ok", "^Steering: on %(mode stop%); hooks registered with the same mode$"), "13: ok の行")
+t.ok(not find("info", "^Steering mode"), "13: mode stop では「無視することがある」を出さない")
+t.ok(not find("info", "^steer%.at_stop"), "13: at_stop を渡していなければ出さない")
+t.ok(find("ok", "^SendMessage recorded %(relay confirmation%)$"), "18: matcher に SendMessage → ok")
+write_steer("stop", { no_guard = true })
+t.eq(HM0.steer_registration_ok(spath2, config.get().steer), true, "13: mode stop は門番が無くても合格（pause 無効のとき）")
+config.setup({ steer = { mode = "deny" } })
+write_steer("stop")
+t.eq({ HM0.steer_registration_ok(spath2, config.get().steer) }, { false, "stop" }, "13: 設定 deny・登録 stop → 不合格")
+run_health()
+t.ok(find("warn", "^Steering settings differ from the registered hook %(mode%): run :AgentMapInstallHooks$"), "13: mode 違いは warn")
+t.ok(find("info", "^Steering mode deny: current Claude Code models may ignore instructions delivered as a tool result$"),
+  "13: deny は「無視することがある」")
+write_steer("deny")
+t.eq(HM0.steer_registration_ok(spath2, config.get().steer), true, "13: deny の登録＋設定 deny → 合格")
+write_steer("deny", { no_guard = true })
+t.eq(HM0.steer_registration_ok(spath2, config.get().steer), false, "13: deny は門番が要る")
+config.setup({})
+write_steer("deny") -- v0.1.1 / 0.1.2 作業中の形（--mode deny --at-stop）
+t.eq({ HM0.steer_registration_ok(spath2, config.get().steer) }, { false, "deny" }, "13: 登録 deny・既定 stop → 不合格")
+config.setup({ steer = { mode = "context", at_stop = true } })
+write_steer("context")
+run_health()
+t.ok(find("ok", "^Steering: on %(mode context%)"), "13: context の登録＋設定 context → ok")
+t.ok(find("info", "^Steering mode context: current Claude Code models"), "13: context も「無視することがある」")
+t.ok(find("info", "^steer%.at_stop is ignored since 0%.1%.2 %(always on%)$"), "13: at_stop を渡したら知らせる")
+config.setup({})
+write_steer("stop", { matcher = "Agent|Write|TaskList" })
+t.eq(HM0.sendmessage_recorded(spath2), false, "18: SendMessage が無い matcher")
+write_steer("stop", { matcher = "Agent|SendMessageX" })
+t.eq(HM0.sendmessage_recorded(spath2), false, "18: 名前の一部だけでは数えない")
+run_health()
+t.ok(find("warn", "^SendMessage is not in the PostToolUse matcher"), "18: 無ければ warn")
+config.setup({ steer = false })
+write_steer("stop")
+run_health()
+t.ok(find("info", "^Steering: off"), "13: 無効なら off だけ")
+t.ok(not find("info", "^Steering mode"), "13: 無効なら mode の知らせも無し")
+-- 日本語
+require("agentmap.i18n").setup("ja")
+config.setup({ lang = "ja", steer = { mode = "deny" } })
+run_health()
+t.ok(find("info", "^修正指示の mode deny: 今の Claude Code のモデルは、道具の結果として届く指示を無視することがあります$"), "13: 日本語")
+t.ok(find("ok", "^SendMessage を記録します（親経由の確認用）$"), "18: 日本語")
+require("agentmap.i18n").setup("en")
+config.setup({})
+os.remove(spath2)
 
 -- 7. v0.1.2 の 2 行（DESIGN-v0.1.2-pause §8.2 の 16・17）。担当 W2
 --   settings.json は手で作る（hooks.lua の作業中でも試せるように、§7.1 の形そのもの）

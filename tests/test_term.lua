@@ -16,6 +16,9 @@ t.run("parse / is_claude_cmd", function()
   t.ok(not term.is_claude_cmd("/bin/bash"), "bash は違う")
   t.ok(not term.is_claude_cmd("nvim ~/.claude/settings.json"), "設定フォルダの名前は違う")
   t.eq(term.sanitize("a\nb\r\27[2Jc\td"), "a b [2Jc d", "制御文字は空白に（1 行で送る）")
+  local ja = "[AgentMap] サブエージェント [1]「調査」（agent id a1）に SendMessage で次を伝えてください：v3 を読むこと。\n次に進む"
+  t.eq(term.sanitize(ja), "[AgentMap] サブエージェント [1]「調査」（agent id a1）に SendMessage で次を伝えてください：v3 を読むこと。 次に進む",
+    "日本語の親経由の文は壊さない（改行だけ空白に）")
 end)
 
 -- 2. 本物の :terminal で偽の claude を動かす

@@ -3,14 +3,17 @@
 #  agentmap-collect -- recorder called by Claude Code hooks (part of agentmap.nvim)
 #
 #  Usage   : agentmap-collect [--root DIR | --root=DIR]   (hook payload JSON on stdin)
-#            agentmap-collect --root DIR --steer [--mode deny|context] [--at-stop] [--record]
+#            agentmap-collect --root DIR --steer [--mode stop|deny|context] [--at-stop] [--record]
 #                             [--pause --max-wait SECONDS]
 #  Input   : one hook payload (JSON) on stdin
 #  Output  : one line appended to <root>/projects/<slug>/runs/<session_id>/hooks.jsonl
 #  --steer : deliver pending steering instructions (<run>/steer/<target>-<ms>.json, written by
-#            Neovim) to the agent that is about to use a tool (PreToolUse) or to stop
-#            (SubagentStop / Stop with --at-stop). Prints the hook's JSON answer on stdout only
-#            when something was delivered, and records the delivery as one hooks.jsonl line.
+#            Neovim). --mode stop (the default since 0.1.2): only when the agent tries to finish
+#            (SubagentStop / Stop, decision "block"); PreToolUse then only waits for a pause.
+#            --mode deny / context: also just before the next tool (PreToolUse); at SubagentStop /
+#            Stop only with --at-stop (the v0.1.1 registration) or right after a pause released it.
+#            Prints the hook's JSON answer on stdout only when something was delivered, and records
+#            the delivery as one hooks.jsonl line (DESIGN-v0.1.2-steer2 §3).
 #            Without --record it writes no ordinary record (the recording hook is separate).
 #  --pause : before delivering, wait inside the hook while a pause request
 #            <run>/pause/<target>.json (written by Neovim) exists: PreToolUse (at = "next") and
@@ -68,6 +71,12 @@ STEER_BYTES = 16384      # これより大きい未配達ファイルは読ま�
 STEER_HEAD = ("[AgentMap] Steering instruction from the user, typed in Neovim while you were working "
               "(this is not a tool error):")
 STEER_TAIL = "Follow it from now on, then continue your task. Do not treat this as a test."
+# 終わり際（SubagentStop / Stop の block）で届けるときの文（DESIGN-v0.1.2-steer2 §3.3）。Claude Code はこれを
+# "Stop hook feedback" として user の行に入れる（ツールの結果ではない）ので「tool error ではない」とは書かない
+STEER_HEAD_STOP = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
+                   "It reaches you now, just before you finish:")
+STEER_TAIL_STOP = "Apply it now, continue your task, then finish again."
+STEER_MODES = ("stop", "deny", "context")
 # 子（ROOT 以外）への文の最後に足す 1 文（親にも知らせるため、報告に書いてもらう。DESIGN-v0.2-steer 付録 E）
 STEER_TAIL_CHILD = "Mention this instruction and what you changed because of it in your final report."
 # 一時停止（DESIGN-v0.1.2-pause §3）
@@ -391,6 +400,14 @@ def build(d):
                                         if tr.get(k) is not None}
                 if isinstance(tr.get("summary"), str):
                     rec["tool_response"]["summary"] = head(tr["summary"], 120)
+        elif tool == "SendMessage":
+            # 親経由の修正指示が渡った事実（宛先 to）。本文は先頭 120 文字だけ、tool_response は残さない
+            # （DESIGN-v0.1.2-steer2 §4.5。2.1.291 の payload は to / recipient、message / content の両方を持つ）
+            to = ti.get("to") if isinstance(ti.get("to"), str) and ti.get("to") else ti.get("recipient")
+            rec["tool_input"] = {k: v for k, v in (("to", to if isinstance(to, str) else None),
+                                                   ("head", head(ti.get("message") if isinstance(ti.get("message"), str)
+                                                                 else ti.get("content"), 120)),
+                                                   ("summary", head(ti.get("summary"), 120))) if v is not None}
         elif tool in WRITE_TOOLS:
             rec["target"] = tail(ti.get("file_path") or ti.get("notebook_path"))
         elif tool == "Bash":
@@ -541,12 +558,13 @@ def log_error(root, e, ev):
         pass
 
 
-def steer_message(texts, child=False, paused_ms=None):
+def steer_message(texts, child=False, paused_ms=None, at_stop=False):
     """モデルに渡す文（英語固定。本文だけ作者の言語）。子への文には報告に書く頼みを足す。
-    止まれから解けて届けるときは、止まっていた時間の 1 行を見出しの次に足す"""
+    止まれから解けて届けるときは、止まっていた時間の 1 行を見出しの次に足す。
+    at_stop（SubagentStop / Stop の block）は終わり際用の見出しと結び（DESIGN-v0.1.2-steer2 §3.3）"""
     extra = (PAUSE_LINE % dur_text(paused_ms) + "\n") if paused_ms is not None else ""
-    return (STEER_HEAD + "\n" + extra + "\n\n".join(texts) + "\n" + STEER_TAIL
-            + (" " + STEER_TAIL_CHILD if child else ""))
+    h, t = (STEER_HEAD_STOP, STEER_TAIL_STOP) if at_stop else (STEER_HEAD, STEER_TAIL)
+    return h + "\n" + extra + "\n\n".join(texts) + "\n" + t + (" " + STEER_TAIL_CHILD if child else "")
 
 
 def dur_text(ms):
@@ -840,15 +858,16 @@ def steer(root, d, run, argv):
             log_error(root, e, ev)  # 待ちの中の失敗は止まらない側に倒す
             paused = None
     mode = opt_value(argv, "--mode")
-    if mode not in ("deny", "context"):
-        mode = "deny"
+    if mode not in STEER_MODES:
+        mode = "stop"  # 0.1.2 から既定は終わり際（DESIGN-v0.1.2-steer2 §3.2）
     used = None
     if ev in ("SubagentStop", "Stop"):
-        # 終わりで届けるのは --at-stop のときだけ。ただし止まれから解けた直後は届ける（関門の「直す」）
-        if "--at-stop" in argv or paused:
+        # 終わり際で届ける：mode stop、v0.1.1 の --at-stop、止まれから解けた直後（関門の「直す」）
+        if mode == "stop" or "--at-stop" in argv or paused:
             used = "block"
     elif ev == "PreToolUse":
-        used = mode
+        # mode stop では道具の直前に配達しない（止まれの待ちだけ。解けた直後でも何も出さない）
+        used = mode if mode in ("deny", "context") else None
     target = target_of(d)
     got = []
     if used:
@@ -872,7 +891,7 @@ def steer(root, d, run, argv):
     except Exception as e:
         log_error(root, e, ev)
     msg = steer_message([t for _i, t in got], child=(target != "ROOT"),
-                        paused_ms=paused["waited_ms"] if paused else None)
+                        paused_ms=paused["waited_ms"] if paused else None, at_stop=(used == "block"))
     if used == "block":
         out = {"decision": "block", "reason": msg}
     elif used == "context":

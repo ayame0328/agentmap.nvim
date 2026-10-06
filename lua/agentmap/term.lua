@@ -1,6 +1,7 @@
 -- agentmap/term.lua ... find the Claude Code terminal inside this Neovim and type into it.
---   Used to steer the main agent (ROOT) and to ask it to redo a finished agent
---   (DESIGN-v0.2-steer.md §4). A candidate is a terminal buffer whose name is
+--   Used to steer the main agent (ROOT), to ask it to redo a finished agent
+--   (DESIGN-v0.2-steer.md §4) and to relay an instruction to one of its sub-agents, which it passes
+--   on with SendMessage (DESIGN-v0.1.2-steer2 §4). A candidate is a terminal buffer whose name is
 --   term://<dir>//<pid>:<cmd> (:terminal, snacks.nvim and toggleterm all follow this) and whose
 --   <cmd> contains the word "claude", with a job that is still running.
 --   Claude Code reads text typed while it works at its next tool boundary. A short line with "\r"

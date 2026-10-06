@@ -26,6 +26,8 @@ M.MAP_KEYS = {
   { "z", "keymaps.help_zoom" },
   { "a", "keymaps.help_review" },
   { "s", "keymaps.help_steer" },
+  { "x", "keymaps.help_pause" },
+  { "X", "keymaps.help_gate" },
   { "v", "keymaps.help_mode" },
   { "R", "keymaps.help_runs" },
   { "?", "keymaps.help_help" },
@@ -36,7 +38,7 @@ M.AUX_KEYS = {
   { "BS", "keymaps.help_aux_back" },
   { "q", "keymaps.help_aux_close" },
   { "Enter", "keymaps.help_aux_enter" },
-  { "t / d / w / a / s", "keymaps.help_aux_tdwa" },
+  { "t / d / w / a / s / x", "keymaps.help_aux_tdwa" },
   { "keymaps.key_check_view", "keymaps.help_aux_check" },
 }
 
@@ -56,7 +58,7 @@ function M.help_lines()
   out[#out + 1] = t("keymaps.help_aux_title")
   out[#out + 1] = ""
   for _, k in ipairs(M.AUX_KEYS) do
-    out[#out + 1] = "  " .. pad(k[1], 19) .. t(k[2])
+    out[#out + 1] = "  " .. pad(k[1], 23) .. t(k[2])
   end
   out[#out + 1] = ""
   out[#out + 1] = t("keymaps.help_close")
@@ -133,6 +135,14 @@ function M.attach_map(buf)
     if not id then vim.notify(t("keymaps.no_agent_at_cursor")) return end
     ui().steer_menu(id)
   end, t("keymaps.desc_steer"))
+  -- x：止める／再開（関門で待っている箱だけ「通す／直す」のメニュー）。HUMAN CHECK・まとめ役は pause_toggle が断る
+  map(buf, "x", function()
+    local id = ui().current_id()
+    if not id then vim.notify(t("keymaps.no_agent_at_cursor")) return end
+    ui().pause_toggle(id)
+  end, t("keymaps.desc_pause"))
+  -- X：見ている run の関門の入／切
+  map(buf, "X", function() ui().toggle_gate() end, t("keymaps.desc_gate"))
   map(buf, "z", function()
     local id = ui().current_id()
     if id and id:sub(1, 5) == "gate:" then id = id:sub(6) end
@@ -172,6 +182,11 @@ function M.attach_aux(buf, kind)
     local id = target()
     if id then ui().steer_menu(id) end
   end, t("keymaps.desc_steer"))
+  map(buf, "x", function()
+    -- 確認の画面（HUMAN CHECK）では断る（図と同じ）。id はそのまま渡す
+    local id = ui().current_id()
+    if id then ui().pause_toggle(id) end
+  end, t("keymaps.desc_pause"))
   map(buf, "?", function() ui().help() end, t("keymaps.desc_help"))
   if kind == "detail" or kind == "check" then
     map(buf, "<CR>", function() ui().follow_link() end, t("keymaps.desc_follow"))

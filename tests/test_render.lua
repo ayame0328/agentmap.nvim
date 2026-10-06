@@ -312,5 +312,183 @@ local trow
 for _, l in ipairs(Lt.lines) do if l:find("[2]", 1, true) then trow = l end end
 ok(trow and trow:find(mk .. "1", 1, true) ~= nil, "一覧でも ✎1")
 
+-- 12. 一時停止（DESIGN-v0.1.2-pause §6.3）：札・橙・枠・印・凡例・一覧・止まっていた時間を引いた %
+local pmk = graph.pause_mark()
+-- fixture に止まれが入っていても入っていなくても同じ結果になるよう、毎回作り直す
+local function with_pause(p)
+  local x = fixture()
+  x.pauses, x.pause_order = {}, {}
+  for _, a in pairs(x.agents) do a.pauses, a.pause = nil, nil end
+  if p then
+    p.id = p.id or "a1-1"
+    p.agent_id = p.agent_id or "a1"
+    x.pauses[p.id] = p
+    x.pause_order = { p.id }
+    x.agents[p.agent_id].pauses = { p.id }
+    if p.status == "REQUESTED" or p.status == "PAUSED" then x.agents[p.agent_id].pause = p.id end
+  end
+  return x
+end
+local function hls_on_row(Lx, row)
+  local out = {}
+  for _, m in ipairs(Lx.marks) do if m[1] == row then out[m[4]] = true end end
+  return out
+end
+local Lp = graph.layout(with_pause({ status = "PAUSED", kind = "pause", at = "next", requested_at = iso(NOW - 50),
+  hit_at = iso(NOW - 40), hit_via = "PreToolUse:Read", deadline = iso(NOW + 560) }), { width = 200, now = NOW })
+local p4 = Lp.nodes.a1.lines[4]
+ok(p4:find("[PAUSED] ~", 1, true) == 1, "PAUSED → 札 [PAUSED] と推定 %（実際: " .. p4 .. "）")
+ok(p4:find("%d:%d%d") ~= nil, "[PAUSED] でも経過時間が箱に収まる（実際: " .. p4 .. "）")
+ok(vim.fn.strdisplaywidth(p4) <= 24, "4 行目は内側 24 桁に収まる")
+ok(hls_on_row(Lp, Lp.nodes.a1.y + 4).AgentMapPaused, "[PAUSED] は橙（AgentMapPaused）")
+ok(hls_on_row(Lp, Lp.nodes.a1.y).AgentMapPaused, "止まっている箱は枠も橙")
+ok(not hls_on_row(Lp, Lp.nodes.a1.y).AgentMapRunning, "枠は RUNNING の黄ではない")
+ok(not p4:find(pmk, 1, true), "PAUSED では ⏸ の印は出さない（札で分かる）")
+ok(Lp.nodes.ROOT.lines[4]:find("[RUNNING]", 1, true) == 1, "ほかの箱は今までどおり")
+ok(Lp.lines[2]:find("[PAUSED] [GATE]", 1, true) ~= nil, "凡例に [PAUSED] [GATE]")
+local legend_hl = hls_on_row(Lp, 1)
+ok(legend_hl.AgentMapPaused, "凡例の [PAUSED] [GATE] は橙")
+ok(Lp.lines[2]:find("[WAITING]", 1, true) < Lp.lines[2]:find("[PAUSED]", 1, true), "凡例では [WAITING] の後ろ")
+ok(graph.STATUS_HL.PAUSED == "AgentMapPaused" and graph.STATUS_HL.GATE == "AgentMapPaused", "STATUS_HL.PAUSED / GATE")
+ok(graph.status_tag("PAUSED") == "[PAUSED]" and graph.status_tag("GATE") == "[GATE]", "札は英語のまま")
+
+local Lg = graph.layout(with_pause({ status = "PAUSED", kind = "gate", at = "stop", requested_at = iso(NOW - 50),
+  hit_at = iso(NOW - 10), hit_via = "SubagentStop", deadline = iso(NOW + 590) }), { width = 200, now = NOW })
+ok(Lg.nodes.a1.lines[4]:find("[GATE] ", 1, true) == 1, "関門で止まっている → [GATE]（実際: " .. Lg.nodes.a1.lines[4] .. "）")
+ok(hls_on_row(Lg, Lg.nodes.a1.y).AgentMapPaused, "[GATE] の箱も枠が橙")
+
+local Lr = graph.layout(with_pause({ status = "REQUESTED", kind = "pause", at = "next", requested_at = iso(NOW - 5) }),
+  { width = 200, now = NOW })
+local r4 = Lr.nodes.a1.lines[4]
+ok(r4:find("[RUNNING] " .. pmk, 1, true) == 1, "REQUESTED → 札は [RUNNING] のまま、直後に ⏸（実際: " .. r4 .. "）")
+ok(hls_on_row(Lr, Lr.nodes.a1.y + 4).AgentMapPaused, "⏸ は橙")
+ok(hls_on_row(Lr, Lr.nodes.a1.y).AgentMapRunning, "REQUESTED の枠は黄のまま")
+
+-- 印の順：止まれ → 人の番 → 指示
+local xo = with_pause({ status = "REQUESTED", requested_at = iso(NOW - 5) })
+xo.steers = { ["a1-s"] = { id = "a1-s", agent_id = "a1", status = "PENDING" } }
+xo.steer_order = { "a1-s" }
+xo.agents.a1.steers = { "a1-s" }
+local o4 = graph.layout(xo, { width = 200, now = NOW }).nodes.a1.lines[4]
+local ip, is = o4:find(pmk, 1, true), o4:find(graph.steer_mark() .. "1", 1, true)
+ok(ip and is and ip < is, "⏸ は ✎ の前（実際: " .. o4 .. "）")
+
+-- 再開・取り下げ後は普通に戻る
+for _, st in ipairs({ "RESUMED", "EXPIRED" }) do
+  local Lx = graph.layout(with_pause({ status = st, requested_at = iso(NOW - 50), hit_at = st == "RESUMED" and iso(NOW - 40) or nil,
+    released_at = st == "RESUMED" and iso(NOW - 10) or nil }), { width = 200, now = NOW })
+  local l = Lx.nodes.a1.lines[4]
+  ok(l:find("[RUNNING]", 1, true) == 1 and not l:find(pmk, 1, true), st .. " → [RUNNING]・印なし（実際: " .. l .. "）")
+end
+
+-- 終わる直前で止まっている（記録は先に DONE）→ [GATE]。道具の直前で止まったまま DONE なら DONE
+local xe = with_pause({ status = "PAUSED", kind = "gate", at = "stop", requested_at = iso(NOW - 50), hit_at = iso(NOW - 10),
+  hit_via = "SubagentStop" })
+xe.agents.a1.status, xe.agents.a1.finished_at = "DONE", iso(NOW - 10)
+ok(graph.display_status(xe, "a1") == "GATE", "終わる直前で止まっている DONE の箱は [GATE]")
+xe.pauses["a1-1"].hit_via = "PreToolUse:Read"
+ok(graph.display_status(xe, "a1") == "DONE", "道具の直前の止まれが残ったまま DONE なら DONE")
+-- state.lua の関数が無いときの予備（§13.2）も同じ答えを返す
+do
+  local st = require("agentmap.state")
+  local names = { "pauses_of", "pause_of", "display_status", "paused_ms" }
+  local cases = {
+    with_pause({ status = "PAUSED", kind = "pause", requested_at = iso(NOW - 50), hit_at = iso(NOW - 40), hit_via = "PreToolUse:Read" }),
+    with_pause({ status = "PAUSED", kind = "gate", requested_at = iso(NOW - 50), hit_at = iso(NOW - 40), hit_via = "SubagentStop" }),
+    with_pause({ status = "REQUESTED", requested_at = iso(NOW - 5) }),
+    with_pause({ status = "RESUMED", requested_at = iso(NOW - 55), hit_at = iso(NOW - 50), released_at = iso(NOW - 20) }),
+    with_pause(nil),
+  }
+  local function answers()
+    local out = {}
+    for i, x in ipairs(cases) do
+      local p = graph.pause_of(x, "a1")
+      out[i] = { graph.display_status(x, "a1"), p and p.id or false, graph.paused_ms(x, "a1", NOW), graph.pauses_of(x, "a1") }
+    end
+    return out
+  end
+  local real = answers()
+  local saved_fns = {}
+  for _, n in ipairs(names) do saved_fns[n], st[n] = st[n], nil end
+  local fallback = answers()
+  for _, n in ipairs(names) do st[n] = saved_fns[n] end
+  ok(vim.deep_equal(real, fallback), "予備の計算は state.lua と同じ（実際: " .. vim.inspect({ real, fallback }) .. "）")
+end
+
+-- 一覧（tree）：札は同じ、印は札と印の並びの後ろ
+local Lpt = graph.layout(with_pause({ status = "PAUSED", requested_at = iso(NOW - 50), hit_at = iso(NOW - 40),
+  hit_via = "PreToolUse:Read" }), { width = 200, now = NOW, mode = "tree" })
+local prow
+for _, l in ipairs(Lpt.lines) do if l:find("[1]", 1, true) then prow = l end end
+ok(prow and prow:find("[PAUSED]", 1, true) ~= nil, "一覧でも [PAUSED]")
+local Lrt = graph.layout(with_pause({ status = "REQUESTED", requested_at = iso(NOW - 5) }), { width = 200, now = NOW, mode = "tree" })
+local rrow
+for _, l in ipairs(Lrt.lines) do if l:find("[1]", 1, true) then rrow = l end end
+ok(rrow and rrow:find("[RUNNING]", 1, true) and rrow:find(pmk, 1, true), "一覧でも ⏸（実際: " .. tostring(rrow) .. "）")
+ok(rrow and rrow:find(pmk, 1, true) < rrow:find("既存の Neovim", 1, true), "一覧の ⏸ は薄い task の文の手前")
+
+-- 見出しの ROOT が止まっていれば [PAUSED]
+local Lroot = graph.layout(with_pause({ agent_id = "ROOT", id = "ROOT-1", status = "PAUSED", requested_at = iso(NOW - 50),
+  hit_at = iso(NOW - 40), hit_via = "PreToolUse:Bash" }), { width = 200, now = NOW })
+ok(Lroot.lines[1]:find("[PAUSED]", 1, true) ~= nil, "見出しの ROOT の札も [PAUSED]")
+ok(Lroot.nodes.ROOT.lines[4]:find("[PAUSED]", 1, true) == 1, "ROOT の箱も [PAUSED]")
+
+-- 止まっていた時間は推定の % から引く（時計は NOW に固定。a1 の手順 3 は NOW-60 に始まり、目安は 200 秒）
+local progress = require("agentmap.progress")
+local base = progress.compute(with_pause(nil), "a1", { now = NOW })
+ok(base.cur_elapsed_ms == 60000, "止まれ無し：手順 3 の経過 60 秒（実際: " .. tostring(base.cur_elapsed_ms) .. "）")
+ok(base.pct == 76.6, "止まれ無し：76.6%（実際: " .. tostring(base.pct) .. "）")
+local done30 = progress.compute(with_pause({ status = "RESUMED", requested_at = iso(NOW - 55), hit_at = iso(NOW - 50),
+  released_at = iso(NOW - 20) }), "a1", { now = NOW })
+ok(done30.cur_elapsed_ms == 30000, "30 秒止まって再開 → 経過は 30 秒（実際: " .. tostring(done30.cur_elapsed_ms) .. "）")
+ok(done30.pct == 71.6, "30 秒止まって再開 → 71.6%（実際: " .. tostring(done30.pct) .. "）")
+local still = progress.compute(with_pause({ status = "PAUSED", requested_at = iso(NOW - 45), hit_at = iso(NOW - 40) }), "a1", { now = NOW })
+ok(still.cur_elapsed_ms == 20000 and still.pct == 70.0, "40 秒止まったまま → 経過 20 秒・70.0%（実際: " .. tostring(still.cur_elapsed_ms) .. ", " .. tostring(still.pct) .. "）")
+local later = progress.compute(with_pause({ status = "PAUSED", requested_at = iso(NOW - 45), hit_at = iso(NOW - 40) }), "a1", { now = NOW + 30 })
+ok(later.pct == 70.0, "止まっている間は時計が進んでも % は伸びない（実際: " .. tostring(later.pct) .. "）")
+local before = progress.compute(with_pause({ status = "RESUMED", requested_at = iso(NOW - 300), hit_at = iso(NOW - 200),
+  released_at = iso(NOW - 100) }), "a1", { now = NOW })
+ok(before.cur_elapsed_ms == 60000, "今の手順より前の止まりは引かない（実際: " .. tostring(before.cur_elapsed_ms) .. "）")
+local half = progress.compute(with_pause({ status = "RESUMED", requested_at = iso(NOW - 100), hit_at = iso(NOW - 90),
+  released_at = iso(NOW - 40) }), "a1", { now = NOW })
+ok(half.cur_elapsed_ms == 40000, "手順の開始をまたぐ止まりは、開始後の分（20 秒）だけ引く（実際: " .. tostring(half.cur_elapsed_ms) .. "）")
+-- 手順表の無い箱（時間だけの推定）
+local xt = with_pause({ status = "RESUMED", requested_at = iso(NOW - 130), hit_at = iso(NOW - 120), released_at = iso(NOW - 60) })
+xt.agents.a1.steps, xt.agents.a1.tasks, xt.agents.a1.children = nil, nil, {}
+xt.agents.a1.started_at = iso(NOW - 180)
+for _, c in pairs(xt.agents) do if c.parent_id == "a1" then c.parent_id = "ROOT" end end
+local tp = progress.compute(xt, "a1", { now = NOW })
+ok(tp and tp.basis == "time" and tp.cur_elapsed_ms == 120000, "時間だけの推定も止まった 60 秒を引く（実際: " .. vim.inspect(tp and { tp.basis, tp.cur_elapsed_ms }) .. "）")
+-- 経過時間の表示は壁時計のまま
+ok(graph.util.elapsed_ms(xt.agents.a1, NOW) == 180000, "経過時間の表示は止まっていた時間を引かない")
+-- paused_ms：止まったまま終わった（EXPIRED、解放時刻なし）は数えない、since で切る
+local xm = with_pause({ status = "PAUSED", requested_at = iso(NOW - 45), hit_at = iso(NOW - 40) })
+ok(graph.paused_ms(xm, "a1", NOW) == 40000, "paused_ms：PAUSED は今まで")
+ok(graph.paused_ms(xm, "a1", NOW, NOW - 10) == 10000, "paused_ms：since より後だけ")
+ok(graph.paused_ms(with_pause({ status = "EXPIRED", hit_at = iso(NOW - 40) }), "a1", NOW) == 0, "paused_ms：EXPIRED で解放時刻なし → 0")
+ok(graph.paused_ms(with_pause(nil), "a1", NOW) == 0, "paused_ms：止まれ無し → 0")
+
+-- 所要時間の文
+require("agentmap.i18n").setup("en")
+ok(graph.fmt_duration(45000) == "45 s" and graph.fmt_duration(211000) == "3 min 31 s" and graph.fmt_duration(600000) == "10 min"
+  and graph.fmt_duration(3900000) == "1 h 5 min", "fmt_duration（英語）")
+require("agentmap.i18n").setup("ja")
+ok(graph.fmt_duration(211000) == "3 分 31 秒", "fmt_duration（日本語）")
+require("agentmap.i18n").setup("en")
+
+-- 色の定義（橙。default = true なので利用者の定義が勝つ）
+vim.api.nvim_set_hl(0, "AgentMapPaused", {})
+graph.setup_highlights()
+local ph = vim.api.nvim_get_hl(0, { name = "AgentMapPaused" })
+ok(ph.ctermfg == 208 and ph.fg ~= nil, "AgentMapPaused：暗い背景では ctermfg 208（実際: " .. vim.inspect(ph) .. "）")
+vim.o.background = "light"
+vim.api.nvim_set_hl(0, "AgentMapPaused", {})
+graph.setup_highlights()
+ok(vim.api.nvim_get_hl(0, { name = "AgentMapPaused" }).ctermfg == 166, "明るい背景では濃い橙（ctermfg 166）")
+vim.o.background = "dark"
+vim.api.nvim_set_hl(0, "AgentMapPaused", { fg = "#123456" })
+graph.setup_highlights()
+ok(vim.api.nvim_get_hl(0, { name = "AgentMapPaused" }).fg == 0x123456, "利用者の定義があればそちらが勝つ")
+
 io.write(string.format("test_render: %d ok, %d NG\n", passes, fails))
 os.exit(fails == 0 and 0 or 1)

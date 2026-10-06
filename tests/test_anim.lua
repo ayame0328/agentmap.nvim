@@ -236,4 +236,32 @@ t.run("highlights", function()
   t.ok(anim.low_color() and h.reverse == true and h.bold == true, "低色では bold + reverse")
 end)
 
+-- 5. 一時停止（DESIGN-v0.1.2-pause §6.3）：止まっている箱は光らない、再開で流れ、通して終われば戻る
+t.run("pause", function()
+  local a = anim.plan(nil, { a1 = "PAUSED", a2 = "GATE", a3 = "RUNNING" }, 0, CFG)
+  t.eq({ a.forward, a.wait }, { { "a3" }, {} }, "PAUSED / GATE の線は光らない（前向きも紫も無し）")
+  local b = anim.plan({ a1 = "RUNNING" }, { a1 = "PAUSED" }, 1000, CFG)
+  t.eq({ b.forward, b.back }, { {}, {} }, "RUNNING → PAUSED：止まる。戻りの光も出ない（終わっていない）")
+  local c = anim.plan({ a1 = "PAUSED" }, { a1 = "RUNNING" }, 2000, CFG)
+  t.eq({ c.forward, c.back }, { { "a1" }, {} }, "PAUSED → RUNNING：また流れる。戻りの光は出ない")
+  local d = anim.plan({ a1 = "GATE" }, { a1 = "DONE" }, 3000, CFG)
+  t.eq(d.back, { a1 = 6000 }, "GATE → DONE（関門を通した）：報告が親へ戻る光")
+  local e = anim.plan({ a1 = "PAUSED" }, { a1 = "DONE" }, 0, CFG)
+  t.eq(e.back, { a1 = 3000 }, "PAUSED → DONE でも戻る")
+  t.ok(anim.is_empty(anim.plan(nil, { a1 = "PAUSED", a2 = "GATE" }, 0, CFG)), "止まっている箱だけなら空（タイマーを回さない）")
+  -- 実際のタイマー：止まったら消え、再開したら動く
+  anim.reset()
+  anim.update(buf, layout, { ROOT = "PAUSED", a1 = "RUNNING" })
+  t.ok(anim._running(), "動いている子があれば動く")
+  anim.update(buf, layout, { ROOT = "PAUSED", a1 = "PAUSED" })
+  t.ok(not anim._running(), "全部止まればタイマーも止まる")
+  t.eq(#marks(), 0, "光が消える")
+  anim.update(buf, layout, { ROOT = "PAUSED", a1 = "RUNNING" })
+  t.ok(anim._running(), "再開したら流れ出す")
+  local backs = 0
+  for _, m in ipairs(marks()) do if m[4].hl_group:find("Back") then backs = backs + 1 end end
+  t.eq(backs, 0, "再開で戻りの光は出ない")
+  anim.stop()
+end)
+
 t.done()

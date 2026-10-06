@@ -5,6 +5,7 @@
 #      （2.1.283 の 14 件＋2.1.288 の手順表 TaskCreate/TaskUpdate/TaskList の session 11 件＋修正指示の payload 4 件）
 #    - 手順表（TaskCreate/TaskUpdate/TaskList）は決めた項目だけ残す（description は保存しない）
 #    - --steer：未配達の修正指示を配達する（deny / context / 終わりで block、二重配達しない、記録 1 行）
+#    - --pause：止まれファイルがある間 hook の中で待つ（期限・--max-wait・再開・指示つき再開・SIGTERM・壊れたファイル）
 #    - 保存場所（projects/<slug>/runs/<sid>/hooks.jsonl, project.json）
 #    - 残す項目だけ残っているか（依頼文の全文・permission_mode などが無いこと）
 #    - 空の入力・壊れた入力でも終了コード 0
@@ -446,6 +447,210 @@ put(CH + "-1791100000010.json", "あ" * 5000)
 code, out, err = call(pre_child, "--steer")
 r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
 check(r.count("あ") == 4000, "text cut to 4000 chars; default mode is deny")
+sys.exit(1 if bad else 0)
+PY
+
+# 4h) --pause：止まれファイルがある間 hook の中で待つ（DESIGN-v0.1.2-pause §3.2、§10 の (a)〜(j)）
+python3 - "$COLLECT" "$TMP/pause" "$RAW" <<'PY' || FAIL=1
+import json, sys, os, subprocess, time, threading
+collect, root, raw = sys.argv[1:4]
+bad = []
+def check(c, msg):
+    print(("  ok   " if c else "  FAIL ") + msg)
+    if not c: bad.append(msg)
+pl = [json.loads(l) for l in open(raw, encoding="utf-8") if l.strip()]
+pre_child, pre_root, stop_first, stop_again = [d for d in pl if d["session_id"].startswith("c0ffee20")]
+CH = pre_child["agent_id"]
+slug = os.path.basename(os.path.dirname(pre_child["transcript_path"]))
+run = os.path.join(root, "projects", slug, "runs", pre_child["session_id"])
+pdir, sdir, hp = os.path.join(run, "pause"), os.path.join(run, "steer"), os.path.join(run, "hooks.jsonl")
+PF, SIDE = os.path.join(pdir, CH + ".json"), os.path.join(pdir, CH + ".hit.json")
+ARGS = ["--steer", "--mode", "deny", "--pause"]
+n_pause = [0]
+def put_pause(at="next", kind="pause", auto=600, target=CH, raw_body=None):
+    os.makedirs(pdir, exist_ok=True)
+    n_pause[0] += 1
+    pid = "%s-17912000%05d" % (target, n_pause[0])
+    with open(os.path.join(pdir, target + ".json"), "w", encoding="utf-8") as f:
+        f.write(raw_body if raw_body is not None else json.dumps(
+            {"id": pid, "agent_id": target, "at": at, "kind": kind, "auto_resume_s": auto,
+             "created_at": "2026-10-05T12:00:00.123Z", "by": "nvim", "lang": "en"}))
+    return pid
+def put_steer(text, ms):
+    os.makedirs(sdir, exist_ok=True)
+    sid = "%s-%d" % (CH, ms)
+    with open(os.path.join(sdir, sid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"id": sid, "agent_id": CH, "text": text}, f)
+    return sid
+def start(d, *args):
+    return subprocess.Popen(["python3", collect, "--root", root] + list(args), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def call(d, *args, later=None, timeout=20):
+    p = start(d, *args)
+    if later:
+        threading.Timer(later[0], later[1]).start()
+    t0 = time.time()
+    out, err = p.communicate(json.dumps(d).encode("utf-8"), timeout=timeout)
+    return p.returncode, out.decode("utf-8"), err.decode("utf-8"), time.time() - t0
+def lines():
+    return [json.loads(l) for l in open(hp, encoding="utf-8")] if os.path.isfile(hp) else []
+def pause_lines(since=0):
+    return [l["pause"] for l in lines()[since:] if "pause" in l]
+def rm(p):
+    return lambda: os.path.exists(p) and os.remove(p)
+
+# (a) 止まれ無し → 今までどおり（何も出さない・hit 行無し・run も作らない）
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "5")
+check(code == 0 and out == "" and err == "" and not os.path.exists(run), "(a) no pause file: exit 0, silent, nothing written")
+
+# (b) --max-wait 1・期限は遠い → 約 1 秒で max_wait、ファイルと .hit.json が消える
+pid = put_pause()
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "1")
+ps = pause_lines()
+check(code == 0 and out == "" and err == "", "(b) exit 0, stdout empty")
+check(0.9 <= dt < 2.5, "(b) waited about 1 s (%.2f s)" % dt)
+check([p["phase"] for p in ps] == ["hit", "released"], "(b) one hit line, then one released line")
+check(ps and ps[0] == {"id": pid, "phase": "hit", "kind": "pause", "at": "next", "target": CH, "deadline": ps[0].get("deadline")}
+      and ps[0]["deadline"].endswith("Z"), "(b) hit line: id / kind / at / target / deadline (ISO)")
+check(len(ps) > 1 and ps[1].get("reason") == "max_wait" and 900 <= ps[1].get("waited_ms", 0) < 2500 and "steer_ids" not in ps[1],
+      "(b) released reason = max_wait, waited_ms ~1000, no steer_ids")
+check(not os.path.exists(PF) and not os.path.exists(SIDE), "(b) pause file and .hit.json removed")
+hl = [l for l in lines() if "pause" in l]
+check(hl and hl[0].get("tool_name") == "Write" and hl[0].get("agent_id") == CH and hl[0].get("_src") == "claude_hook"
+      and "tool_input" not in hl[0], "(b) the line carries tool_name / agent_id / _src, no tool_input")
+
+# (c) 0.3 秒後に rm → 0.6 秒以内に抜けて reason = user
+put_pause()
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10", later=(0.3, rm(PF)))
+ps = pause_lines(n0)
+check(out == "" and dt < 0.9 and ps and ps[-1].get("reason") == "user", "(c) removed after 0.3 s: released by user (%.2f s), stdout empty" % dt)
+check(not os.path.exists(SIDE), "(c) .hit.json removed")
+
+# (d) .hit.json の期限が過去 → すぐ auto、止まれファイルは消える、hit 行は書かない
+pid = put_pause()
+with open(SIDE, "w") as f:
+    json.dump({"id": pid, "hit_at": "2026-10-05T12:00:00.000Z", "deadline": int(time.time()) - 5}, f)
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10")
+ps = pause_lines(n0)
+check(dt < 0.8 and [p["phase"] for p in ps] == ["released"] and ps[0]["reason"] == "auto", "(d) past deadline: released at once, reason auto")
+check(not os.path.exists(PF) and not os.path.exists(SIDE), "(d) the hook removed the pause file itself")
+
+# (e) at = stop は PreToolUse では止めない。SubagentStop では止まる
+pid = put_pause(at="stop", kind="gate")
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "5")
+check(out == "" and dt < 0.8 and pause_lines(n0) == [] and os.path.exists(PF), "(e) at=stop: PreToolUse ignores it (no hit line, file kept)")
+code, out, err, dt = call(stop_first, *ARGS, "--max-wait", "5", later=(0.3, rm(PF)))
+ps = pause_lines(n0)
+check(out == "" and [p["phase"] for p in ps] == ["hit", "released"] and ps[0]["kind"] == "gate" and ps[0]["at"] == "stop",
+      "(e) at=stop: SubagentStop waits (gate hit + released), nothing printed")
+check(lines()[-1].get("hook_event_name") == "SubagentStop", "(e) the lines are SubagentStop's")
+
+# (f) .hit.json が既にある（同じ止まれ）→ 2 回目は hit 行を書かず、期限を引き継ぐ
+pid = put_pause()
+dl = int(time.time()) + 1
+with open(SIDE, "w") as f:
+    json.dump({"id": pid, "hit_at": "2026-10-05T12:00:00.000Z", "deadline": dl}, f)
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10")
+ps = pause_lines(n0)
+check([p["phase"] for p in ps] == ["released"] and ps[0]["reason"] == "auto" and dt < 2.2,
+      "(f) existing .hit.json: no second hit line, its deadline is kept (auto after %.2f s)" % dt)
+# 前の止まれの印の残り（id が違う）は作り直して hit を書く
+put_pause()
+with open(SIDE, "w") as f:
+    json.dump({"id": "stale-1", "deadline": int(time.time()) - 100}, f)
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "0.3")
+ps = pause_lines(n0)
+check([p["phase"] for p in ps] == ["hit", "released"] and ps[1]["reason"] == "max_wait", "(f) a stale .hit.json of another pause is replaced (fresh hit)")
+
+# (g) 止まれ＋未配達の指示、0.3 秒後に rm → deny＋止まっていた時間の 1 行、released の steer_ids
+put_pause()
+sid = put_steer("use docs/v3", 1791300000001)
+n0 = len(lines())
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10", later=(0.3, rm(PF)))
+h = (json.loads(out) if out else {}).get("hookSpecificOutput") or {}
+r = h.get("permissionDecisionReason") or ""
+check(h.get("permissionDecision") == "deny", "(g) resumed with an instruction: deny")
+check(r.startswith("[AgentMap] Steering instruction from the user, typed in Neovim while you were working (this is not a tool error):\n"
+                   "(You were paused by the user for 0 s before this instruction.)\nuse docs/v3\n"),
+      "(g) the reason has the paused-for line after the header")
+check(r.endswith("in your final report."), "(g) the fixed tail is unchanged")
+new = lines()[n0:]
+check([("pause" in l and l["pause"]["phase"]) or ("steer" in l and "steer") for l in new] == ["hit", "released", "steer"],
+      "(g) lines: hit, released, steer")
+check(len(new) == 3 and new[1]["pause"].get("steer_ids") == [sid] and new[2]["steer"]["ids"] == [sid], "(g) released.steer_ids = the delivered id")
+# 止まれ無しで配達するとき（今までどおり）は 1 行を足さない
+sid2 = put_steer("plain", 1791300000002)
+code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10")
+r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+check("plain" in r and "You were paused" not in r, "(g) no pause: no paused-for line")
+
+# (h) SubagentStop ＋ --record → 記録 → hit → released の順。--at-stop 無しでも、止まれから解けた指示は block で届く
+put_pause(at="stop", kind="gate")
+sid3 = put_steer("also write c.txt", 1791300000003)
+n0 = len(lines())
+code, out, err, dt = call(stop_first, *ARGS, "--max-wait", "10", "--record", later=(0.3, rm(PF)))
+new = lines()[n0:]
+kinds = [("pause" in l and l["pause"]["phase"]) or ("steer" in l and "steer") or "record" for l in new]
+check(kinds == ["record", "hit", "released", "steer"], "(h) --record: record, hit, released, steer (%s)" % kinds)
+o = json.loads(out) if out else {}
+check(o.get("decision") == "block" and "also write c.txt" in o.get("reason", "") and "You were paused" in o.get("reason", ""),
+      "(h) gate fix without --at-stop: decision block + instruction")
+check(new and new[0].get("last_head") == "b.txt written." and "pause" not in new[0], "(h) the ordinary SubagentStop record is written before waiting")
+# 止まれ無し・--at-stop 無しなら終わりでは届けない（今までどおり）
+sid4 = put_steer("not at stop", 1791300000004)
+code, out, err, dt = call(stop_first, *ARGS, "--max-wait", "10")
+check(out == "" and os.path.exists(os.path.join(sdir, sid4 + ".json")), "(h) no pause, no --at-stop: nothing delivered at the stop")
+os.remove(os.path.join(sdir, sid4 + ".json"))
+
+# (i) 0.3 秒後に SIGTERM → aborted 行、exit 0、何も出さない、プロセスは残らない
+put_pause()
+n0 = len(lines())
+p = start(pre_child, *ARGS, "--max-wait", "10")
+p.stdin.write(json.dumps(pre_child).encode("utf-8")); p.stdin.close()
+time.sleep(0.4)
+p.terminate()
+try:
+    rc = p.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill(); rc = "hung"
+out = p.stdout.read().decode("utf-8")
+ps = pause_lines(n0)
+check(rc == 0 and out == "", "(i) SIGTERM: exit 0, nothing printed")
+check([x["phase"] for x in ps] == ["hit", "aborted"] and ps[1].get("waited_ms", 0) >= 300, "(i) SIGTERM: hit then aborted (waited_ms)")
+check(os.path.exists(PF) and not os.path.exists(SIDE), "(i) pause file kept (Neovim cleans it), .hit.json removed")
+os.remove(PF)
+
+# (j) 4 KB 超・壊れた JSON・id の無いもの → 待たずに普通に進む（未配達の指示はいつもどおり届く）
+for name, body in (("too big", json.dumps({"id": "x", "pad": "x" * 5000})), ("broken JSON", "{nope"), ("no id", '{"at":"next"}')):
+    put_pause(raw_body=body)
+    sid5 = put_steer("after " + name, 1791300000010 + len(name))
+    n0 = len(lines())
+    code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10")
+    r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+    check(code == 0 and dt < 0.8 and pause_lines(n0) == [] and ("after " + name) in r and "You were paused" not in r,
+          "(j) %s pause file: ignored, the instruction is delivered as usual" % name)
+    os.remove(PF)
+log = os.path.join(root, "collector.log")
+check(os.path.isfile(log) and "pause file too big" in open(log).read(), "(j) the reason goes to collector.log")
+
+# ROOT 宛て（agent_id の無い payload）は ROOT.json を見る
+os.makedirs(pdir, exist_ok=True)
+put_pause(target="ROOT")
+n0 = len(lines())
+code, out, err, dt = call(pre_root, *ARGS, "--max-wait", "0.3")
+ps = pause_lines(n0)
+check([x["phase"] for x in ps] == ["hit", "released"] and ps[0]["target"] == "ROOT", "ROOT: payload without agent_id waits on ROOT.json")
+# --pause 無しなら止まれがあっても待たない（v0.1.1 の登録のまま）
+put_pause()
+n0 = len(lines())
+code, out, err, dt = call(pre_child, "--steer", "--mode", "deny")
+check(out == "" and dt < 0.8 and pause_lines(n0) == [], "without --pause: a pause file is ignored (v0.1.1 registration)")
+os.remove(PF)
 sys.exit(1 if bad else 0)
 PY
 

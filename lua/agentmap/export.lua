@@ -746,6 +746,69 @@ end
 ---@param opts? { source?: string, now?: number, stats?: table }  source: record source code ("hooks" / "transcript" / "history");
 ---   now / stats: the moment and the history used for progress (default: os.time() and stats.load())
 ---@return string markdown
+-- 一時停止の時刻欄（ISO 文字列か、hook の期限の通し秒）→ 秒
+local function pause_secs(v)
+  if type(v) == "number" then return v end
+  return parse_iso(v)
+end
+
+local function pause_clock(v)
+  local x = pause_secs(v)
+  return x and os.date("%H:%M:%S", x) or "-"
+end
+
+local PAUSE_REASON = { agent_finished = "detail.pause_reason_finished", session_ended = "detail.pause_reason_session",
+  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit" }
+
+--- One "## Pauses" line (DESIGN-v0.1.2-pause §6.6), e.g.
+--- "- [3] name — 10:21:03 pause → paused 10:21:09 (PreToolUse:Read) → resumed by the user 10:24:40 with instruction #2".
+---@param state table
+---@param s table prepare() result (labels); state is used when nil
+---@param p table a state.pauses entry
+---@param now? number seconds (for a pause still waiting)
+function M.pause_line(state, s, p, now)
+  s = s or state
+  local target = p.agent_id or "ROOT"
+  local ta = s.agents and s.agents[target]
+  local label = target == "ROOT" and "ROOT"
+    or (agent_label(s, target) .. (ta and (" " .. cut(name_of(ta), 30)) or ""))
+  local kind = tr(p.kind == "gate" and "export.pause_kind_gate" or "export.pause_kind_pause")
+  local via = one_line(p.hit_via or "-")
+  local outcome
+  if p.status == "PAUSED" then
+    outcome = tr("export.pause_waiting", { via = via, time = pause_clock(p.hit_at) })
+  elseif p.status == "REQUESTED" then
+    outcome = tr("export.pause_requested")
+  elseif p.status == "RESUMED" then
+    local graph = try("agentmap.graph")
+    local waited = graph and graph.pause_waited_ms(p, now) or p.waited_ms
+    local rt, r = pause_clock(p.released_at), p.release_reason
+    if r == "auto" or r == "max_wait" then
+      outcome = tr("export.pause_resumed_auto", { time = rt,
+        min = graph and graph.fmt_duration(waited) or fmt_elapsed(waited) })
+    elseif r == "nvim_exit" then
+      outcome = tr("export.pause_resumed_exit", { time = rt })
+    elseif r == "gate_off" then
+      outcome = tr("export.pause_resumed_gate_off", { time = rt })
+    elseif r == "aborted" then
+      outcome = tr("export.pause_aborted", { time = rt })
+    elseif p.steer_id then
+      local x = type(state.steers) == "table" and state.steers[p.steer_id] or nil
+      outcome = tr("export.pause_resumed_with", { time = rt, n = (x and x.n) or "?" })
+    else
+      outcome = tr("export.pause_resumed_user", { time = rt })
+    end
+    if p.hit_at then
+      outcome = tr("export.pause_paused", { time = pause_clock(p.hit_at), via = via }) .. " → " .. outcome
+    end
+  else
+    local rk = PAUSE_REASON[p.end_reason]
+    outcome = tr("export.pause_expired", { reason = rk and tr(rk) or one_line(p.end_reason or "-") })
+  end
+  return tr("export.pause_line", { label = label, time = pause_clock(p.requested_at or p.hit_at), kind = kind,
+    outcome = outcome })
+end
+
 function M.to_markdown(state, opts)
   opts = opts or {}
   local stats = opts.stats
@@ -804,6 +867,37 @@ function M.to_markdown(state, opts)
       if all[sid].status == "PENDING" then n_steer_pending = n_steer_pending + 1 end
     end
   end
+  -- 一時停止（DESIGN-v0.1.2-pause §6.6）：出てきた順。待機中 = PAUSED
+  local pause_ids, n_pause_waiting = {}, 0
+  do
+    local all, seen = type(state.pauses) == "table" and state.pauses or {}, {}
+    for _, pid in ipairs(state.pause_order or {}) do
+      if all[pid] and not seen[pid] then
+        seen[pid] = true
+        pause_ids[#pause_ids + 1] = pid
+      end
+    end
+    local rest = {}
+    for pid in pairs(all) do
+      if not seen[pid] then rest[#rest + 1] = pid end
+    end
+    table.sort(rest, function(x, y)
+      local tx, ty = parse_iso(all[x].requested_at) or 0, parse_iso(all[y].requested_at) or 0
+      if tx ~= ty then return tx < ty end
+      return tostring(x) < tostring(y)
+    end)
+    vim.list_extend(pause_ids, rest)
+    for _, pid in ipairs(pause_ids) do
+      if all[pid].status == "PAUSED" then n_pause_waiting = n_pause_waiting + 1 end
+    end
+  end
+  -- 関門：run の記録（gate_set）が無ければ設定の初期値
+  local gate_on = state.gate == true
+  if state.gate == nil then
+    local cfg = try("agentmap.config")
+    local pc = cfg and cfg.get().pause
+    gate_on = type(pc) == "table" and pc.enabled ~= false and pc.gate == true
+  end
   local run_ms
   local st, en = parse_iso(state.started_at), parse_iso(state.ended_at)
   if st then run_ms = ((en or os.time()) - st) * 1000 end
@@ -843,9 +937,11 @@ function M.to_markdown(state, opts)
     { tr("export.ov_reworks"), tostring(reworks) },
     { tr("export.ov_checks"), n_checks_text },
     { tr("export.ov_steers_label"), tr("export.ov_steers", { n = #steer_ids, pending = n_steer_pending }) },
+    { tr("export.ov_pauses_label"), tr("export.ov_pauses", { n = #pause_ids, waiting = n_pause_waiting }) },
     { tr("export.ov_status"), run_status },
     { tr("export.ov_source"), source_text(opts.source or state.source) },
   }
+  if gate_on then table.insert(rows, #rows - 1, { tr("export.ov_gate_label"), tr("export.ov_gate") }) end
   for _, r in ipairs(rows) do w("| " .. r[1] .. " | " .. cell(r[2]) .. " |") end
   w()
 
@@ -996,6 +1092,16 @@ function M.to_markdown(state, opts)
       local plabel = p == "ROOT" and "ROOT" or (agent_label(s, p) .. (pa and (" " .. cut(name_of(pa), 30)) or ""))
       w(tr("export.steer_notice", { parent = plabel, outcome = steer_outcome(nt) }))
     end
+  end
+  w()
+
+  w("## " .. tr("export.h_pauses"))
+  w()
+  if #pause_ids == 0 then
+    w(tr("export.pause_none"))
+  end
+  for _, pid in ipairs(pause_ids) do
+    w(M.pause_line(state, s, state.pauses[pid], opts.now))
   end
   w()
 

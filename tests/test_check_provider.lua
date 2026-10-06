@@ -291,6 +291,46 @@ do
     { "steer_delivered", "akid-1", "akid", "PreToolUse:Write", "tw", "deny", "hook" }, "steer_delivered fields")
   local ss = claude.normalize_hook(rec({ hook_event_name = "SubagentStop", agent_id = "akid", steer = { ids = { "akid-3" }, mode = "block", target = "akid" } }))
   t.eq({ #ss, ss[1].event, ss[1].via }, { 1, "steer_delivered", "SubagentStop" }, "steer line on SubagentStop is not an agent_finished")
+
+  -- 一時停止の 3 種の行（DESIGN-v0.1.2-pause §5.1）：それぞれ 1 件だけ（tool_used / agent_finished を作らない）
+  local ph = claude.normalize_hook(rec({ hook_event_name = "PreToolUse", tool_name = "Read", tool_use_id = "tr", agent_id = "akid",
+    pause = { id = "akid-1791200000123", phase = "hit", kind = "pause", at = "next", target = "akid", deadline = "2026-10-05T12:10:06Z" } }))
+  t.eq(#ph, 1, "pause hit line → one event")
+  t.eq({ ph[1].event, ph[1].pause_id, ph[1].agent_id, ph[1].kind, ph[1].at, ph[1].via, ph[1].tool_use_id, ph[1].deadline, ph[1].prompt_id, ph[1].src },
+    { "pause_hit", "akid-1791200000123", "akid", "pause", "next", "PreToolUse:Read", "tr", "2026-10-05T12:10:06Z", "pv2", "hook" },
+    "pause_hit fields (via = event:tool)")
+  local pr = claude.normalize_hook(rec({ hook_event_name = "SubagentStop", agent_id = "akid",
+    pause = { id = "akid-2", phase = "released", target = "akid", reason = "user", waited_ms = 151034, steer_ids = { "akid-9" } } }))
+  t.eq(#pr, 1, "pause released line on SubagentStop → one event (not agent_finished)")
+  t.eq({ pr[1].event, pr[1].pause_id, pr[1].agent_id, pr[1].reason, pr[1].waited_ms, pr[1].steer_ids },
+    { "pause_released", "akid-2", "akid", "user", 151034, { "akid-9" } }, "pause_released fields")
+  local pa = claude.normalize_hook(rec({ hook_event_name = "Stop",
+    pause = { id = "ROOT-3", phase = "aborted", target = "ROOT", waited_ms = 20000 } }))
+  t.eq({ #pa, pa[1].event, pa[1].pause_id, pa[1].agent_id, pa[1].waited_ms }, { 1, "pause_aborted", "ROOT-3", "ROOT", 20000 },
+    "pause_aborted fields (ROOT)")
+  local pst = claude.normalize_hook(rec({ hook_event_name = "Stop", pause = { id = "ROOT-4", phase = "hit", kind = "pause", at = "next" } }))
+  t.eq({ pst[1].agent_id, pst[1].via }, { "ROOT", "Stop" }, "pause hit on Stop: target falls back to ROOT, via = Stop")
+  t.eq(#claude.normalize_hook(rec({ hook_event_name = "PreToolUse", tool_name = "Read", pause = { phase = "hit" } })), 0,
+    "pause line without id → nothing")
+  t.eq(#claude.normalize_hook(rec({ hook_event_name = "PreToolUse", tool_name = "Read", pause = { id = "x", phase = "odd" } })), 0,
+    "unknown pause phase → nothing")
+  -- 実物（fixtures/hooks_pause.jsonl：collector --pause が書いた行）を流すと pause_* だけになる
+  local fx = io.open(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/fixtures/hooks_pause.jsonl", "rb")
+  if fx then
+    local kinds = {}
+    for line in fx:lines() do
+      if line:match("%S") then
+        local r = vim.json.decode(line)
+        for _, e in ipairs(claude.normalize_hook(r)) do
+          if r.pause then kinds[#kinds + 1] = e.event end
+        end
+      end
+    end
+    fx:close()
+    local only = true
+    for _, k in ipairs(kinds) do if not k:match("^pause_") then only = false end end
+    t.ok(#kinds >= 3 and only, "fixtures/hooks_pause.jsonl: pause lines become pause_* events only (" .. #kinds .. ")")
+  end
 end
 
 t.done()

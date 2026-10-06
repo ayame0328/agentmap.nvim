@@ -443,4 +443,97 @@ t.run("v0.2 detail: progress, steps, steering", function()
   require("agentmap.i18n").setup("en")
 end)
 
+t.run("v0.1.2 detail: pauses", function()
+  -- DESIGN-v0.1.2-pause §6.4：「■ Steering」の後・「■ Human checks」の前、1 件以上あるときだけ
+  local NOW = 1790600000
+  local function iso(sec) return os.date("!%Y-%m-%dT%H:%M:%S.000Z", sec) end
+  local function clk(sec) return os.date("%H:%M:%S", sec) end
+  local graph = require("agentmap.graph")
+  local mk = graph.pause_mark()
+  local function base()
+    local x = fixture()
+    x.pauses, x.pause_order = {}, {}
+    for _, a in pairs(x.agents) do a.pauses, a.pause = nil, nil end
+    x.agents.a1.status, x.agents.a1.finished_at, x.agents.a1.elapsed_ms = "RUNNING", nil, nil
+    return x
+  end
+  local function put(x, list)
+    for i, p in ipairs(list) do
+      p.id, p.agent_id, p.n = "a1-" .. i, p.agent_id or "a1", i
+      x.pauses[p.id] = p
+      x.pause_order[#x.pause_order + 1] = p.id
+      x.agents[p.agent_id].pauses = x.agents[p.agent_id].pauses or {}
+      table.insert(x.agents[p.agent_id].pauses, p.id)
+    end
+    return x
+  end
+  local sp = put(base(), {
+    { kind = "pause", at = "next", status = "RESUMED", requested_at = iso(NOW - 3000), hit_at = iso(NOW - 2994),
+      hit_via = "PreToolUse:Read", released_at = iso(NOW - 2783), release_reason = "user", waited_ms = 211000, steer_id = "a1-s" },
+    { kind = "gate", at = "stop", status = "PAUSED", requested_at = iso(NOW - 100), hit_at = iso(NOW - 96),
+      hit_via = "SubagentStop", deadline = iso(NOW + 504) },
+    { kind = "pause", at = "stop", status = "RESUMED", requested_at = iso(NOW - 2000), hit_at = iso(NOW - 1995),
+      hit_via = "SubagentStop", released_at = iso(NOW - 1395), release_reason = "auto", waited_ms = 600000 },
+    { kind = "pause", at = "next", status = "EXPIRED", requested_at = iso(NOW - 1000), end_reason = "agent_finished" },
+    { kind = "pause", at = "next", status = "REQUESTED", requested_at = iso(NOW - 5) },
+    { kind = "pause", at = "next", status = "RESUMED", requested_at = iso(NOW - 900), hit_at = iso(NOW - 890),
+      hit_via = "PreToolUse:Bash", released_at = iso(NOW - 880), release_reason = "aborted" },
+    { kind = "gate", at = "stop", status = "RESUMED", requested_at = iso(NOW - 800), hit_at = iso(NOW - 790),
+      hit_via = "SubagentStop", released_at = iso(NOW - 760), release_reason = "gate_off" },
+    { kind = "pause", at = "next", status = "RESUMED", requested_at = iso(NOW - 700), hit_at = iso(NOW - 690),
+      hit_via = "PreToolUse:Edit", released_at = iso(NOW - 645), release_reason = "nvim_exit" },
+  })
+  sp.pause_order = { "a1-1", "a1-3", "a1-4", "a1-6", "a1-7", "a1-8", "a1-2", "a1-5" }
+  sp.steers = { ["a1-s"] = { id = "a1-s", agent_id = "a1", text = "use v3", status = "DELIVERED", n = 2,
+    requested_at = iso(NOW - 2790), delivered_at = iso(NOW - 2783), delivered_via = "PreToolUse:Read" } }
+  sp.steer_order = { "a1-s" }
+  sp.agents.a1.steers = { "a1-s" }
+  local d = detail.build(sp, sp.agents.a1, { width = 200, now = NOW })
+  has(d, "■ Pauses (8)", "節の見出しと件数")
+  t.matches(text(d), "\n  " .. vim.pesc(mk) .. " #1 " .. clk(NOW - 3000) .. " requested %(next tool call%) → paused "
+    .. clk(NOW - 2994) .. " at PreToolUse:Read → resumed by you " .. clk(NOW - 2783) .. " with instruction #2 %(3 min 31 s%)\n",
+    "指示つきで再開した行")
+  t.matches(text(d), "\n  " .. vim.pesc(mk) .. " #2 " .. clk(NOW - 100) .. " gate → waiting since " .. clk(NOW - 96)
+    .. " at SubagentStop %(auto%-resume at " .. clk(NOW + 504) .. "%)\n", "関門で待っている行")
+  t.matches(text(d), "#3 " .. clk(NOW - 2000) .. " requested %(when it finishes%) → paused " .. clk(NOW - 1995)
+    .. " at SubagentStop → resumed automatically " .. clk(NOW - 1395) .. " after 10 min\n", "自動で再開した行")
+  t.matches(text(d), "#4 " .. clk(NOW - 1000) .. " requested %(next tool call%) → not reached: the agent finished first\n",
+    "止まる前に終わった行")
+  t.matches(text(d), "#5 " .. clk(NOW - 5) .. " requested %(next tool call%) → not reached yet\n", "まだ止まっていない行")
+  t.matches(text(d), "#6 .* → ended " .. clk(NOW - 880) .. ": the hook was stopped %(10 s%)\n", "hook が止められた行")
+  t.matches(text(d), "#7 .* gate → paused .* → passed " .. clk(NOW - 760) .. " %(gate turned off%) %(30 s%)\n", "関門を切って通した行")
+  t.matches(text(d), "#8 .* → resumed " .. clk(NOW - 645) .. " when Neovim closed %(45 s%)\n", "Neovim 終了で再開した行")
+  -- 順番は要求の順（pause_order に依らず requested_at の順）
+  local r1, r8, r5 = row_of(d, mk .. " #1 "), row_of(d, mk .. " #8 "), row_of(d, mk .. " #5 ")
+  t.ok(r1 and r8 and r5 and r1 < r8 and r8 < r5, "要求の時刻の順")
+  -- 指示つきの行は Enter で指示の本文へ（steer:<id>）
+  t.eq(d.links[r1], "steer:a1-s", "指示つき再開の行に steer:<id>")
+  t.eq(d.links[r5], nil, "ほかの行にはリンクなし")
+  -- 位置：Steering の後、Human checks の前
+  local si, pi = row_of(d, "■ Steering (1)"), row_of(d, "■ Pauses (8)")
+  t.ok(si and pi and si < pi, "Steering の後")
+  local sc = put(base(), { { kind = "pause", at = "next", status = "REQUESTED", requested_at = iso(NOW - 5) } })
+  local dc = detail.build(sc, sc.agents.a2, { width = 160, now = NOW })
+  t.ok(not text(dc):find("■ Pauses", 1, true), "ほかの Agent の止まれは出さない")
+  local ci = row_of(d, "■ Human checks")
+  t.ok(not ci or pi < ci, "Human checks の前")
+  -- 状態の札：止まっていれば [GATE]（a1 は #2 の関門で止まっている）
+  sp.agents.a1.pause = "a1-2"
+  local dg = detail.build(sp, sp.agents.a1, { width = 200, now = NOW })
+  t.matches(dg.lines[1], "%[GATE%]", "見出しの札は [GATE]")
+  t.matches(text(dg), "\n  status   %[GATE%]", "状態の行も [GATE]")
+  -- 0 件なら節を出さない
+  hasnt(detail.build(base(), base().agents.a1, { width = 120, now = NOW }), "■ Pauses", "0 件なら節を出さない")
+  -- footer
+  has(d, "s steer  x pause", "footer に x pause")
+  -- 日本語
+  require("agentmap.i18n").setup("ja")
+  local dj = detail.build(sp, sp.agents.a1, { width = 200, now = NOW })
+  has(dj, "■ 一時停止 (8)", "日本語の見出し")
+  t.matches(text(dj), "#1 " .. clk(NOW - 3000) .. " 止まれ（次の道具の直前） → " .. clk(NOW - 2994)
+    .. " に PreToolUse:Read で停止 → " .. clk(NOW - 2783) .. " に指示 #2 をつけて再開 %(3 分 31 秒%)", "日本語の行")
+  has(dj, "x 一時停止", "日本語の footer")
+  require("agentmap.i18n").setup("en")
+end)
+
 t.done()

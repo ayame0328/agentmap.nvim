@@ -143,7 +143,30 @@ M.STATUS_HL = {
   DONE = "AgentMapDone",
   REWORK = "AgentMapRework",
   FAILED = "AgentMapFailed",
+  -- 一時停止（DESIGN-v0.1.2-pause §6.3）。橙：黄＝動いている・紫＝人の番・赤＝失敗と見分ける
+  PAUSED = "AgentMapPaused",
+  GATE = "AgentMapPaused",
 }
+
+--- Define the highlight groups owned by graph.lua (currently AgentMapPaused, orange).
+--- Uses default = true, so a color scheme or the user's own definition wins.
+--- Called from init.lua's hl() on setup / ColorScheme / background change, and once lazily by layout().
+--- Not linked to DiagnosticWarn: in Neovim's default scheme that group is yellow, the RUNNING color.
+function M.setup_highlights()
+  local light = vim.o.background == "light"
+  pcall(vim.api.nvim_set_hl, 0, "AgentMapPaused", {
+    default = true, bold = true,
+    fg = light and "#bc4c00" or "#f0883e",
+    ctermfg = light and 166 or 208,
+  })
+end
+
+-- 色がまだ定義されていなければ定義する（init.lua の hl() から呼ばれる前に図を描いたときの保険）
+local function ensure_highlights()
+  local ok, got = pcall(vim.api.nvim_get_hl, 0, { name = "AgentMapPaused" })
+  if ok and type(got) == "table" and next(got) == nil then M.setup_highlights() end
+end
+M._ensure_highlights = ensure_highlights
 
 --- Status label such as "[DONE]".
 function M.status_tag(status)
@@ -598,7 +621,7 @@ function M.box_progress(state, id, view)
 end
 
 local function status_segs(state, a, view)
-  local st = a.status or "PENDING"
+  local st = M.display_status(state, a.id) or a.status or "PENDING"
   local segs = { { M.status_tag(st), M.STATUS_HL[st] or "AgentMapPending" } }
   local opts = M.progress_opts(view)
   local label
@@ -630,6 +653,175 @@ function M.check_marks(state, a)
     local c = a.ask_check and state.checks and state.checks[a.ask_check]
     if not (c and c.status == "ANSWERED") then return { { tr("graph.ask"), "AgentMapWaiting" } } end
   end
+  return {}
+end
+
+-- ------------------------------------------------------------
+-- 一時停止（DESIGN-v0.1.2-pause §2・§5.2・§6.3）。state.lua の関数があればそれを優先し、
+-- 無い間は同じ規則をここで計算する（§13.2 の予備）
+-- ------------------------------------------------------------
+local LIVE_PAUSE = { REQUESTED = true, PAUSED = true }
+
+local function state_fn(name)
+  local ok, st = pcall(require, "agentmap.state")
+  if ok and type(st) == "table" and type(st[name]) == "function" then return st[name] end
+  return nil
+end
+
+--- Pause ids aimed at agent `id`, in request order (state.pauses_of when present).
+function M.pauses_of(state, id)
+  local all = state and state.pauses
+  if type(all) ~= "table" then return {} end
+  local f = state_fn("pauses_of")
+  if f then
+    local ok, r = pcall(f, state, id)
+    if ok and type(r) == "table" then
+      return vim.tbl_filter(function(pid) return all[pid] ~= nil end, r)
+    end
+  end
+  local out, seen = {}, {}
+  local a = state.agents and state.agents[id]
+  for _, pid in ipairs(a and a.pauses or {}) do
+    if all[pid] and not seen[pid] then
+      seen[pid] = true
+      out[#out + 1] = pid
+    end
+  end
+  for _, pid in ipairs(state.pause_order or {}) do
+    if all[pid] and all[pid].agent_id == id and not seen[pid] then
+      seen[pid] = true
+      out[#out + 1] = pid
+    end
+  end
+  for pid, x in pairs(all) do
+    if x.agent_id == id and not seen[pid] then
+      seen[pid] = true
+      out[#out + 1] = pid
+    end
+  end
+  table.sort(out, function(x, y)
+    local tx, ty = H.parse_iso(all[x].requested_at or all[x].hit_at), H.parse_iso(all[y].requested_at or all[y].hit_at)
+    if tx and ty and tx ~= ty then return tx < ty end
+    if tx and not ty then return true end
+    if ty and not tx then return false end
+    return tostring(x) < tostring(y)
+  end)
+  return out
+end
+
+--- The live pause (REQUESTED or PAUSED) of agent `id`, or nil (state.pause_of when present).
+function M.pause_of(state, id)
+  local all = state and state.pauses
+  if type(all) ~= "table" then return nil end
+  local f = state_fn("pause_of")
+  if f then
+    local ok, r = pcall(f, state, id)
+    if ok then return r end
+  end
+  local a = state.agents and state.agents[id]
+  local cur = a and a.pause and all[a.pause]
+  if cur and LIVE_PAUSE[cur.status] then return cur end
+  local best
+  for _, pid in ipairs(M.pauses_of(state, id)) do
+    local x = all[pid]
+    if LIVE_PAUSE[x.status] and (not best or best.status ~= "PAUSED") then best = x end
+  end
+  return best
+end
+
+--- Status shown on the box (§2): "GATE" / "PAUSED" while a pause of the agent is PAUSED,
+--- otherwise a.status. a.status itself never changes (progress, elapsed time and the flow light rely on it).
+function M.display_status(state, id)
+  local a = state and state.agents and state.agents[id]
+  local base = a and a.status or "PENDING"
+  if type(state) ~= "table" or type(state.pauses) ~= "table" then return base end
+  local f = state_fn("display_status")
+  if f then
+    local ok, r = pcall(f, state, id)
+    if ok and type(r) == "string" then return r end
+  end
+  local p = M.pause_of(state, id)
+  -- 終わった箱は、終わる直前（SubagentStop / Stop）で止められているときだけ札を変える
+  -- （記録係は終わりの記録を書いてから待つので、止まっている間にもう DONE に見える。state.held_at_end と同じ）
+  local closed = base == "DONE" or base == "FAILED" or base == "REWORK"
+  local at_end = p and (p.hit_via == "SubagentStop" or p.hit_via == "Stop")
+  if p and p.status == "PAUSED" and (not closed or at_end) then return p.kind == "gate" and "GATE" or "PAUSED" end
+  return base
+end
+
+--- Milliseconds agent `id` spent stopped (PAUSED / RESUMED pauses: (released_at or now) - hit_at),
+--- counting only the part after `since` (seconds; nil = all). `now` is in seconds.
+--- Without `since`, state.paused_ms is used when present.
+function M.paused_ms(state, id, now, since)
+  local all = state and state.pauses
+  if type(all) ~= "table" then return 0 end
+  now = now or os.time()
+  if since == nil then
+    local f = state_fn("paused_ms")
+    if f then
+      local ok, r = pcall(f, state, id, now)
+      if ok and type(r) == "number" then return math.max(0, r) end
+    end
+  end
+  local sum = 0
+  for _, pid in ipairs(M.pauses_of(state, id)) do
+    local x = all[pid]
+    local h = M.pause_time(x.hit_at)
+    if h and (x.status == "PAUSED" or x.status == "RESUMED" or x.status == "EXPIRED") then
+      local e = M.pause_time(x.released_at)
+      if not e then
+        -- 止まったまま終わった（EXPIRED）なら終わりの時刻が分からないので数えない。PAUSED は今まで
+        e = x.status == "PAUSED" and now or nil
+      end
+      if e then
+        local s0 = since and math.max(h, since) or h
+        if e > s0 then sum = sum + (e - s0) * 1000 end
+      end
+    end
+  end
+  return sum
+end
+
+--- Readable duration for pause texts: "45 s", "3 min 31 s", "10 min", "1 h 5 min" (localized).
+---@param ms number|nil
+---@return string
+function M.fmt_duration(ms)
+  if type(ms) ~= "number" or ms < 0 then return "-" end
+  local sec = math.floor(ms / 1000 + 0.5)
+  if sec < 60 then return tr("common.dur_s", { s = sec }) end
+  local m, s2 = math.floor(sec / 60), sec % 60
+  if m >= 60 then return tr("common.dur_hm", { h = math.floor(m / 60), m = m % 60 }) end
+  if s2 == 0 then return tr("common.dur_m", { m = m }) end
+  return tr("common.dur_ms", { m = m, s = s2 })
+end
+
+--- Seconds since the epoch for a pause time field: ISO string or epoch number (the hook's deadline). nil if unreadable.
+function M.pause_time(v)
+  if type(v) == "number" then return v end
+  return H.parse_iso(v)
+end
+
+--- Milliseconds pause `p` waited: p.waited_ms, else (released_at or now) - hit_at. nil when it never stopped.
+function M.pause_waited_ms(p, now)
+  if type(p) ~= "table" then return nil end
+  if type(p.waited_ms) == "number" then return p.waited_ms end
+  local h = M.pause_time(p.hit_at)
+  if not h then return nil end
+  local e = M.pause_time(p.released_at) or (p.status == "PAUSED" and (now or os.time())) or nil
+  if not e then return nil end
+  return math.max(0, e - h) * 1000
+end
+
+--- Pause mark for a REQUESTED pause (U+23F8), or "||" where the terminal draws it two cells wide.
+function M.pause_mark()
+  return vim.fn.strdisplaywidth("⏸") == 1 and "⏸" or "||"
+end
+
+--- Orange mark on line 4 of a box while a pause is REQUESTED (not yet reached). PAUSED shows the tag instead.
+function M.pause_marks(state, a)
+  if not a or type(state) ~= "table" or type(state.pauses) ~= "table" then return {} end
+  local p = M.pause_of(state, a.id)
+  if p and p.status == "REQUESTED" then return { { " " .. M.pause_mark(), "AgentMapPaused" } } end
   return {}
 end
 
@@ -812,8 +1004,10 @@ function M.box_spec(node, state, view)
     lines[3] = { { "task: " .. (a.task or a.prompt_head or "-"), "AgentMapDim" } }
   end
   lines[4] = status_segs(state, a, view)
-  -- 人の番の印は状態の札のすぐ後ろに置く（経過時間などで幅が足りなくなっても切れないように）
-  local marks = M.check_marks(state, a)
+  -- 止まれの印 → 人の番の印 → 修正指示の印の順で、状態の札のすぐ後ろに置く
+  -- （経過時間などで幅が足りなくなっても切れないように。DESIGN-v0.1.2-pause §6.3）
+  local marks = M.pause_marks(state, a)
+  vim.list_extend(marks, M.check_marks(state, a))
   -- 修正指示の印は人の番の印の後ろ（DESIGN-v0.2-steer §6.3）
   vim.list_extend(marks, M.steer_marks(state, a, view and view.now))
   for i, s in ipairs(marks) do table.insert(lines[4], 1 + i, s) end
@@ -821,7 +1015,9 @@ function M.box_spec(node, state, view)
     -- 畳んだ数は札と印のすぐ後ろへ（% と経過時間で幅が埋まっても [+n] が切れないように）
     table.insert(lines[4], 2 + #marks, { " [+" .. node.collapsed_count .. "]", "AgentMapIndex" })
   end
-  return lines, M.STATUS_HL[st] or "AgentMapPending", nil
+  -- 枠の色も表示上の状態で（止まっている箱は枠も橙）
+  local dst = M.display_status(state, node.id)
+  return lines, M.STATUS_HL[dst] or M.STATUS_HL[st] or "AgentMapPending", nil
 end
 
 -- segs を表示幅 w に収めて繋げる。{文字, 色, 右寄せ文字} の3つ目があれば右端に置く
@@ -1059,7 +1255,7 @@ end
 
 local function draw_header(cv, state, view, mode)
   local root = M.agent(state, "ROOT")
-  local st = root.status or "PENDING"
+  local st = M.display_status(state, "ROOT") or root.status or "PENDING"
   local now = view.now or os.time()
   local x = cv:put(0, 0, "AgentMap", "AgentMapHeader")
   x = cv:put(x, 0, "  run " .. H.short_id(state.run_id) .. " · " .. short_path(state.cwd) .. " · ")
@@ -1082,6 +1278,7 @@ local function draw_header(cv, state, view, mode)
   local legend = {
     { "[PENDING]", "AgentMapPending" }, { tr("graph.legend_grey") }, { "[RUNNING]", "AgentMapRunning" }, { tr("graph.legend_yellow") },
     { "[WAITING]", "AgentMapWaiting" }, { tr("graph.legend_purple") },
+    { tr("graph.legend_paused"), "AgentMapPaused" }, { tr("graph.legend_orange") },
     { (tr("graph.legend_steer"):gsub("✎", M.steer_mark())), "AgentMapWaiting" }, { " " },
     { "[REVIEW]", "AgentMapReview" }, { tr("graph.legend_blue") },
     { "[DONE]", "AgentMapDone" }, { tr("graph.legend_green") },
@@ -1464,6 +1661,9 @@ local function tree_segs(t, state, view)
   for _, s in ipairs(M.check_marks(state, a)) do segs[#segs + 1] = s end
   for _, s in ipairs(M.steer_marks(state, a, view and view.now)) do segs[#segs + 1] = s end
   if t.collapsed_count then segs[#segs + 1] = { " [+" .. t.collapsed_count .. "]", "AgentMapIndex" } end
+  -- 木の一覧では止まれの印は札と印の並びの最後（DESIGN-v0.1.2-pause §6.3 の「行末」。
+  -- 本当の行末は長い task の後ろで幅に切られて見えなくなるので、薄い task の文の手前に置く）
+  for _, s in ipairs(M.pause_marks(state, a)) do segs[#segs + 1] = s end
   if t.id == "ROOT" and state.title then segs[#segs + 1] = { "   " .. state.title, "AgentMapDim" } end
   if t.id ~= "ROOT" and a.task and a.task ~= a.name then
     segs[#segs + 1] = { "   " .. a.task, "AgentMapDim" }
@@ -1576,6 +1776,7 @@ function M.layout(state, view)
   state.agents = state.agents or {}
   view = view or {}
   local cfg = H.config()
+  ensure_highlights()
   local mode = view.mode or cfg.mode or "auto"
   local width = view.width or 120
   local forest = M.visible(state, view)

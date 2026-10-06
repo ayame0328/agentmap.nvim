@@ -1,6 +1,6 @@
 *agentmap.txt*    Live map of Claude Code agents inside Neovim
 
-Version: 0.1.1
+Version: 0.1.2
 
 Author:  ayame0328
 License: MIT
@@ -21,6 +21,7 @@ CONTENTS                                                    *agentmap-contents*
  10. Records and privacy ...................... |agentmap-privacy|
  11. Progress and the light ................... |agentmap-progress|
  12. Steering ................................. |agentmap-steer|
+ 13. Pausing and the gate ..................... |agentmap-pause|
 
 ==============================================================================
 1. INTRODUCTION                                                *agentmap-intro*
@@ -94,6 +95,23 @@ says "outdated" until then. Run it again after changing `steer.mode` or
         agent {id}). Without {text} the editor window opens. See
         |agentmap-steer|.
 
+:AgentMapPause {n|id} [next|stop]                             *:AgentMapPause*
+        Pause agent number {n} (or ROOT, or the agent {id}). `next` (the
+        default) stops it at its next tool call or when it finishes,
+        whichever comes first; `stop` only when it finishes. On an agent
+        that already has a pause it tells how it stands (a different place
+        replaces a pause that has not stopped the agent yet); it never
+        resumes. A box waiting at the gate gets the Pass / Fix menu.
+        See |agentmap-pause|.
+
+:AgentMapResume {n|id}                                       *:AgentMapResume*
+        Resume a paused agent, withdraw a pause that has not stopped it yet,
+        or let a box waiting at the gate pass.
+
+:AgentMapGate [on|off]                                         *:AgentMapGate*
+        Turn the gate of the run on screen on or off (no argument: toggle).
+        See |agentmap-gate|.
+
 ==============================================================================
 4. KEYS                                                         *agentmap-keys*
 
@@ -110,12 +128,14 @@ Map:
   a          review              e    export          r    reload
   R          past runs           v    map / list      ?    key list
   s          steer (|agentmap-steer|)                 q    close
+  x          pause / resume (gate: Pass / Fix menu, |agentmap-pause|)
+  X          gate of this run on / off (|agentmap-gate|)
 
 Detail, transcript and diff views:
   <BS>       back               q     close
   <CR>       open the agent / parent / HUMAN CHECK on the line; on a
              steering line, show or hide its full text
-  t d w a s  as in the map
+  t d w a s x  as in the map
 
 ==============================================================================
 5. CONFIGURATION                                              *agentmap-config*
@@ -154,11 +174,18 @@ Detail, transcript and diff views:
       input = "window",       -- "window" | "line"
       text_max = 4000,
     },
+    pause = {                 -- false: { enabled = false }
+      enabled = true,         -- false: no pause in the hook command
+      auto_resume_s = 600,    -- seconds until a pause resumes itself
+      gate = false,           -- gate of a run you start watching
+      release_on_exit = false, -- true: closing Neovim resumes all pauses
+      notify = true,          -- notices: paused / at the gate / resumed
+    },
   })
 <
-The full list with defaults is in the README. `steer.mode` and `steer.at_stop`
-are written into the hook command; run |:AgentMapInstallHooks| after changing
-them.
+The full list with defaults is in the README. `steer.mode`, `steer.at_stop`
+and `pause.auto_resume_s` are written into the hook command (the last one
+also into its timeout); run |:AgentMapInstallHooks| after changing them.
 
 ==============================================================================
 6. WRITING CONVENTION                                     *agentmap-convention*
@@ -223,6 +250,9 @@ characters). Full prompts, tool output and file contents are not stored.
 Strings that look like keys or passwords are replaced with `***`.
 Step lists keep up to 60 characters per step (TaskCreate descriptions are not
 stored). Steering instructions are stored as you wrote them (not redacted).
+Pauses are recorded with their times and where the agent stopped; pause
+files hold no text (`<agent>.hit.json` holds the tool name and tool_use_id
+while the agent waits).
 
 ==============================================================================
 11. PROGRESS AND THE LIGHT                                 *agentmap-progress*
@@ -303,5 +333,58 @@ outdated (`s` on a running agent: run |:AgentMapInstallHooks| first; the
 terminal route is not affected) or when the run has ended (`s` on the main
 agent or a finished agent would reach another conversation's terminal in the
 same folder; give new instructions in Claude Code itself).
+
+==============================================================================
+13. PAUSING AND THE GATE                                      *agentmap-pause*
+
+`x` on a running box (or |:AgentMapPause|) pauses that agent; `x` again
+resumes it. Nothing is cancelled: the agent stops at its next tool call or
+when it tries to finish, whichever comes first, and waits there. ROOT can be
+paused too. Only that agent stops; other sub-agents go on.
+
+The synchronous hooks that deliver steering (PreToolUse, SubagentStop, Stop)
+find the pause file `<run>/pause/<agent>.json` and wait inside Claude Code,
+checking it every 100 ms, until Neovim removes it. Resumed without an
+instruction, the agent sees nothing (the held tool call just runs). `s` on a
+paused box resumes it with the instruction on the spot, through that hook
+(ROOT included): the agent gets the usual steering text with one more line,
+`(You were paused by the user for 2 min 31 s before this instruction.)`.
+
+The box shows [PAUSED] (orange, `AgentMapPaused`) while the agent waits and
+` ⏸` (`||` where it is drawn wide) while the pause waits to be reached; the
+light on its line stops. Claude Code shows `running PreToolUse hooks...` in
+its spinner for a paused main agent and nothing for a paused sub-agent.
+
+A pause left alone resumes by itself after `pause.auto_resume_s` (600 s).
+The hook keeps the deadline by the wall clock, so it holds when Neovim is
+closed or the computer sleeps. Claude Code stops a hook after its `timeout`
+(600 s when none is set) and then runs the tool silently, so the delivery
+hooks are registered with `auto_resume_s + 30` (630 s). Run
+|:AgentMapInstallHooks| after upgrading to 0.1.2: with the old registration
+`x` and `X` refuse, while recording and steering keep working.
+
+Esc in Claude Code interrupts the main agent's turn only; a pause on ROOT
+stays placed and stops it again at its next tool call. Closing Neovim does
+nothing by default (`pause.release_on_exit = true` resumes every pause of the
+run on screen). When Claude Code exits, the waiting hook ends and the pause
+is recorded as ended.
+
+Cost: nothing paused, 1-2 ms per tool call as before; while any pause file
+exists (always while a gate is on), about 15-20 ms per tool call. Files:
+`<run>/pause/<agent>.json` (0600), `<agent>.hit.json` (written by the hook),
+`<run>/pause/GATE`, and the flag `<root>/pause.pending`.
+
+                                                               *agentmap-gate*
+`X` (or |:AgentMapGate|) turns the gate of the run on screen on or off
+(`pause.gate` is the value for runs you start watching; the state is kept in
+the run's folder). While it is on, every running sub-agent (not ROOT) waits
+when it tries to finish; the box shows [GATE] and its report can already be
+read with <CR>. `x` on it offers:
+  Pass            let it finish; the parent gets the report
+  Fix             write an instruction; the agent continues and waits again
+                  at its next end (Claude Code allows 8 stops in a row)
+  Keep waiting    show the report
+Left alone it passes after 10 minutes. Turning the gate off lets every
+waiting agent pass.
 
  vim:tw=78:ts=8:ft=help:norl:

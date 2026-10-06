@@ -13,6 +13,8 @@
 --    poll_steps(run)    … 動いている Agent の transcript から手順表（## Steps）を読み足す（DESIGN-v0.2 §2.1）
 --    request_steer / mark_steer_sent / cancel_steer / sweep_steers
 --                       … 修正指示（steer）の未配達ファイルと記録（DESIGN-v0.2-steer §5.3）
+--    request_pause / resume_pause / sweep_pauses / set_gate / gate_on / sync_gate / release_all
+--                       … 一時停止（pause）の止まれファイルと関門（gate）の記録（DESIGN-v0.1.2-pause §5.3）
 -- ============================================================
 local config = require("agentmap.config")
 local util = require("agentmap.util")
@@ -136,7 +138,12 @@ function M.poll(run)
   if hoff > 0 then run.source = "hooks" elseif eoff > 0 and run.source == "empty" then run.source = "transcript" end
   save(run)
   -- 宛先が終わった未配達の修正指示を片付ける（記録が増えたときだけ。sweep の中の emit から戻ってきたときは呼ばない）
-  if #new > 0 and not run._sweeping then pcall(M.sweep_steers, run) end
+  if #new > 0 and not run._sweeping then
+    pcall(M.sweep_steers, run)
+    -- 一時停止：宛先が終わった止まれの掃除と、関門が入っている run の新しい子への止まれ（DESIGN-v0.1.2-pause §4・§5.3）
+    pcall(M.sweep_pauses, run)
+    pcall(M.sync_gate, run)
+  end
   return #new > 0
 end
 
@@ -609,6 +616,296 @@ function M.sweep_steers(run, now)
   end
   run._steer_pending = pending
   return changed
+end
+
+-- ---------- 一時停止（pause。DESIGN-v0.1.2-pause §3.1・§5.3）----------
+--   <run>/pause/<agent_id|ROOT>.json      … 止まれ（Neovim が書く 0600。消す＝再開。hook は期限で自分で消す）
+--   <run>/pause/<agent_id|ROOT>.hit.json  … 止まった印（hook が作って消す。Neovim は掃除のときだけ消す）
+--   <run>/pause/GATE                      … この run の関門が入っている印（hook は見ない）
+--   <root>/pause.pending                  … どこかに止まれがある印（門番が見る）
+
+local PAUSE_STALE_EXTRA = 3600 -- 秒。REQUESTED のまま auto_resume_s + これを過ぎた止まれは取り残しとして消す
+M.PAUSE_STALE_EXTRA = PAUSE_STALE_EXTRA
+local PAUSE_HIT_SLACK = 1 -- 秒。hit と終わりの記録の時刻のずれ（同じ hook が「記録 → 待つ」の順に書く）
+local CLOSED_STATUS = { DONE = true, REWORK = true, FAILED = true }
+
+local function pause_dir(run) return run.dir .. "/pause" end
+local function pause_file(run, target) return pause_dir(run) .. "/" .. target .. ".json" end
+local function hit_file(run, target) return pause_dir(run) .. "/" .. target .. ".hit.json" end
+local function pause_flag_path(run) return root_of(run) .. "/pause.pending" end
+
+--- 一時停止の設定（config.pause が無い版でも動くように）
+local function pause_cfg()
+  local c = config.get().pause
+  if c == false then return { enabled = false, auto_resume_s = 600, gate = false } end
+  c = type(c) == "table" and c or {}
+  local auto = math.floor(tonumber(c.auto_resume_s) or 600)
+  return { enabled = c.enabled ~= false, auto_resume_s = math.min(math.max(auto, 5), 86400), gate = c.gate == true }
+end
+
+--- 止まれファイルの名前（<target>.json。.hit.json・.tmp.* は含まない）か
+local function is_pause_name(name)
+  return name:match("^[%w_%-]+%.json$") ~= nil
+end
+
+--- 止まれファイルが取り残しか（中身の auto_resume_s + 1 時間より古い）
+local function pause_file_stale(f, now)
+  local st = uv.fs_stat(f)
+  if not st then return false end
+  local body = util.json_decode(util.read_file(f) or "") or {}
+  local auto = tonumber(type(body) == "table" and body.auto_resume_s) or 600
+  return now - st.mtime.sec > auto + PAUSE_STALE_EXTRA
+end
+
+--- どの run にも止まれファイルが無ければ <root>/pause.pending を消す（GATE と .hit.json は数えない）。消したら true
+local function sweep_pause_flag(run, now)
+  local p = pause_flag_path(run)
+  if not uv.fs_stat(p) then return false end
+  now = now or os.time()
+  local live = false
+  for _, f in ipairs(vim.fn.glob(root_of(run) .. "/projects/*/runs/*/pause/*.json", false, true)) do
+    if is_pause_name(util.basename(f)) then
+      if pause_file_stale(f, now) then
+        os.remove(f)
+      else
+        live = true
+      end
+    end
+  end
+  if live then return false end
+  os.remove(p)
+  return true
+end
+M._sweep_pause_flag = sweep_pause_flag
+
+local function touch_pause_flag(run)
+  local p = pause_flag_path(run)
+  if uv.fs_stat(p) then return true end
+  local fd = uv.fs_open(p, "a", 384)
+  if not fd then return false end
+  uv.fs_close(fd)
+  return true
+end
+
+--- 止まれを置ける宛先か。だめなら理由の符号
+local function pause_target_error(s, agent_id)
+  if type(agent_id) ~= "string" or not agent_id:match("^[%w_%-]+$") or agent_id == "UNKNOWN_PARENT" then
+    return "bad_target"
+  end
+  local a = s.agents[agent_id]
+  if not a or a.kind == "workflow" or a.placeholder then return "bad_target" end
+  if s.ended_at then return "ended" end
+  if agent_id ~= "ROOT" and CLOSED_STATUS[a.status] then return "finished" end
+  return nil
+end
+
+--- Put a pause request for an agent (or ROOT).
+---   Writes <run>/pause/<agent_id>.json (0600), touches <root>/pause.pending and records pause_requested.
+---@param run table
+---@param agent_id string "ROOT" or an agent id
+---@param opts? { at?: "next"|"stop", kind?: "pause"|"gate", prompt_id?: string }
+---@return string|nil pause_id, string|nil err  err: "no_run" | "bad_target" | "exists" | "finished" | "ended" | write error
+function M.request_pause(run, agent_id, opts)
+  opts = opts or {}
+  if not run or not run.dir or not run.state then return nil, "no_run" end
+  local s = run.state
+  local e = pause_target_error(s, agent_id)
+  if e then return nil, e end
+  if state_mod.pause_of(s, agent_id) or uv.fs_stat(pause_file(run, agent_id)) then return nil, "exists" end
+  local pc = pause_cfg()
+  local at = opts.at == "stop" and "stop" or "next"
+  local kind = opts.kind == "gate" and "gate" or "pause"
+  local id = agent_id .. "-" .. tostring(new_ms())
+  local body = util.json_encode({ id = id, agent_id = agent_id, at = at, kind = kind, auto_resume_s = pc.auto_resume_s,
+    created_at = util.iso_now(), by = "nvim", lang = config.get().lang })
+  local ok, err = write_private(pause_file(run, agent_id), body or "")
+  if not ok then return nil, tostring(err) end
+  touch_pause_flag(run)
+  run._pause_live = nil -- 次の sweep_pauses で印の掃除をやり直す（0 件に戻ったときに消すため）
+  local a = s.agents[agent_id]
+  M.emit(run, {
+    event = "pause_requested", pause_id = id, agent_id = agent_id, at = at, kind = kind,
+    auto_resume_s = pc.auto_resume_s,
+    prompt_id = opts.prompt_id or (agent_id ~= "ROOT" and a and a.prompt_id) or state_mod.latest_flow_id(s),
+  })
+  return id
+end
+
+--- 止まれファイルと止まった印を消す（無くてもよい）
+local function remove_pause_files(run, target)
+  os.remove(pause_file(run, target))
+  os.remove(hit_file(run, target))
+end
+
+--- 止まらないまま終わった・取り下げた（pause_expired）
+local function expire_pause(run, p, reason)
+  remove_pause_files(run, p.agent_id)
+  M.emit(run, { event = "pause_expired", pause_id = p.id, agent_id = p.agent_id, reason = reason })
+end
+
+--- Resume a paused agent (or withdraw a pause that has not stopped it yet): removes its files and records
+--- pause_resumed. The hook notices within ~0.1 s; a pending instruction (put before this call) is delivered then.
+---@param opts? { reason?: "user"|"nvim_exit"|"gate_off", steer_id?: string }
+---@return boolean ok, string|nil err  err: "no_run" | "none" (no live pause)
+function M.resume_pause(run, agent_id, opts)
+  opts = opts or {}
+  if not run or not run.dir or not run.state then return false, "no_run" end
+  local p = state_mod.pause_of(run.state, agent_id)
+  if not p then return false, "none" end
+  remove_pause_files(run, agent_id) -- 無ければ hook がもう消した。それでも記録する
+  M.emit(run, { event = "pause_resumed", pause_id = p.id, agent_id = agent_id, reason = opts.reason or "user",
+    steer_id = opts.steer_id })
+  pcall(sweep_pause_flag, run)
+  return true
+end
+
+--- 生きている止まれを片付ける理由（符号）か nil
+local function pause_expire_reason(run, p, now)
+  local s = run.state
+  if s.ended_at then return "session_ended" end
+  if p.status == "REQUESTED" then
+    local t0 = util.parse_iso(p.requested_at)
+    if t0 and now - t0 > (tonumber(p.auto_resume_s) or 600) + PAUSE_STALE_EXTRA then return "stale" end
+  end
+  -- ROOT は流れが終わっても次の番で止まる（Esc で番が終わった等。DESIGN-v0.1.2-pause §9）ので、セッションの終わりまで残す
+  if p.agent_id == "ROOT" then return nil end
+  local a = s.agents[p.agent_id]
+  if not (a and CLOSED_STATUS[a.status]) then return nil end
+  local fin = util.parse_iso(a.finished_at)
+  if fin and now - fin < STEER_EXPIRE_GRACE then return nil end
+  if p.status == "PAUSED" and state_mod.held_at_end(p) then
+    -- 終わりで止まっている：終わりの記録は hit の前に書かれるので、その終わりは hook がまだ握っている
+    local hit = util.parse_iso(p.hit_at)
+    if not fin or not hit or fin <= hit + PAUSE_HIT_SLACK then return nil end
+  end
+  return "agent_finished"
+end
+
+--- Expire live pauses whose target finished (or whose session ended, or REQUESTED for longer than
+--- auto_resume_s + 1 h): removes the files and records pause_expired. Also removes <root>/pause.pending when
+--- no pause file is left anywhere.
+---@param now? number epoch seconds
+---@return boolean changed
+function M.sweep_pauses(run, now)
+  if not run or not run.state or not run.dir then return false end
+  local s = run.state
+  now = now or os.time()
+  local changed = false
+  local was = run._sweeping
+  run._sweeping = true
+  local ok, err = pcall(function()
+    for _, pid in ipairs(vim.deepcopy(s.pause_order or {})) do
+      local p = s.pauses[pid]
+      if p and (p.status == "REQUESTED" or p.status == "PAUSED") then
+        local reason = pause_expire_reason(run, p, now)
+        if reason then
+          expire_pause(run, p, reason)
+          changed = true
+        end
+      end
+    end
+  end)
+  run._sweeping = was
+  if not ok then error(err) end
+  local c = s.counts or {}
+  local live = (c.paused or 0) + (c.pause_requested or 0)
+  if changed or (live == 0 and (run._pause_live == nil or run._pause_live > 0)) then
+    pcall(sweep_pause_flag, run, now)
+  end
+  run._pause_live = live
+  return changed
+end
+
+--- Whether the gate is on for this run: the last gate_set, else config pause.gate.
+---@return boolean
+function M.gate_on(run)
+  local s = run and run.state
+  if not s then return false end
+  if s.gate ~= nil then return s.gate == true end
+  return pause_cfg().gate
+end
+
+--- While the gate is on, put an at = "stop", kind = "gate" pause on every RUNNING sub-agent that has no live
+--- pause (not ROOT, not a workflow box). Returns how many were put.
+---@return integer
+function M.sync_gate(run)
+  if not run or not run.state or not run.dir then return 0 end
+  local s = run.state
+  if s.ended_at or not pause_cfg().enabled or not M.gate_on(run) then return 0 end
+  local n = 0
+  local was = run._sweeping
+  run._sweeping = true
+  local ok, err = pcall(function()
+    for _, id in ipairs(vim.deepcopy(s.order)) do
+      local a = s.agents[id]
+      if a and id ~= "ROOT" and a.kind ~= "workflow" and not a.placeholder and a.status == "RUNNING"
+          and not state_mod.pause_of(s, id) then
+        if M.request_pause(run, id, { at = "stop", kind = "gate" }) then n = n + 1 end
+      end
+    end
+  end)
+  run._sweeping = was
+  if not ok then error(err) end
+  return n
+end
+
+--- Turn the gate of this run on or off: writes / removes <run>/pause/GATE and records gate_set.
+---   on: puts gate pauses (sync_gate). off: withdraws REQUESTED gate pauses (pause_expired gate_off) and lets
+---   PAUSED ones finish (resume_pause, reason gate_off).
+---@return boolean ok
+function M.set_gate(run, on)
+  if not run or not run.dir or not run.state then return false end
+  on = on and true or false
+  local g = pause_dir(run) .. "/GATE"
+  if on then
+    vim.fn.mkdir(pause_dir(run), "p")
+    local fd = uv.fs_open(g, "a", 384)
+    if fd then uv.fs_close(fd) end
+  else
+    os.remove(g)
+  end
+  M.emit(run, { event = "gate_set", on = on })
+  if on then
+    M.sync_gate(run)
+  else
+    local s = run.state
+    for _, pid in ipairs(vim.deepcopy(s.pause_order or {})) do
+      local p = s.pauses[pid]
+      if p and p.kind == "gate" then
+        if p.status == "REQUESTED" then
+          expire_pause(run, p, "gate_off")
+        elseif p.status == "PAUSED" then
+          M.resume_pause(run, p.agent_id, { reason = "gate_off" })
+        end
+      end
+    end
+    pcall(sweep_pause_flag, run)
+  end
+  return true
+end
+
+--- Release every live pause of the run (from VimLeavePre): PAUSED ones and REQUESTED pauses are resumed /
+--- withdrawn with `reason`; REQUESTED gate pauses are expired with the same reason. Returns how many.
+---@param reason? string default "nvim_exit"
+---@return integer
+function M.release_all(run, reason)
+  if not run or not run.state or not run.dir then return 0 end
+  reason = reason or "nvim_exit"
+  local s = run.state
+  local n = 0
+  for _, pid in ipairs(vim.deepcopy(s.pause_order or {})) do
+    local p = s.pauses[pid]
+    if p and (p.status == "REQUESTED" or p.status == "PAUSED") then
+      if p.status == "REQUESTED" and p.kind == "gate" then
+        expire_pause(run, p, reason)
+        n = n + 1
+      elseif M.resume_pause(run, p.agent_id, { reason = reason }) then
+        n = n + 1
+      end
+    end
+  end
+  pcall(sweep_pause_flag, run)
+  return n
 end
 
 --- Look up the git branch of an agent asynchronously and record it.

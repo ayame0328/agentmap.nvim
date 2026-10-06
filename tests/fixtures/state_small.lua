@@ -1,9 +1,11 @@
--- テスト用の小さな state（DESIGN §4 の形そのまま。SV 9 の欄を含む）
+-- テスト用の小さな state（DESIGN §4 の形そのまま。SV 10 の欄を含む）
 --   ROOT → [1] 調査（RUNNING。子 [3] は DONE）、[2] 実装（レビューで RETRY → 差し戻し中）
 --   進み具合の事実（DESIGN-v0.2 §6 (b) と同じ値）:
 --     [1] の手順表（## Steps）3 項目のうち 2 済み、3 つ目は 2026-09-28T12:52:20Z（= 試験の NOW 1790600000 の 60 秒前）に開始
 --     ROOT の手順表（TaskCreate）2 項目のうち 1 済み、2 つ目が in_progress
 --   修正指示：[2] に配達済み 1 件（ずっと前）と取り消し 1 件。箱の印は出ない（配達から 60 秒超・取り消し）
+--   一時停止（DESIGN-v0.1.2-pause §5.2）：ROOT に再開済み 1 件（04:24:00 に止まり 04:24:20 に指示なしで再開 = 20 秒）。
+--     PAUSED の例は各試験が s.pauses に直接書く（[1] を止めると、[1] を RUNNING として数える既存の試験の値が変わるため）
 --   transcript_path はテスト側で差し替える（fixtures/transcript_small.jsonl）
 return {
   v = 1,
@@ -16,7 +18,17 @@ return {
   next_index = 4,
   spawn_requests = {},
   counts = { agents = 3, done = 1, running = 1, review = 0, rework = 1, failed = 0, pending = 0, unknown_parent = 0,
-    steers = 2, steers_pending = 0 },
+    steers = 2, steers_pending = 0, pauses = 1, paused = 0, pause_requested = 0 },
+  pauses = {
+    ["ROOT-1790569400000"] = {
+      id = "ROOT-1790569400000", agent_id = "ROOT", kind = "pause", at = "next", status = "RESUMED",
+      prompt_id = "c0ffee02-0000-4000-8000-000000000002", n = 1, auto_resume_s = 600,
+      requested_at = "2026-09-28T04:23:55.000Z", hit_at = "2026-09-28T04:24:00.000Z", hit_via = "PreToolUse:Agent",
+      tool_use_id = "toolu_small0002", deadline = "2026-09-28T04:34:00Z",
+      released_at = "2026-09-28T04:24:20.000Z", release_reason = "user", waited_ms = 20000,
+    },
+  },
+  pause_order = { "ROOT-1790569400000" },
   steers = {
     ["a2-1790570000000"] = {
       id = "a2-1790570000000", agent_id = "a2", text = "テストも書くこと", via = "hook", kind = "steer",
@@ -39,6 +51,7 @@ return {
       attempts = { { n = 1, started_at = "2026-09-28T04:23:38.000Z" } }, attempt = 1,
       review_count = 0, rework_count = 0, started_at = "2026-09-28T04:23:38.000Z",
       cwd = "/tmp/agentmap-test/probe/work", tools = {}, tool_counts = {}, files = {},
+      pauses = { "ROOT-1790569400000" },
       tasks = {
         order = { "1", "2" },
         items = {

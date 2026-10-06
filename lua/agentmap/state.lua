@@ -10,13 +10,14 @@
 --  進み具合の事実は手順表だけ（a.tasks = TaskCreate/TaskUpdate/TaskList、a.steps = "## Steps" の目印）。
 --  % の数字は state に保存しない（progress.lua が毎回計算する。progress_facts がその材料）。
 --  修正指示（steer）は s.steers に持つ（DESIGN-v0.2-steer §5.2）。
+--  一時停止（pause）は s.pauses に持つ（DESIGN-v0.1.2-pause §5.2）。a.status は変えず、表示だけ display_status。
 -- ============================================================
 local util = require("agentmap.util")
 local brief = require("agentmap.brief")
 
 local M = {}
 
-M.SV = 9 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示が増えた
+M.SV = 10 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示、10 で一時停止が増えた
 
 M.STATUSES = { "PENDING", "RUNNING", "REVIEW", "DONE", "REWORK", "FAILED" }
 -- HUMAN CHECK（AskUserQuestion）の状態。Agent の状態とは別の箱で持つ（Agent の STATUSES は変えない）
@@ -24,6 +25,9 @@ M.STATUSES = { "PENDING", "RUNNING", "REVIEW", "DONE", "REWORK", "FAILED" }
 M.CHECK_STATUSES = { "WAITING", "ANSWERED", "ABANDONED" }
 -- 修正指示（steer）の状態。PENDING = 未配達 / DELIVERED = 配達した（端末へ送った）/ CANCELLED = 取り消した / EXPIRED = 届かないまま終わった
 M.STEER_STATUSES = { "PENDING", "DELIVERED", "CANCELLED", "EXPIRED" }
+-- 一時停止（pause）の状態。REQUESTED = 止まれを置いた / PAUSED = hook が止めて待っている / RESUMED = 抜けた /
+-- EXPIRED = 止まらないまま宛先が終わった・取り下げた
+M.PAUSE_STATUSES = { "REQUESTED", "PAUSED", "RESUMED", "EXPIRED" }
 -- 端末へ送る修正指示の先頭の印（固定。DESIGN-v0.2-steer §4.2）。この印で始まる指示は新しい流れを作らない
 M.STEER_PREFIX = "[AgentMap] "
 local LINK_GRACE = 1.0 -- 子の終了と質問の時刻の比べに許すずれ（秒）。hooks の到着順のずれ（ACTIVITY_GRACE と同じ考え）
@@ -1025,6 +1029,101 @@ function H.steer_expired(s, ev)
   st.end_reason = ev.reason
 end
 
+-- ---------- 一時停止（pause。DESIGN-v0.1.2-pause §5.2）----------
+--   宛先の箱の a.pauses（一覧）と a.pause（生きている 1 件）は recount が s.pauses から作り直す
+
+local function get_pause(s, id)
+  s.pauses = s.pauses or {}
+  s.pause_order = s.pause_order or {}
+  local p = s.pauses[id]
+  if not p then
+    p = { id = id, status = "REQUESTED" }
+    s.pauses[id] = p
+    s.pause_order[#s.pause_order + 1] = id
+  end
+  return p
+end
+
+local LIVE_PAUSE = { REQUESTED = true, PAUSED = true }
+-- hook が自分で決めた再開の理由（Neovim の理由より事実として強い）
+local HOOK_OWN_REASON = { auto = true, max_wait = true, aborted = true }
+
+local function pause_common(s, p, ev)
+  for _, k in ipairs({ "agent_id", "kind", "at" }) do fill(p, k, ev[k]) end
+  if p.prompt_id == nil and ev.prompt_id then p.prompt_id = resolve_pid(s, ev.prompt_id) end
+end
+
+function H.pause_requested(s, ev)
+  if not ev.pause_id then return end
+  local p = get_pause(s, ev.pause_id)
+  pause_common(s, p, ev)
+  fill(p, "requested_at", ev.ts)
+  fill(p, "auto_resume_s", tonumber(ev.auto_resume_s))
+end
+
+function H.pause_hit(s, ev)
+  if not ev.pause_id then return end
+  local p = get_pause(s, ev.pause_id)
+  pause_common(s, p, ev)
+  if p.status == "REQUESTED" then p.status = "PAUSED" end
+  fill(p, "hit_at", ev.ts)
+  fill(p, "hit_via", ev.via)
+  fill(p, "tool_use_id", ev.tool_use_id)
+  fill(p, "deadline", ev.deadline)
+end
+
+--- 抜けた（hook の released / aborted、Neovim の resumed）。EXPIRED にも勝つ
+local function release(s, p, ev, reason, from_hook)
+  p.status = "RESUMED"
+  p.end_reason = nil
+  fill(p, "released_at", ev.ts)
+  if from_hook then
+    -- hook が自分で消した（期限・上限・SIGTERM）ならその理由。ファイルが消えた（user）なら Neovim の理由を残す
+    if HOOK_OWN_REASON[reason] or not p.release_reason or not p._nvim_reason then p.release_reason = reason end
+    p._hook = true
+    if ev.waited_ms then p.waited_ms = tonumber(ev.waited_ms) end
+  else
+    p._nvim_reason = true
+    if not p._hook or not HOOK_OWN_REASON[p.release_reason] then p.release_reason = reason end
+  end
+end
+
+function H.pause_released(s, ev)
+  if not ev.pause_id then return end
+  local p = get_pause(s, ev.pause_id)
+  pause_common(s, p, ev)
+  release(s, p, ev, ev.reason or "user", true)
+  if type(ev.steer_ids) == "table" and type(ev.steer_ids[1]) == "string" then fill(p, "steer_id", ev.steer_ids[1]) end
+end
+
+function H.pause_resumed(s, ev)
+  if not ev.pause_id then return end
+  local p = get_pause(s, ev.pause_id)
+  pause_common(s, p, ev)
+  release(s, p, ev, ev.reason or "user", false)
+  if type(ev.steer_id) == "string" then p.steer_id = ev.steer_id end
+end
+
+function H.pause_aborted(s, ev)
+  if not ev.pause_id then return end
+  local p = get_pause(s, ev.pause_id)
+  pause_common(s, p, ev)
+  if p._hook and p.status == "RESUMED" then return end -- もう抜けた記録がある
+  release(s, p, ev, "aborted", true)
+end
+
+function H.pause_expired(s, ev)
+  local p = ev.pause_id and s.pauses and s.pauses[ev.pause_id]
+  if not p or not LIVE_PAUSE[p.status] then return end
+  p.status = "EXPIRED"
+  p.ended_at = ev.ts
+  p.end_reason = ev.reason
+end
+
+function H.gate_set(s, ev)
+  s.gate = ev.on == true
+end
+
 -- ---------- HUMAN CHECK（AskUserQuestion）----------
 
 function H.check_asked(s, ev)
@@ -1213,6 +1312,41 @@ local function recount(s)
       return x.i < y.i
     end)
     for n, x in ipairs(g) do x.st.n = n end
+  end
+  -- 一時停止：総数・止まっている数・置いただけの数、宛先の箱の一覧と生きている 1 件、流れの中での通し番号 n
+  c.pauses, c.paused, c.pause_requested = 0, 0, 0
+  for _, id in ipairs(s.order) do
+    local a = s.agents[id]
+    if a then a.pauses, a.pause = nil, nil end
+  end
+  local pgroups, porder = {}, {}
+  for i, pid in ipairs(s.pause_order or {}) do
+    local p = s.pauses and s.pauses[pid]
+    if p then
+      c.pauses = c.pauses + 1
+      if p.status == "PAUSED" then c.paused = c.paused + 1 end
+      if p.status == "REQUESTED" then c.pause_requested = c.pause_requested + 1 end
+      local owner = p.owner_id or p.agent_id
+      local a = owner and s.agents[owner]
+      if a then
+        a.pauses = a.pauses or {}
+        a.pauses[#a.pauses + 1] = pid
+        if LIVE_PAUSE[p.status] and owner == p.agent_id then a.pause = pid end
+      end
+      local key = p.prompt_id or ""
+      if not pgroups[key] then pgroups[key] = {}; porder[#porder + 1] = key end
+      local g = pgroups[key]
+      g[#g + 1] = { p = p, t = secs(p.requested_at or p.hit_at), i = i }
+    end
+  end
+  for _, key in ipairs(porder) do
+    local g = pgroups[key]
+    table.sort(g, function(x, y)
+      if x.t and y.t and x.t ~= y.t then return x.t < y.t end
+      if (x.t == nil) ~= (y.t == nil) then return x.t ~= nil end
+      return x.i < y.i
+    end)
+    for n, x in ipairs(g) do x.p.n = n end
   end
   -- Workflow のまとめ役：状態と時刻は中の Agent から決める
   for _, w in ipairs(wfs) do
@@ -1416,6 +1550,19 @@ function M.flow_view(s, flow_id)
   for _, id in ipairs(members) do
     local list = flow_steers(id)
     v.agents[id].steers = #list > 0 and list or nil
+  end
+  -- 一時停止：修正指示と同じ（宛先が流れの外なら ROOT に付けた写し。生きている 1 件は宛先そのものの箱だけ）
+  v.pauses, v.pause_order = {}, {}
+  for _, pid in ipairs(s.pause_order or {}) do
+    local p = s.pauses and s.pauses[pid]
+    if p and (p.prompt_id == nil or resolve_pid(s, p.prompt_id) == flow_id) then
+      local pc = {}
+      for k, val in pairs(p) do pc[k] = val end
+      local target = pc.agent_id
+      pc.owner_id = (target == "ROOT" or is_member[target]) and target or "ROOT"
+      v.pauses[pid] = pc
+      v.pause_order[#v.pause_order + 1] = pid
+    end
   end
   local r = copy(s.agents.ROOT)
   r.checks = flow_checks("ROOT")
@@ -1723,6 +1870,93 @@ end
 --- Steering instruction by id, or nil.
 function M.steer_of(s, sid)
   return s and s.steers and s.steers[sid] or nil
+end
+
+--- Pause ids of a box (Agent or ROOT), in the order requested.
+---@return string[]
+function M.pauses_of(s, id)
+  local out = {}
+  if not s or type(s.pauses) ~= "table" then return out end
+  local pos = {}
+  for i, pid in ipairs(s.pause_order or {}) do
+    local p = s.pauses[pid]
+    if p and (p.owner_id or p.agent_id) == id then
+      out[#out + 1] = pid
+      pos[pid] = i
+    end
+  end
+  table.sort(out, function(x, y)
+    local px, py = s.pauses[x], s.pauses[y]
+    local tx, ty = secs(px.requested_at or px.hit_at), secs(py.requested_at or py.hit_at)
+    if tx and ty and tx ~= ty then return tx < ty end
+    if (tx == nil) ~= (ty == nil) then return tx ~= nil end
+    return pos[x] < pos[y]
+  end)
+  return out
+end
+
+--- The live pause (REQUESTED or PAUSED) of an agent, or nil.
+---@return table|nil
+function M.pause_of(s, id)
+  if not s or type(s.pauses) ~= "table" then return nil end
+  local a = s.agents and s.agents[id]
+  local p = a and a.pause and s.pauses[a.pause]
+  if p and LIVE_PAUSE[p.status] then return p end
+  for i = #(s.pause_order or {}), 1, -1 do
+    local q = s.pauses[s.pause_order[i]]
+    if q and q.agent_id == id and LIVE_PAUSE[q.status] then return q end
+  end
+  return nil
+end
+
+--- Pause by id, or nil.
+function M.pause_by_id(s, pid)
+  return s and s.pauses and s.pauses[pid] or nil
+end
+
+--- True when a PAUSED pause was hit at the end of its agent (SubagentStop / Stop). The collector writes the
+--- ordinary stop record before it waits, so the agent already looks DONE while the hook still holds its end.
+---@return boolean
+function M.held_at_end(p)
+  local via = p and p.hit_via
+  return p ~= nil and p.status == "PAUSED" and (via == "SubagentStop" or via == "Stop")
+end
+
+--- Status shown on a box: "GATE" / "PAUSED" while a hook holds the agent (kind gate / pause), else a.status.
+--- a.status itself is not changed (progress, elapsed time and the light keep working). A pause held at the
+--- end shows even though the stop record already made the agent DONE.
+---@return string|nil
+function M.display_status(s, id)
+  local a = s and s.agents and s.agents[id]
+  if not a then return nil end
+  local p = M.pause_of(s, id)
+  if p and p.status == "PAUSED" and (not CLOSED[a.status] or M.held_at_end(p)) then
+    return p.kind == "gate" and "GATE" or "PAUSED"
+  end
+  return a.status
+end
+
+--- Milliseconds an agent spent paused: the sum of (released_at or now) - hit_at over its PAUSED / RESUMED
+--- pauses (waited_ms when there is no hit time). For subtracting from the time-based progress estimate.
+---@param now? number epoch seconds (default os.time())
+---@return integer
+function M.paused_ms(s, id, now)
+  if not s or type(s.pauses) ~= "table" then return 0 end
+  now = now or os.time()
+  local total = 0
+  for _, pid in ipairs(s.pause_order or {}) do
+    local p = s.pauses[pid]
+    if p and p.agent_id == id and (p.status == "PAUSED" or p.status == "RESUMED") then
+      local h = secs(p.hit_at)
+      if h then
+        local r = p.status == "PAUSED" and now or (secs(p.released_at) or now)
+        total = total + math.max(0, r - h) * 1000
+      elseif p.waited_ms then
+        total = total + math.max(0, tonumber(p.waited_ms) or 0)
+      end
+    end
+  end
+  return math.floor(total + 0.5)
 end
 
 --- HUMAN CHECK by id, or nil.

@@ -114,14 +114,29 @@ local function children(s, id)
   return {}
 end
 
-local function elapsed_since(iso, now)
+-- 止まっていた時間（ms）。DESIGN-v0.1.2-pause §6.3：止まっている間に推定の % が伸びないように、
+-- 経過時間から引く。since（秒）があれば、その時刻より後の分だけ
+local function paused_ms(s, id, now, since)
+  local ok, graph = pcall(require, "agentmap.graph")
+  if not ok or type(graph.paused_ms) ~= "function" then return 0 end
+  local ok2, r = pcall(graph.paused_ms, s, id, now, since)
+  if ok2 and type(r) == "number" then return r end
+  return 0
+end
+M._paused_ms = paused_ms
+
+-- iso から now までの ms。止まっていた時間（その間の分だけ）を引く
+local function elapsed_since(iso, now, s, id)
   local t = ts(iso)
   if not t then return nil end
-  return math.max(0, now - t) * 1000
+  local el = math.max(0, now - t) * 1000
+  if s and id then el = math.max(0, el - paused_ms(s, id, now, t)) end
+  return el
 end
 
 --- Progress of agent `id` (DESIGN-v0.2 §2.3; appendix D: boxes without a step list are
---- estimated from elapsed time when config.progress.no_steps == "time"). A parent without a step
+--- estimated from elapsed time when config.progress.no_steps == "time"). Time spent paused
+--- (DESIGN-v0.1.2-pause §6.3) is taken out of the elapsed time used for estimates. A parent without a step
 --- list shows the plain average of its children: finished = 100, not yet started (PENDING) = 0.
 ---@param state table
 ---@param id string
@@ -182,7 +197,7 @@ function M.compute(state, id, opts)
     r.expected_ms, r.stat_basis, r.samples = d, sb, ns
     r.cur_started_at = facts.cur and facts.cur.started_at or nil
     r.cur_text = facts.cur and facts.cur.text or nil
-    local el = r.cur_started_at and elapsed_since(r.cur_started_at, now) or nil
+    local el = r.cur_started_at and elapsed_since(r.cur_started_at, now, state, id) or nil
     r.cur_elapsed_ms = el
     if kid_n > 0 then
       r.f = math.min(0.99, kid_sum / kid_n / 100)
@@ -233,7 +248,7 @@ function M.compute(state, id, opts)
   end
 
   if cfg.no_steps ~= "time" then return nil end
-  local el = elapsed_since(a.started_at, now)
+  local el = elapsed_since(a.started_at, now, state, id)
   if not el then return nil end
   local stats = require("agentmap.stats")
   local T, sb, ns = stats.expected_ms(opts.stats, atype, model, cfg)

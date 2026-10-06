@@ -370,7 +370,7 @@ do
     listed_at = "2026-10-04T09:00:30.000Z", items = { { n = 1, text = "root step" } } } }))
   ok(state.flow_view(s, P1).agents.ROOT.steps ~= nil, "flow_view: ROOT steps listed in flow 1 shown in flow 1")
   eq(state.flow_view(s, P2).agents.ROOT.steps, nil, "flow_view: … and not in flow 2")
-  eq(state.SV, 9, "SV = 9")
+  eq(state.SV, 10, "SV = 10")
 end
 
 -- ---------- 11) 修正指示（steer。DESIGN-v0.2-steer §5.2） ----------
@@ -507,6 +507,151 @@ do
   eq(state.flow_of(s, P1).ended_at, nil, "blocked Stop → flow not ended")
   feed(H("Stop", "00:40", { last_head = "root end" }))
   eq(state.flow_of(s, P1).ended_at, "2026-10-04T11:00:40.000Z", "second Stop → flow ended")
+end
+
+-- ---------- 13) 一時停止（pause。DESIGN-v0.1.2-pause §5.2） ----------
+print("[13] pauses")
+do
+  local function eq(a, b, msg)
+    local same = vim.deep_equal(a, b)
+    ok(same, msg .. (same and "" or ("  (got " .. vim.inspect(a) .. ", want " .. vim.inspect(b) .. ")")))
+  end
+  local P1 = "p2200000-0000-4000-8000-000000000001"
+  local P2 = "p2200000-0000-4000-8000-000000000002"
+  local A, B = "afeed130000000001", "afeed130000000002"
+  local function H(ev, ts, f)
+    local r = { session_id = "r13", hook_event_name = ev, prompt_id = P1, _ts = "2026-10-05T12:" .. ts .. ".000Z" }
+    for k, v in pairs(f or {}) do r[k] = v end
+    return r
+  end
+  local function U(event, ts, f)
+    local e = { v = 1, event = event, ts = "2026-10-05T12:" .. ts .. ".000Z", run_id = "r13", src = "user" }
+    for k, v in pairs(f or {}) do e[k] = v end
+    return e
+  end
+  local s = state.new("r13")
+  local function feed(rec) for _, e in ipairs(claude.normalize_hook(rec)) do state.apply(s, e) end end
+  feed(H("UserPromptSubmit", "00:00", { prompt_head = "go" }))
+  feed(H("PreToolUse", "00:01", { tool_name = "Agent", tool_use_id = "tA", tool_input = { description = "a" } }))
+  feed(H("SubagentStart", "00:02", { agent_id = A, agent_type = "general-purpose" }))
+  feed(H("PreToolUse", "00:03", { tool_name = "Agent", tool_use_id = "tB", tool_input = { description = "b" } }))
+  feed(H("SubagentStart", "00:04", { agent_id = B, agent_type = "general-purpose" }))
+  eq(state.display_status(s, A), "RUNNING", "no pause: display_status = a.status")
+  eq(state.paused_ms(s, A), 0, "no pause: paused_ms = 0")
+
+  -- REQUESTED → PAUSED → RESUMED（指示つき）
+  state.apply(s, U("pause_requested", "01:00", { pause_id = A .. "-1", agent_id = A, at = "next", kind = "pause", auto_resume_s = 600, prompt_id = P1 }))
+  local p = s.pauses[A .. "-1"]
+  eq(p and p.status, "REQUESTED", "pause_requested → REQUESTED")
+  eq(s.agents[A].pause, A .. "-1", "a.pause = the live pause")
+  eq(s.agents[A].pauses and s.agents[A].pauses[1], A .. "-1", "a.pauses has the id")
+  eq(s.counts.pauses .. "/" .. s.counts.paused .. "/" .. s.counts.pause_requested, "1/0/1", "counts: pauses / paused / pause_requested")
+  eq(state.display_status(s, A), "RUNNING", "REQUESTED: still RUNNING on the box")
+  eq(state.pause_of(s, A) and state.pause_of(s, A).id, A .. "-1", "pause_of: the REQUESTED pause")
+  feed(H("PreToolUse", "01:06", { agent_id = A, tool_name = "Read", tool_use_id = "tr1",
+    pause = { id = A .. "-1", phase = "hit", kind = "pause", at = "next", target = A, deadline = "2026-10-05T12:11:06Z" } }))
+  eq(p.status, "PAUSED", "pause_hit → PAUSED")
+  eq({ p.hit_at, p.hit_via, p.tool_use_id, p.deadline }, { "2026-10-05T12:01:06.000Z", "PreToolUse:Read", "tr1", "2026-10-05T12:11:06Z" },
+    "hit_at / hit_via / tool_use_id / deadline")
+  eq(s.agents[A].status, "RUNNING", "a.status is not changed")
+  eq(state.display_status(s, A), "PAUSED", "display_status = PAUSED")
+  eq(#s.agents[A].tools, 0, "the pause line is not a tool use")
+  eq(s.counts.paused, 1, "counts.paused = 1")
+  eq(state.paused_ms(s, A, util.parse_iso("2026-10-05T12:01:16.000Z")), 10000, "paused_ms while PAUSED = now - hit_at")
+  state.apply(s, U("steer_requested", "02:00", { steer_id = A .. "-9", agent_id = A, text = "use v3", via = "hook", prompt_id = P1 }))
+  state.apply(s, U("pause_resumed", "02:00", { pause_id = A .. "-1", reason = "user", steer_id = A .. "-9" }))
+  eq(p.status, "RESUMED", "pause_resumed → RESUMED")
+  eq(p.release_reason, "user", "… reason user (Neovim)")
+  eq(s.agents[A].pause, nil, "a.pause cleared")
+  feed(H("PreToolUse", "02:00", { agent_id = A, tool_name = "Read", tool_use_id = "tr1",
+    pause = { id = A .. "-1", phase = "released", target = A, reason = "user", waited_ms = 54000, steer_ids = { A .. "-9" } } }))
+  eq({ p.status, p.release_reason, p.waited_ms, p.steer_id }, { "RESUMED", "user", 54000, A .. "-9" }, "pause_released after pause_resumed: waited_ms filled")
+  eq(state.display_status(s, A), "RUNNING", "after resume: RUNNING again")
+  eq(state.paused_ms(s, A, util.parse_iso("2026-10-05T12:30:00.000Z")), 54000, "paused_ms after resume = released_at - hit_at")
+
+  -- pause_hit が先に来る（pause_requested の記録より前）→ 作って PAUSED。hook が自分で決めた理由（auto）は Neovim に勝つ
+  feed(H("PreToolUse", "03:00", { agent_id = B, tool_name = "Bash", tool_use_id = "tb",
+    pause = { id = B .. "-2", phase = "hit", kind = "pause", at = "next", target = B } }))
+  local q = s.pauses[B .. "-2"]
+  eq(q and q.status, "PAUSED", "pause_hit before pause_requested → created as PAUSED")
+  state.apply(s, U("pause_requested", "03:00", { pause_id = B .. "-2", agent_id = B, at = "next", kind = "pause", auto_resume_s = 600 }))
+  eq(q.status, "PAUSED", "late pause_requested keeps PAUSED")
+  eq(q.requested_at, "2026-10-05T12:03:00.000Z", "… and fills requested_at")
+  feed(H("PreToolUse", "13:00", { agent_id = B, tool_name = "Bash", tool_use_id = "tb",
+    pause = { id = B .. "-2", phase = "released", target = B, reason = "auto", waited_ms = 600000 } }))
+  state.apply(s, U("pause_resumed", "13:01", { pause_id = B .. "-2", reason = "nvim_exit" }))
+  eq(q.release_reason, "auto", "hook's own reason (auto) wins over Neovim's")
+  -- Neovim の具体的な理由（nvim_exit / gate_off）は、hook の「ファイルが消えた（user）」より残す
+  state.apply(s, U("pause_requested", "14:00", { pause_id = B .. "-3", agent_id = B, at = "next", kind = "pause" }))
+  feed(H("PreToolUse", "14:01", { agent_id = B, tool_name = "Bash", pause = { id = B .. "-3", phase = "hit", kind = "pause", at = "next", target = B } }))
+  feed(H("PreToolUse", "14:05", { agent_id = B, tool_name = "Bash", pause = { id = B .. "-3", phase = "released", target = B, reason = "user", waited_ms = 4000 } }))
+  state.apply(s, U("pause_resumed", "14:05", { pause_id = B .. "-3", reason = "nvim_exit" }))
+  eq(s.pauses[B .. "-3"].release_reason, "nvim_exit", "Neovim's nvim_exit is kept over the hook's user")
+
+  -- aborted → RESUMED（理由 aborted）
+  state.apply(s, U("pause_requested", "15:00", { pause_id = B .. "-4", agent_id = B, at = "next", kind = "pause" }))
+  feed(H("PreToolUse", "15:01", { agent_id = B, tool_name = "Bash", pause = { id = B .. "-4", phase = "hit", kind = "pause", at = "next", target = B } }))
+  feed(H("PreToolUse", "15:21", { agent_id = B, tool_name = "Bash", pause = { id = B .. "-4", phase = "aborted", target = B, waited_ms = 20000 } }))
+  eq({ s.pauses[B .. "-4"].status, s.pauses[B .. "-4"].release_reason, s.pauses[B .. "-4"].waited_ms }, { "RESUMED", "aborted", 20000 }, "pause_aborted → RESUMED, aborted")
+
+  -- expired：REQUESTED から。RESUMED は EXPIRED に勝つ（解放が後から来ても RESUMED）
+  state.apply(s, U("pause_requested", "16:00", { pause_id = B .. "-5", agent_id = B, at = "stop", kind = "pause" }))
+  state.apply(s, U("pause_expired", "16:10", { pause_id = B .. "-5", reason = "agent_finished" }))
+  eq({ s.pauses[B .. "-5"].status, s.pauses[B .. "-5"].end_reason }, { "EXPIRED", "agent_finished" }, "pause_expired → EXPIRED with end_reason")
+  eq(s.agents[B].pause, nil, "expired: a.pause cleared")
+  feed(H("Stop", "16:11", { agent_id = B, pause = { id = B .. "-5", phase = "released", target = B, reason = "user", waited_ms = 100 } }))
+  eq({ s.pauses[B .. "-5"].status, s.pauses[B .. "-5"].end_reason }, { "RESUMED", nil }, "RESUMED wins over EXPIRED")
+  state.apply(s, U("pause_expired", "16:20", { pause_id = B .. "-5", reason = "session_ended" }))
+  eq(s.pauses[B .. "-5"].status, "RESUMED", "pause_expired does nothing to RESUMED")
+
+  -- 関門：SubagentStop の記録（DONE）の後に hit → 箱は GATE。通す（指示なし）→ DONE に戻る
+  state.apply(s, U("gate_set", "20:00", { on = true }))
+  eq(s.gate, true, "gate_set on → s.gate = true")
+  state.apply(s, U("pause_requested", "20:01", { pause_id = A .. "-6", agent_id = A, at = "stop", kind = "gate", prompt_id = P1 }))
+  feed(H("SubagentStop", "20:10", { agent_id = A, last_head = "done", report = "## 報告" }))
+  eq(s.agents[A].status, "DONE", "the stop record comes first: DONE")
+  feed(H("SubagentStop", "20:10", { agent_id = A, pause = { id = A .. "-6", phase = "hit", kind = "gate", at = "stop", target = A } }))
+  eq(state.display_status(s, A), "GATE", "gate hit at SubagentStop: GATE although a.status is DONE")
+  eq(state.held_at_end(s.pauses[A .. "-6"]), true, "held_at_end")
+  eq(s.pauses[A .. "-6"].hit_via, "SubagentStop", "hit_via = SubagentStop (no tool)")
+  feed(H("SubagentStop", "20:40", { agent_id = A, pause = { id = A .. "-6", phase = "released", target = A, reason = "user", waited_ms = 30000 } }))
+  eq(state.display_status(s, A), "DONE", "pass: DONE again")
+  state.apply(s, U("gate_set", "21:00", { on = false }))
+  eq(s.gate, false, "gate_set off → false")
+  -- 止まれ（PreToolUse）の残りがあっても、終わった箱は DONE のまま
+  state.apply(s, U("pause_requested", "21:01", { pause_id = A .. "-7", agent_id = A, at = "next", kind = "pause" }))
+  feed(H("PreToolUse", "21:02", { agent_id = A, tool_name = "Read", pause = { id = A .. "-7", phase = "hit", kind = "pause", at = "next", target = A } }))
+  eq(state.display_status(s, A), "DONE", "a stale PreToolUse pause on a finished box shows DONE")
+
+  -- ROOT にも止まれ（Stop で止まる）
+  state.apply(s, U("pause_requested", "22:00", { pause_id = "ROOT-8", agent_id = "ROOT", at = "next", kind = "pause", prompt_id = P1 }))
+  feed(H("Stop", "22:05", { pause = { id = "ROOT-8", phase = "hit", kind = "pause", at = "next", target = "ROOT" } }))
+  eq(state.display_status(s, "ROOT"), "PAUSED", "ROOT paused at Stop")
+  eq(state.pause_of(s, "ROOT").id, "ROOT-8", "pause_of(ROOT)")
+
+  -- 一覧の順と通し番号、counts
+  eq(table.concat(state.pauses_of(s, A), ","), table.concat({ A .. "-1", A .. "-6", A .. "-7" }, ","), "pauses_of: requested order")
+  eq(s.pauses[A .. "-1"].n, 1, "n: numbered in the flow")
+  eq(s.pauses[A .. "-6"].n, 6, "n follows the requested order across boxes")
+  eq(s.counts.pauses, 8, "counts.pauses = 8")
+  eq(s.counts.paused, 2, "counts.paused = 2 (A's stale one and ROOT)")
+
+  -- flow_view：この流れの pause だけ。宛先が流れの外なら ROOT に付けた写し
+  feed(H("UserPromptSubmit", "30:00", { prompt_id = P2, prompt_head = "second" }))
+  feed(H("PreToolUse", "30:01", { prompt_id = P2, tool_name = "Agent", tool_use_id = "tC", tool_input = { description = "c" } }))
+  feed(H("SubagentStart", "30:02", { prompt_id = P2, agent_id = "afeed130000000003", agent_type = "general-purpose" }))
+  state.apply(s, U("pause_requested", "30:10", { pause_id = A .. "-10", agent_id = A, at = "next", kind = "pause", prompt_id = P2 }))
+  local v1 = state.flow_view(s, P1)
+  eq(#v1.pause_order, 8, "flow_view(P1): the 8 pauses of flow 1")
+  eq(v1.pauses[A .. "-10"], nil, "flow_view(P1): flow 2's pause not copied")
+  eq(state.display_status(v1, "ROOT"), "PAUSED", "flow_view: ROOT's live pause shows")
+  local v2 = state.flow_view(s, P2)
+  eq(#v2.pause_order, 1, "flow_view(P2): 1 pause")
+  eq(v2.pauses[A .. "-10"].owner_id, "ROOT", "flow_view(P2): target outside the flow → owner ROOT")
+  eq(v2.agents.ROOT.pause, nil, "… but it is not ROOT's live pause")
+  eq(state.pause_of(v2, "ROOT"), nil, "pause_of(ROOT) in flow 2 = nil")
+  eq(s.pauses[A .. "-10"].owner_id, nil, "flow_view does not change the original")
+  eq(state.SV, 10, "SV = 10")
 end
 
 vim.fn.delete(TMP, "rf")

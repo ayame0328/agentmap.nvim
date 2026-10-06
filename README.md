@@ -35,6 +35,10 @@ every run, so you can open old ones later.
 - **Steering.** Press `s` on a running agent and write what to change: a sub-agent gets it at its
   next tool call, the main agent gets it typed into its terminal.
   See [Steering a running agent](#steering-a-running-agent).
+- **Pausing.** Pause a running agent from the map (`x`): it stops at its next tool call or when it
+  finishes, waits for you (10 minutes at most), and takes an instruction when you resume it.
+  Optional gate (`X`): every sub-agent waits at its end for your pass or fix. The box turns orange
+  (`[PAUSED]` / `[GATE]`). See [Pausing an agent and the gate](#pausing-an-agent-and-the-gate).
 
 ### How is it different from other tools?
 
@@ -57,7 +61,8 @@ Claude Code ── hooks ──▶ bin/agentmap-collect ──▶ <root>/project
 - Claude Code calls a small recorder through its [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks).
   The recorder appends one short line per event and exits. It never fails and never changes what
   Claude Code does, with one exception you start yourself: a [steering instruction](#steering-a-running-agent)
-  you wrote is delivered by stopping the agent's next tool call.
+  you wrote is delivered by stopping the agent's next tool call, and a [pause](#pausing-an-agent-and-the-gate)
+  you place holds the agent inside the hook until you resume it (10 minutes at most).
 - Most hooks run asynchronously, so Claude Code does not wait for them. `Stop`, `SubagentStop`
   and `SessionEnd` run synchronously (a few milliseconds; asynchronous ones were lost when Claude
   Code exited, and the stop hooks also deliver steering). One more synchronous `PreToolUse` hook
@@ -118,6 +123,9 @@ with `:AgentMapRuns` or `:AgentMapImport`.
 
 ### Upgrading
 
+From 0.1.1 to 0.1.2: run `:AgentMapInstallHooks` again (the delivery hooks get `--pause` and a
+630 s timeout). Until then pausing is refused; recording and steering keep working.
+
 After upgrading from 0.1.0, run `:AgentMapInstallHooks` again. Version 0.1.1 records
 TaskCreate / TaskUpdate / TaskList (the main agent's step list), adds the synchronous
 `PreToolUse` guard that delivers steering, and makes `SubagentStop` synchronous.
@@ -151,6 +159,9 @@ through the real recorder. The `sleep 1` gives it time to write the first record
 | `:AgentMapInstallHooks [settings.json]` | Register the recording hooks in Claude Code |
 | `:AgentMapImport [session_id]` | Import a run from a transcript |
 | `:AgentMapSteer {n\|id} [text]` | Send a steering instruction to an agent (no text: opens the editor) |
+| `:AgentMapPause {n\|id} [next\|stop]` | Pause an agent at its next tool call or when it finishes (`next`, default), or only when it finishes (`stop`) |
+| `:AgentMapResume {n\|id}` | Resume a paused agent (a box waiting at the gate: let it pass) |
+| `:AgentMapGate [on\|off]` | Gate of the run on screen on / off (no argument: toggle) |
 
 ### Keys in the map
 
@@ -169,6 +180,8 @@ All keys are local to the map buffer; nothing global is mapped unless you ask fo
 | `w` | Go to the agent's working folder |
 | `a` | Review (submit / PASS / RETRY / ESCALATE / rerun / name) |
 | `s` | Steer: write an instruction to this agent (see [Steering](#steering-a-running-agent)) |
+| `x` | Pause this agent / resume it (a box waiting at the gate: Pass / Fix menu; see [Pausing](#pausing-an-agent-and-the-gate)) |
+| `X` | Gate on / off for this run: every sub-agent waits at its end for pass / fix |
 | `e` | Export |
 | `r` | Reload |
 | `R` | Past runs |
@@ -177,7 +190,7 @@ All keys are local to the map buffer; nothing global is mapped unless you ask fo
 | `q` | Close |
 
 In the detail, transcript and diff views: `BS` goes back, `q` closes, `Enter` opens the
-agent / parent / HUMAN CHECK on the line, and `t` / `d` / `w` / `a` / `s` work as in the map.
+agent / parent / HUMAN CHECK on the line, and `t` / `d` / `w` / `a` / `s` / `x` work as in the map.
 
 When the map is too wide for the window it opens as a list (tree) instead; `v` switches.
 
@@ -287,11 +300,20 @@ require("agentmap").setup({
     input = "window",          -- "window" (floating editor) | "line" (vim.ui.input)
     text_max = 4000,           -- characters
   },
+  pause = {                    -- false = { enabled = false }
+    enabled = true,            -- false: no pause in the hook command; x / X say it is off
+    auto_resume_s = 600,       -- a pause left alone resumes by itself after this many seconds (5–86400)
+    gate = false,              -- gate of a run you start watching (X turns it over per run)
+    release_on_exit = false,   -- true: closing Neovim resumes every pause of the run on screen
+    notify = true,             -- notices: paused, waiting at the gate, resumed by itself
+  },
 })
 ```
 
 `steer.mode` and `steer.at_stop` are written into the hook command: run `:AgentMapInstallHooks`
 again after changing them (`:checkhealth agentmap` warns when they differ).
+`pause.auto_resume_s` is written into the hook command and timeout: run `:AgentMapInstallHooks`
+after changing it.
 
 The default record folder is named `agentflow` (not `agentmap`) on purpose: it keeps records
 from the earlier private version readable. `$AGENTFLOW_DIR` is still read as an old name for
@@ -425,6 +447,63 @@ What to know:
   renamed to `*.delivered.json`. Any process running as your user can write these files (an
   agent's Bash included), so read the delivered text in the detail view if something looks odd.
 
+## Pausing an agent and the gate
+
+Press `x` on a running box (or run `:AgentMapPause {n|id}`) to pause that agent. Nothing is
+cancelled: the agent stops at its next tool call, or when it tries to finish, whichever comes
+first, and waits there. Press `x` again to resume it. `:AgentMapPause {n|id} stop` pauses it only
+when it finishes. The main agent (ROOT) can be paused too.
+
+How it works: the synchronous hooks that deliver steering (`PreToolUse`, `SubagentStop`, `Stop`)
+look for a pause file. When they find one, the hook **waits inside Claude Code** (it checks the
+file every 100 ms) instead of returning. Removing the file (`x`) lets the hook return.
+
+- **What stops, what does not.** Only that agent. Other sub-agents keep working; a parent that
+  needs the paused child's result waits for it as it would for a slow tool. Claude Code shows
+  nothing for a paused sub-agent; for a paused main agent its spinner says
+  `running PreToolUse hooks…`. The map is where you see it: the box turns orange,
+  `[PAUSED]` (or `[GATE]`), and the light on its line stops. While a pause is placed but the
+  agent has not reached it yet, the box shows ` ⏸` (`||` in terminals that draw it wide).
+- **What the agent sees.** Resumed without an instruction: nothing. The held tool call simply
+  runs (or the agent finishes), as if the tool had been slow. Resumed with an instruction
+  (`s` on the paused box, or "Fix" at the gate): the same text as any steering instruction, with
+  one more line, `(You were paused by the user for 2 min 31 s before this instruction.)`. Writing
+  an instruction to a paused box always resumes it on the spot; for the main agent it then goes
+  through the hook, not the terminal.
+- **10 minutes at most.** A pause left alone resumes by itself after `pause.auto_resume_s`
+  (600 s). The hook keeps this deadline itself, by the wall clock, so it holds when Neovim is
+  closed or the computer sleeps. You get a notice when it happens.
+- **Why the hook timeout is 630 s.** Claude Code stops a hook after its `timeout` (600 s when none
+  is set, in 2.1.289) and then runs the tool anyway, silently. A pause that outlives the timeout
+  would look paused while the agent goes on, so `:AgentMapInstallHooks` registers the delivery
+  hooks with `auto_resume_s + 30` seconds. The recording hooks keep 10 s.
+- **The gate.** `X` turns the gate of the run on screen on (or `:AgentMapGate on`; `pause.gate`
+  is the value for runs you start watching). While it is on, every running sub-agent (children,
+  grandchildren and Workflow agents; not the main agent) waits when it tries to finish. Its report
+  is already recorded, so `Enter` on the `[GATE]` box shows it. `x` on that box gives:
+  **Pass** (let it finish; the parent gets the report), **Fix** (write an instruction; the agent
+  continues, and waits again at its next end while the gate is on; Claude Code allows 8 stops in a
+  row, so 8 fixes) and **Keep waiting** (show the report). Left alone, it passes after 10 minutes.
+  `X` again turns the gate off and lets every waiting agent pass. The gate is kept in the run's
+  folder, so it stays on when you reopen the map.
+- **Esc in Claude Code** interrupts only the main agent's turn; sub-agents (and a hook holding
+  one) keep going. A pause on the main agent stays placed: it stops again at its next tool call
+  (within the same 10 minutes).
+- **Closing Neovim** changes nothing by default: paused agents resume by themselves at their
+  deadline, and you can reopen the map to resume them earlier. With `pause.release_on_exit = true`
+  closing Neovim resumes every pause of the run on screen. When Claude Code itself exits, the
+  waiting hook is ended and the pause is recorded as ended.
+- **Hooks.** Pausing needs the hooks registered by 0.1.2: run `:AgentMapInstallHooks` after
+  upgrading. With the old registration `x` and `X` say so and do nothing; recording and steering
+  keep working.
+- **Cost.** With nothing paused, a tool call costs the same 1–2 ms shell check as before. While
+  any pause file exists (always, while a gate is on), each tool call starts the recorder
+  (about 15–20 ms). A waiting hook checks one file every 100 ms (under 1% of a CPU).
+- **Files.** `<root>/projects/<project>/runs/<session>/pause/<agent>.json` is the pause (mode 0600,
+  no text), `<agent>.hit.json` is written by the hook when the agent stopped (time, deadline, tool
+  name), `GATE` marks a run whose gate is on, and `<root>/pause.pending` is the flag the shell check
+  looks at. Like the steering files, any process running as your user can write them.
+
 ## Review and verdict providers
 
 Press `a` on an agent (or use `:AgentMapReview`) to record `PASS`, `RETRY` or `ESCALATE` with a
@@ -491,6 +570,9 @@ Stored, per event:
 - **steering instructions as you wrote them** (not redacted; up to 4000 characters), in
   `events.jsonl` and `steer/*.delivered.json`
 - `progress_log.jsonl` (estimates and actual durations, no text) and `stats.json` (median durations)
+- pauses: when they were placed, where the agent stopped and when it resumed (`events.jsonl`,
+  `hooks.jsonl`). Pause files hold no text; `pause/<agent>.hit.json` holds the tool name and its
+  `tool_use_id` while the agent waits
 
 Not stored:
 
@@ -520,6 +602,7 @@ real hook payloads (see `tests/fixtures/`).
 | 2.1.283 – 2.1.286 | 2026-10-01 | The real hook payloads in `tests/fixtures/` were captured from 2.1.283 |
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList payloads; steering (deny wording, `stop_hook_active`, typing into a running `claude`) |
 | 2.1.289 | 2026-10-04 | Full run through Neovim: progress, light, steering, parent notice, HUMAN CHECK, export. A long line typed into `claude` needs Enter sent separately (`steer.submit_delay_ms`, now 300) |
+| 2.1.289 | 2026-10-05 | Pausing: a hook without `timeout` is stopped after 600 s; an explicit `timeout` is kept (630 s and 7200 s tested). Past the timeout Claude Code ends the hook (SIGTERM) and runs the tool, showing nothing. Esc does not stop background sub-agents; `/exit` with background work asks (stop tasks / move to background / stay). A hook that waits on the main agent's tool shows `running PreToolUse hooks…` in the spinner; on a sub-agent nothing is shown |
 
 Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion; and every
 tool for steering, synchronous), `PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit,
@@ -527,7 +610,8 @@ NotebookEdit, Bash, EnterWorktree, ExitWorktree, TaskCreate, TaskUpdate, TaskLis
 `PostToolUseFailure` (Agent, AskUserQuestion), `SubagentStart`, `SubagentStop`, `Stop`,
 `SessionEnd`. Unknown events are ignored, so new hook types do not break it.
 `PermissionRequest` is not used, so agentmap.nvim never approves anything. It denies a tool call
-only to deliver a steering instruction you wrote (`steer.enabled = false` removes that hook).
+only to deliver a steering instruction you wrote (`steer.enabled = false` removes that hook), and
+it holds a tool call or an agent's end only while you pause it (`pause.enabled = false` removes that).
 
 Notes for 2.1.288: sub-agents cannot use TaskCreate, so they use the `## Steps` convention.
 A denied tool call reaches the model as `PreToolUse:<Tool> hook error: <reason>`. The main agent
@@ -538,7 +622,7 @@ The record format is versioned (`_v`). Records written by older versions stay re
 ## Status and roadmap
 
 v0.1.0 is the first public release of a tool I built for my own work; v0.1.1 adds progress,
-the light and steering. I answer issues a few times a week, without promises.
+the light and steering; v0.1.2 adds pausing and the gate. I answer issues a few times a week, without promises.
 
 Planned:
 

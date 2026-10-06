@@ -67,10 +67,18 @@ M.defaults = {
     input = "window",        -- "window" | "line"
     text_max = 4000,
   },
+  -- 動いている Agent の一時停止と、終わる前に待たせる関門（DESIGN-v0.1.2-pause §8.1）。false を渡すと { enabled = false }
+  pause = {
+    enabled = true,          -- false: hooks に止まれの登録を足さない。x / X は「無効」と知らせる
+    auto_resume_s = 600,     -- 止めたまま放置したとき、hook が自分で再開するまでの秒数（5〜86400）。変えたら :AgentMapInstallHooks
+    gate = false,            -- 新しく見始める run の関門の初期値（X で run ごとに反転）
+    release_on_exit = false, -- true: Neovim を閉じるとき、この run の止まれを全部解く（false: 自動再開に任せる）
+    notify = true,           -- 止まった・再開した・通ったの通知
+  },
 }
 
--- setup({ progress = false }) / { progress = true } を表に直す（animation / steer も同じ）
-local SWITCHABLE = { "progress", "animation", "steer" }
+-- setup({ progress = false }) / { progress = true } を表に直す（animation / steer / pause も同じ）
+local SWITCHABLE = { "progress", "animation", "steer", "pause" }
 local function normalize(opts)
   local out = vim.deepcopy(opts)
   for _, k in ipairs(SWITCHABLE) do
@@ -78,6 +86,15 @@ local function normalize(opts)
       out[k] = { enabled = false }
     elseif out[k] == true then
       out[k] = { enabled = true }
+    end
+  end
+  -- 自動再開の秒数は hook と同じ範囲（5〜86400）に収める。数でなければ既定に戻す
+  if type(out.pause) == "table" and out.pause.auto_resume_s ~= nil then
+    local n = tonumber(out.pause.auto_resume_s)
+    if not n then
+      out.pause.auto_resume_s = nil
+    else
+      out.pause.auto_resume_s = math.max(5, math.min(86400, math.floor(n)))
     end
   end
   return out
@@ -97,7 +114,7 @@ local function env(name)
 end
 
 --- Apply user options over the defaults. May be called any number of times;
---- each call starts again from the defaults. `progress`, `animation` and `steer` also accept
+--- each call starts again from the defaults. `progress`, `animation`, `steer` and `pause` also accept
 --- false / true, normalized to { enabled = false } / { enabled = true }.
 ---@param opts? table see M.defaults
 ---@return table the effective configuration

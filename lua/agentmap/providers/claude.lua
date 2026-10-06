@@ -178,6 +178,29 @@ function M.normalize_hook(rec)
     return out
   end
 
+  -- 一時停止の記録（collector --pause が書いた行。DESIGN-v0.1.2-pause §5.1）。これもほかの記録は作らない
+  if type(rec.pause) == "table" then
+    local p = rec.pause
+    local pid = type(p.id) == "string" and p.id ~= "" and p.id or nil
+    if not pid then return out end
+    local target = type(p.target) == "string" and p.target ~= "" and p.target or who
+    if p.phase == "hit" then
+      add("pause_hit", {
+        pause_id = pid, agent_id = target, kind = p.kind, at = p.at,
+        via = tostring(ev or "") .. (rec.tool_name and (":" .. rec.tool_name) or ""),
+        tool_use_id = rec.tool_use_id, deadline = p.deadline,
+      })
+    elseif p.phase == "released" then
+      add("pause_released", {
+        pause_id = pid, agent_id = target, reason = p.reason, waited_ms = tonumber(p.waited_ms),
+        steer_ids = type(p.steer_ids) == "table" and p.steer_ids or nil,
+      })
+    elseif p.phase == "aborted" then
+      add("pause_aborted", { pause_id = pid, agent_id = target, waited_ms = tonumber(p.waited_ms) })
+    end
+    return out
+  end
+
   if ev == "SessionStart" then
     add("run_started", { cwd = rec.cwd, transcript_path = rec.transcript_path, source = rec.source })
     add("agent_started", { agent_id = "ROOT", cwd = rec.cwd })

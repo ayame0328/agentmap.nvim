@@ -235,6 +235,69 @@ local function checks_for(state, a)
 end
 
 --- Build the detail lines of `agent` (pure). Returns { lines, marks, links }.
+-- 一時停止 1 件の結果（§6.4）。止まった・再開の文と色
+local PAUSE_REASON = { agent_finished = "detail.pause_reason_finished", session_ended = "detail.pause_reason_session",
+  gate_off = "detail.pause_reason_gate_off", nvim_exit = "detail.pause_reason_exit" }
+
+local function clock_of(v)
+  local tsec = graph.pause_time(v)
+  return tsec and os.date("%H:%M:%S", tsec) or "-"
+end
+
+--- One line of the "■ Pauses" section (DESIGN-v0.1.2-pause §6.4), without the leading mark.
+--- Returns segs, link ("steer:<id>" when resumed with an instruction, else nil) and the line color.
+---@param state table
+---@param p table a state.pauses entry
+---@param i integer position in the agent's list (used when p.n is missing)
+---@param now? number seconds
+function M.pause_line(state, p, i, now)
+  now = now or os.time()
+  local kind
+  if p.kind == "gate" then
+    kind = t("detail.pause_gate")
+  elseif p.at == "stop" then
+    kind = t("detail.pause_requested_stop")
+  else
+    kind = t("detail.pause_requested_next")
+  end
+  local segs = { { "#" .. (p.n or i) .. " " .. clock_of(p.requested_at or p.hit_at) .. " " .. kind } }
+  local via = or_dash(p.hit_via)
+  local hl, link = "AgentMapPaused", nil
+  local function add(text, h) segs[#segs + 1] = { " " .. text, h } end
+  local waited = graph.pause_waited_ms(p, now)
+  local dur = waited and t("detail.pause_duration", { dur = graph.fmt_duration(waited) }) or ""
+  if p.status == "PAUSED" then
+    add(t("detail.pause_waiting", { time = clock_of(p.hit_at), via = via, ["until"] = clock_of(p.deadline) }), hl)
+  elseif p.status == "REQUESTED" then
+    add(t("detail.pause_not_yet"), hl)
+  elseif p.status == "RESUMED" then
+    hl = "AgentMapDone"
+    if p.hit_at then add(t("detail.pause_paused", { time = clock_of(p.hit_at), via = via })) end
+    local r, rt = p.release_reason, clock_of(p.released_at)
+    if r == "auto" or r == "max_wait" then
+      add(t("detail.pause_resumed_auto", { time = rt, min = graph.fmt_duration(waited) }), hl)
+    elseif r == "nvim_exit" then
+      add(t("detail.pause_resumed_exit", { time = rt }) .. dur, hl)
+    elseif r == "gate_off" then
+      add(t("detail.pause_resumed_gate_off", { time = rt }) .. dur, hl)
+    elseif r == "aborted" then
+      hl = "AgentMapRework"
+      add(t("detail.pause_aborted", { time = rt }) .. dur, hl)
+    elseif p.steer_id then
+      local x = type(state.steers) == "table" and state.steers[p.steer_id] or nil
+      add(t("detail.pause_resumed_with", { time = rt, n = (x and x.n) or "?" }) .. dur, hl)
+      link = "steer:" .. p.steer_id
+    else
+      add(t("detail.pause_resumed_user", { time = rt }) .. dur, hl)
+    end
+  else -- EXPIRED
+    hl = "AgentMapDim"
+    local rk = PAUSE_REASON[p.end_reason]
+    add(t("detail.pause_expired", { reason = rk and t(rk) or or_dash(p.end_reason) }), hl)
+  end
+  return segs, link, hl
+end
+
 -- extra = { branch = "…", width = 列数, now = 秒, stats = stats.load() の結果（無ければ読む）,
 --           notes = { {ts, kind = "note"|"tool", text, tool, target}, … } | nil（transcript が読めないとき） }
 function M.build(state, agent, extra)
@@ -243,7 +306,8 @@ function M.build(state, agent, extra)
   local width = math.max(40, extra.width or 80)
   local b = renderer.builder()
   local a = agent
-  local st = a.status or "PENDING"
+  -- 札は表示上の状態（止まっていれば [PAUSED] / [GATE]。DESIGN-v0.1.2-pause §2）
+  local st = graph.display_status(state, a.id) or a.status or "PENDING"
   local shl = graph.STATUS_HL[st]
   local nat = #(a.attempts or {})
   local title = a.id == "ROOT" and ("ROOT  " .. (state.title or "")) or label_of(state, a.id)
@@ -392,6 +456,19 @@ function M.build(state, agent, extra)
     end
   end
 
+  -- 一時停止（DESIGN-v0.1.2-pause §6.4）。1 件以上あるときだけ
+  local pids = graph.pauses_of(state, a.id)
+  if #pids > 0 then
+    b:add("")
+    b:add({ { t("detail.h_pauses", { n = #pids }), "AgentMapHeader" } })
+    local pmk = graph.pause_mark()
+    for i, pid in ipairs(pids) do
+      local segs, link, hl = M.pause_line(state, state.pauses[pid], i, now)
+      table.insert(segs, 1, { "  " .. pmk .. " ", hl })
+      b:add(segs, link)
+    end
+  end
+
   -- 人の確認（HUMAN CHECK）：この箱に付いている質問と、まだ質問されていない要確認
   local cids = checks_for(state, a)
   local ask = type(a.ask) == "table" and a.ask or nil
@@ -414,7 +491,7 @@ function M.build(state, agent, extra)
   if #kids == 0 then b:add({ { t("detail.none"), "AgentMapDim" } }) end
   for _, c in ipairs(kids) do
     local ca = state.agents[c]
-    local cst = ca.status or "PENDING"
+    local cst = graph.display_status(state, c) or ca.status or "PENDING"
     b:add({ { "  " }, { "[" .. (ca.index or "?") .. "]", "AgentMapIndex" },
       { " " .. (ca.name or ca.task or H.short_id(c)) .. "  " },
       { graph.status_tag(cst), graph.STATUS_HL[cst] } }, c)

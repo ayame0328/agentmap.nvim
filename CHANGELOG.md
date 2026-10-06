@@ -3,6 +3,51 @@
 All notable changes are listed here. Records written by older versions stay readable: when the
 state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next open.
 
+## [0.1.2] - unreleased
+
+### Added
+
+- Pausing: `x` on a box (or `:AgentMapPause {n|id} [next|stop]`) pauses that agent at its next
+  tool call or when it finishes, whichever comes first (`stop`: only when it finishes); `x` again
+  (or `:AgentMapResume {n|id}`) resumes it. Nothing is cancelled: the synchronous delivery hook
+  waits inside Claude Code until the pause file is removed. Resumed without an instruction, the
+  agent sees nothing; `s` on a paused box resumes it with the instruction on the spot, through the
+  same hook (the main agent included). A pause left alone resumes by itself after
+  `pause.auto_resume_s` (600 s); the hook keeps that deadline itself, so it holds when Neovim is
+  closed or the computer sleeps.
+- Gate: `X` (or `:AgentMapGate [on|off]`, `pause.gate` for runs you start watching) makes every
+  running sub-agent of the run wait when it tries to finish. Its report can already be read;
+  `x` on the box offers Pass (let it finish), Fix (write an instruction; it continues) or Keep
+  waiting. Left alone it passes after 10 minutes.
+- `[PAUSED]` / `[GATE]` labels and frames in orange (`AgentMapPaused`), ` ⏸` while a pause waits
+  to be reached; the light on a paused agent's line stops (and flows back when an agent passes the
+  gate and finishes). Notices when an agent stops, waits at the gate, resumes by itself, or
+  finishes before it could stop (`pause.notify`).
+- A pauses section in the detail view and `## Pauses` in exports (with a count and the gate in
+  the overview).
+- `:checkhealth agentmap`: pause registration (hook timeout) and pending pause flag rows.
+- Setting `pause` (also accepts `false`): `enabled`, `auto_resume_s`, `gate`,
+  `release_on_exit` (default `false`: closing Neovim leaves pauses to resume by themselves),
+  `notify`.
+
+### Changed
+
+- The delivery hooks (`PreToolUse` guard, `SubagentStop`, `Stop`) carry `--pause --max-wait N`
+  and a `timeout` of `auto_resume_s + 30` (630 s). Run `:AgentMapInstallHooks` again after
+  upgrading; until then `x` and `X` are refused, while recording and steering keep working.
+- `hooks.status()` now also checks the feature words and the timeout of its own hook commands
+  (still not their paths), so the 0.1.1 registration is reported as outdated.
+- The state cache version is 10 (the cache is rebuilt once from the records).
+- `?` and the detail views list `x` / `X`.
+
+### Notes
+
+- Claude Code 2.1.289 facts behind the design: a hook without `timeout` is stopped after 600 s;
+  an explicit `timeout` is kept (630 s and 7200 s tested); past the timeout the hook is ended
+  (SIGTERM) and the tool runs, with nothing shown; Esc interrupts only the main agent's turn
+  (background sub-agents and their waiting hooks go on); when Claude Code exits, a waiting hook
+  is ended and nothing is left running.
+
 ## [0.1.1] - 2026-10-05
 
 ### Added

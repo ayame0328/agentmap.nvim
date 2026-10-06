@@ -287,8 +287,8 @@ t.eq(v1.check_order, { CID }, "hooks_ask の流れに check が入る")
 t.eq(v1.checks[CID].owner_id, "a2", "写しでも owner = a2")
 t.eq(v1.agents.a2.checks, { CID }, "写しの a2.checks")
 
--- ---------- 7. state.json の作り直し（SV = 9） ----------
-t.eq(state.SV, 9, "SV = 9")
+-- ---------- 7. state.json の作り直し（SV = 10） ----------
+t.eq(state.SV, 10, "SV = 10")
 t.eq(state.CHECK_STATUSES, { "WAITING", "ANSWERED", "ABANDONED" }, "CHECK_STATUSES")
 t.eq(state.new("x").checks, {}, "new に checks")
 t.eq(state.new("x").check_order, {}, "new に check_order")
@@ -303,11 +303,11 @@ t.run("events.load が古い state.json を捨てる", function()
   store.write_state(dir, { v = 1, sv = 7, run_id = "old", agents = { ROOT = { id = "ROOT" } }, order = { "ROOT" },
     _off = { hooks = h, events = 0 } })
   local run = events.load(dir)
-  t.eq(run.state.sv, 9, "作り直した state は SV 9")
+  t.eq(run.state.sv, 10, "作り直した state は SV 10")
   t.ok(run.state.checks[CID] ~= nil, "作り直した state に check がある")
   t.eq(run.state.checks[CID].status, "ANSWERED", "作り直した check は ANSWERED")
   local again = events.load(dir)
-  t.eq(again.state.checks[CID].agent_id, "a2", "控え（SV 9）から読み直しても同じ")
+  t.eq(again.state.checks[CID].agent_id, "a2", "控え（SV 10）から読み直しても同じ")
 end)
 
 

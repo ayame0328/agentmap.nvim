@@ -1,4 +1,5 @@
--- agentmap/health.lua ... :checkhealth agentmap (DESIGN §8, DESIGN-v0.2 §4.2, DESIGN-v0.2-steer §8.2).
+-- agentmap/health.lua ... :checkhealth agentmap (DESIGN §8, DESIGN-v0.2 §4.2, DESIGN-v0.2-steer §8.2,
+--   DESIGN-v0.1.2-pause §8.2).
 --   Read-only except for one temp file in the record store (writability check);
 --   the progress statistics are loaded without writing stats.json.
 --   Never calls hooks.install().
@@ -94,6 +95,63 @@ local function pending_steer_files(root)
   local n = 0
   for _, f in ipairs(vim.fn.glob(root .. "/projects/*/runs/*/steer/*.json", false, true)) do
     if not f:find("%.delivered%.json$") then n = n + 1 end
+  end
+  return n
+end
+
+-- settings.json に登録された自分の配達用 hook（--steer）の機能語と timeout（hooks.features と同じ形）
+local function registered_features(path)
+  local util = require("agentmap.util")
+  local js = util.json_decode(util.read_file(path))
+  local out = { steer = false, pause = false }
+  if type(js) ~= "table" or type(js.hooks) ~= "table" then return out end
+  for ev, groups in pairs(js.hooks) do
+    for _, g in ipairs(type(groups) == "table" and groups or {}) do
+      for _, h in ipairs(type(g) == "table" and type(g.hooks) == "table" and g.hooks or {}) do
+        local c = type(h) == "table" and h.command
+        if type(c) == "string" and c:find("--steer", 1, true) then
+          out.steer = true
+          if c:find("--pause", 1, true) then out.pause = true end
+          local mw = tonumber(c:match("%-%-max%-wait%s+'?(%d+)"))
+          if mw then out.max_wait = mw end
+          local to = tonumber(h.timeout)
+          if ev == "PreToolUse" then
+            out.guard_timeout = to
+          elseif ev == "SubagentStop" or ev == "Stop" then
+            if out.stop_timeout == nil or (to or 0) < out.stop_timeout then out.stop_timeout = to end
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+--- Whether the registered delivery hooks carry pause support for these settings
+--- (DESIGN-v0.1.2-pause §8.2 row 16): --pause on the delivery hooks and a timeout of at least
+--- auto_resume_s + 30 on the guard and stop hooks. Uses hooks.features() when present.
+---@return boolean ok, integer|nil timeout the smallest registered timeout of the delivery hooks
+function M.pause_registration(path, pcfg)
+  pcfg = type(pcfg) == "table" and pcfg or {}
+  local f
+  local ok_h, hooks = pcall(require, "agentmap.hooks")
+  if ok_h and type(hooks.features) == "function" then
+    local ok, r = pcall(hooks.features, path)
+    if ok and type(r) == "table" then f = r end
+  end
+  f = f or registered_features(path)
+  local need = (tonumber(pcfg.auto_resume_s) or 600) + 30
+  local g, st = tonumber(f.guard_timeout), tonumber(f.stop_timeout)
+  local timeout = (g and st) and math.min(g, st) or g or st
+  local good = f.pause == true and g ~= nil and g >= need and (st == nil or st >= need)
+  return good, timeout
+end
+
+-- 止まれのファイル（<run>/pause/<target>.json。.hit.json と GATE は数えない）の数
+local function pause_files(root)
+  local n = 0
+  for _, f in ipairs(vim.fn.glob(root .. "/projects/*/runs/*/pause/*.json", false, true)) do
+    if not f:find("%.hit%.json$") then n = n + 1 end
   end
   return n
 end
@@ -302,6 +360,31 @@ function M.check()
     else
       h.info(t("health.term_none"))
     end
+  end
+
+  -- 16. 一時停止の登録（DESIGN-v0.1.2-pause §8.2）
+  local pzcfg = config.get().pause or {}
+  if pzcfg.enabled == false then
+    h.info(t("health.pause_off"))
+  else
+    local ok16, timeout = M.pause_registration(spath, pzcfg)
+    if ok16 then
+      h.ok(t("health.pause_on", { s = pzcfg.auto_resume_s or 600, timeout = timeout or "-" }))
+    else
+      h.warn(t("health.pause_outdated"))
+    end
+  end
+
+  -- 17. 止まれの印（health は消さない）
+  if vim.uv.fs_stat(root10 .. "/pause.pending") then
+    local n = pause_files(root10)
+    if n == 0 then
+      h.warn(t("health.pause_flag_stale"))
+    else
+      h.info(t("health.pause_flag_pending", { n = n }))
+    end
+  else
+    h.ok(t("health.pause_flag_ok"))
   end
 end
 

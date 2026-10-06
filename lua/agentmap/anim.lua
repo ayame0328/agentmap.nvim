@@ -4,11 +4,14 @@
 --   for `animation.back_ms` after an agent finishes, backwards along the same line (child -> parent).
 --   Only highlight extmarks move (namespace "agentmap_anim", priority 4200); the text is never
 --   rewritten. The timer runs only while something is lit and the map is visible in the current tab.
+--   A paused agent (PAUSED / GATE, from state.display_status) is not moving, so its line is dark;
+--   when it resumes (back to RUNNING) the light flows again, and when it finishes after a pause
+--   (a gate passed) the light flows back to the parent like after RUNNING.
 --
 --   Pure parts (tested directly): plan(), frame(), cfg().
 --   Stateful parts: update() (called at the end of every ui.refresh), stop(), setup_highlights().
 --
---   設計: DESIGN-v0.2.md §3（光）、付録 D（HUMAN CHECK の線も紫で流す）
+--   設計: DESIGN-v0.2.md §3（光）、付録 D（HUMAN CHECK の線も紫で流す）、DESIGN-v0.1.2-pause §6.3（止まっている箱は光らない）
 local M = {}
 
 M.DEFAULTS = {
@@ -23,6 +26,8 @@ M.DEFAULTS = {
 M.PRIORITY = 4200 -- 基本の印（既定 4096）より上に乗る
 
 local FINISHED = { DONE = true, REWORK = true, FAILED = true }
+-- 終わったときに戻りの光を出す「前の状態」。止まっていた箱（関門を通した子など）も、動いていた箱と同じに扱う
+local WAS_WORKING = { RUNNING = true, PAUSED = true, GATE = true }
 
 --- Effective animation settings: config.get().animation merged over the defaults.
 --- `false` (or { enabled = false }) turns the light off; `true` or nil means the defaults.
@@ -47,8 +52,9 @@ end
 -- ------------------------------------------------------------
 
 --- Decide which lines are lit, from the previous and the current status of every box.
----   prev_status / cur_status = { [id] = "RUNNING" | "DONE" | "WAITING" | … } (prev nil = the map was
----   just opened: nothing flows back, because the end was not seen).
+---   prev_status / cur_status = { [id] = "RUNNING" | "DONE" | "WAITING" | "PAUSED" | "GATE" | … } (prev nil
+---   = the map was just opened: nothing flows back, because the end was not seen). PAUSED / GATE are
+---   not lit; a box that finishes right after PAUSED / GATE flows back like one that was RUNNING.
 ---   prev_back = the `back` table returned last time (kept until it expires).
 ---@return table actives { forward = { id, … }, wait = { id, … }, back = { [id] = expires_at_ms } }
 function M.plan(prev_status, cur_status, now, cfg, prev_back)
@@ -70,7 +76,7 @@ function M.plan(prev_status, cur_status, now, cfg, prev_back)
   end
   if prev_status then
     for id, st in pairs(cur_status) do
-      if FINISHED[st] and prev_status[id] == "RUNNING" then back[id] = now + (cfg.back_ms or 3000) end
+      if FINISHED[st] and WAS_WORKING[prev_status[id]] then back[id] = now + (cfg.back_ms or 3000) end
     end
   end
   return { forward = forward, wait = wait, back = back }

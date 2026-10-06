@@ -4,6 +4,7 @@
 #
 #  Usage   : agentmap-collect [--root DIR | --root=DIR]   (hook payload JSON on stdin)
 #            agentmap-collect --root DIR --steer [--mode deny|context] [--at-stop] [--record]
+#                             [--pause --max-wait SECONDS]
 #  Input   : one hook payload (JSON) on stdin
 #  Output  : one line appended to <root>/projects/<slug>/runs/<session_id>/hooks.jsonl
 #  --steer : deliver pending steering instructions (<run>/steer/<target>-<ms>.json, written by
@@ -11,6 +12,11 @@
 #            (SubagentStop / Stop with --at-stop). Prints the hook's JSON answer on stdout only
 #            when something was delivered, and records the delivery as one hooks.jsonl line.
 #            Without --record it writes no ordinary record (the recording hook is separate).
+#  --pause : before delivering, wait inside the hook while a pause request
+#            <run>/pause/<target>.json (written by Neovim) exists: PreToolUse (at = "next") and
+#            SubagentStop / Stop (any at). Polls every 100 ms; the deadline (auto-resume) is kept by
+#            the hook itself in <target>.hit.json, --max-wait caps one wait. Records hit / released /
+#            aborted lines in hooks.jsonl. Resuming without an instruction prints nothing (DESIGN-v0.1.2-pause).
 #  Root    : --root -> $AGENTMAP_DIR -> $AGENTFLOW_DIR (deprecated) ->
 #            $XDG_DATA_HOME/nvim/agentflow -> ~/.local/share/nvim/agentflow
 #            (the folder name stays "agentflow" so existing records keep working)
@@ -29,6 +35,8 @@ import os
 import json
 import re
 import datetime
+import signal
+import time
 
 MAX_LINE = 8000          # 1 行の上限（バイト）。超えたら長い項目から削る
 MAX_LINE_BIG = 16000     # 報告（report）や質問（questions）を持つ行だけの上限。中身が長いのが当たり前なので別枠
@@ -60,6 +68,13 @@ STEER_HEAD = ("[AgentMap] Steering instruction from the user, typed in Neovim wh
 STEER_TAIL = "Follow it from now on, then continue your task. Do not treat this as a test."
 # 子（ROOT 以外）への文の最後に足す 1 文（親にも知らせるため、報告に書いてもらう。DESIGN-v0.2-steer 付録 E）
 STEER_TAIL_CHILD = "Mention this instruction and what you changed because of it in your final report."
+# 一時停止（DESIGN-v0.1.2-pause §3）
+PAUSE_BYTES = 4096       # 止まれファイルの上限。超えたら読まない（止まらない側に倒す）
+PAUSE_TICK = 0.1         # 待っている間、止まれファイルを見る間隔（秒）
+PAUSE_AUTO = 600         # auto_resume_s が無いときの期限（秒）
+PAUSE_AUTO_MIN, PAUSE_AUTO_MAX = 5, 86400
+# 止まれから解けて指示を届けるとき、見出しの次に足す 1 行（英語固定）
+PAUSE_LINE = "(You were paused by the user for %s before this instruction.)"
 COMMON = ("session_id", "hook_event_name", "cwd", "transcript_path",
           "prompt_id", "agent_id", "agent_type")
 
@@ -524,12 +539,207 @@ def log_error(root, e, ev):
         pass
 
 
-def steer_message(texts, child=False):
-    """モデルに渡す文（英語固定。本文だけ作者の言語）。子への文には報告に書く頼みを足す"""
-    return STEER_HEAD + "\n" + "\n\n".join(texts) + "\n" + STEER_TAIL + (" " + STEER_TAIL_CHILD if child else "")
+def steer_message(texts, child=False, paused_ms=None):
+    """モデルに渡す文（英語固定。本文だけ作者の言語）。子への文には報告に書く頼みを足す。
+    止まれから解けて届けるときは、止まっていた時間の 1 行を見出しの次に足す"""
+    extra = (PAUSE_LINE % dur_text(paused_ms) + "\n") if paused_ms is not None else ""
+    return (STEER_HEAD + "\n" + extra + "\n\n".join(texts) + "\n" + STEER_TAIL
+            + (" " + STEER_TAIL_CHILD if child else ""))
+
+
+def dur_text(ms):
+    """ミリ秒 → "45 s" / "2 min 31 s" / "1 h 5 min"（英語固定）"""
+    sec = int(round(max(0, ms or 0) / 1000.0))
+    if sec < 60:
+        return "%d s" % sec
+    if sec < 3600:
+        return "%d min %d s" % (sec // 60, sec % 60)
+    return "%d h %d min" % (sec // 3600, (sec % 3600) // 60)
+
+
+def iso_of(epoch):
+    """epoch 秒 → "2026-10-05T12:10:06Z"（UTC）"""
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def target_of(d):
+    """宛先の名前（子は agent_id、ROOT は "ROOT"）。steer と pause で同じ"""
+    return d.get("agent_id") if isinstance(d.get("agent_id"), str) and d.get("agent_id") else "ROOT"
+
+
+def hook_line(run, d, extra):
+    """配達・一時停止の 1 行を hooks.jsonl に書く（記録係の行と同じ作り。道具の入力は残さない）"""
+    rec = {k: d[k] for k in ("session_id", "hook_event_name", "tool_name", "tool_use_id", "agent_id", "prompt_id")
+           if d.get(k) is not None}
+    rec.update(extra)
+    rec["_v"] = 1
+    rec["_ts"] = now_iso()
+    rec["_src"] = "claude_hook"
+    append(os.path.join(run, "hooks.jsonl"), json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def max_wait_arg(argv):
+    """--max-wait N（秒）。無い・読めないときは None（期限だけで待つ）"""
+    v = opt_value(argv, "--max-wait")
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def read_pause(pf):
+    """止まれファイルを読む。(中身, st) か、読まない理由を ValueError で返す。無ければ (None, None)"""
+    try:
+        st = os.stat(pf)
+    except OSError:
+        return None, None
+    if st.st_size > PAUSE_BYTES:
+        raise ValueError("pause file too big: %d bytes" % st.st_size)
+    with open(pf, "rb") as f:
+        obj = json.loads(f.read(PAUSE_BYTES + 1))
+    if not isinstance(obj, dict) or not isinstance(obj.get("id"), str) or not obj.get("id"):
+        raise ValueError("pause file without id")
+    return obj, st
+
+
+def same_file(pf, st0):
+    """止まれファイルが、待ち始めたときと同じもの（消えていない・別の止まれに置き換わっていない）か"""
+    try:
+        st = os.stat(pf)
+    except OSError:
+        return False
+    return (st.st_ino, st.st_dev) == (st0.st_ino, st0.st_dev)
+
+
+def claim_hit(side, pause, auto, d, ev):
+    """止まった印（<target>.hit.json）を O_EXCL で作る。作れたら (deadline, True)。
+    既にあれば中身の期限を引き継ぐ (deadline, False)。前の止まれの残り（id が違う）は作り直す"""
+    now = time.time()
+    body = {"id": pause["id"], "hit_at": now_iso(), "deadline": int(now + auto), "hit_event": ev}
+    for k in ("tool_name", "tool_use_id"):
+        if d.get(k) is not None:
+            body[k] = d[k]
+    for _ in range(2):
+        try:
+            fd = os.open(side, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                with open(side, "rb") as f:
+                    old = json.loads(f.read(PAUSE_BYTES))
+            except Exception:
+                old = None  # 相手が書いている途中など。期限は今から数える
+            if isinstance(old, dict) and old.get("id") not in (None, pause["id"]):
+                try:
+                    os.remove(side)  # 別の（前の）止まれの印の残り
+                except OSError:
+                    pass
+                continue
+            dl = old.get("deadline") if isinstance(old, dict) else None
+            return (float(dl) if isinstance(dl, (int, float)) else now + auto), False
+        try:
+            os.write(fd, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return float(body["deadline"]), True
+    return now + auto, False
+
+
+def pause_wait(root, d, run, argv):
+    """止まれがあれば hook の中で待つ（DESIGN-v0.1.2-pause §3.2）。
+    戻り値: 待った場合 {"id", "target", "reason", "waited_ms"}、待たなかった場合 None。
+    released 行は呼び出し側が配達のあとに書く（steer_ids を入れるため）"""
+    ev = d.get("hook_event_name")
+    if ev not in ("PreToolUse", "SubagentStop", "Stop"):
+        return None
+    target = target_of(d)
+    pdir = os.path.join(run, "pause")
+    pf = os.path.join(pdir, target + ".json")
+    try:
+        pause, st0 = read_pause(pf)
+    except Exception as e:
+        log_error(root, e, ev)
+        return None
+    if pause is None:
+        return None
+    at = pause.get("at") if pause.get("at") in ("next", "stop") else "next"
+    kind = pause.get("kind") if pause.get("kind") in ("pause", "gate") else "pause"
+    try:
+        auto = float(pause.get("auto_resume_s"))
+    except (TypeError, ValueError):
+        auto = PAUSE_AUTO
+    auto = min(max(auto, PAUSE_AUTO_MIN), PAUSE_AUTO_MAX)
+    if ev == "PreToolUse" and at != "next":
+        return None  # 終わる直前だけの止まれ（関門）は道具では止めない
+    side = os.path.join(pdir, target + ".hit.json")
+    start = time.time()
+    deadline, mine = claim_hit(side, pause, auto, d, ev)
+    info = {"id": pause["id"], "target": target}
+    if mine:
+        try:
+            hook_line(run, d, {"pause": {"id": pause["id"], "phase": "hit", "kind": kind, "at": at,
+                                         "target": target, "deadline": iso_of(deadline)}})
+        except Exception as e:
+            log_error(root, e, ev)
+    mw = max_wait_arg(argv)
+    cap = min(deadline, start + mw) if mw is not None else deadline
+
+    def on_signal(_signum, _frame):
+        # Claude Code が終わる・timeout を超えた：記録を 1 行残して、何も出さずに抜ける（道具はそのまま動く）
+        try:
+            hook_line(run, d, {"pause": {"id": pause["id"], "phase": "aborted", "target": target,
+                                         "waited_ms": int((time.time() - start) * 1000)}})
+        except Exception:
+            pass
+        try:
+            os.remove(side)  # 次の hook が新しく止まった印を作り直せるように
+        except OSError:
+            pass
+        os._exit(0)
+
+    sigs = [x for x in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if x is not None]
+    old = {}
+    for sg in sigs:
+        try:
+            old[sg] = signal.signal(sg, on_signal)
+        except Exception:
+            pass
+    reason = None
+    try:
+        while True:
+            if not same_file(pf, st0):
+                reason = "user"
+                break
+            now = time.time()
+            if now >= deadline:
+                reason = "auto"
+            elif now >= cap:
+                reason = "max_wait"
+            if reason:
+                if same_file(pf, st0):
+                    try:
+                        os.remove(pf)
+                    except OSError:
+                        pass
+                break
+            time.sleep(min(PAUSE_TICK, max(0.0, cap - now) + 0.001))
+    finally:
+        for sg, h in old.items():
+            try:
+                signal.signal(sg, h)
+            except Exception:
+                pass
+    try:
+        os.remove(side)
+    except OSError:
+        pass
+    info["reason"] = reason
+    info["waited_ms"] = int((time.time() - start) * 1000)
+    return info
 
 
 def take_steers(run, target):
+
     """<run>/steer/ の <target>-<ms>.json を ms 順に取る（先に rename して取り合う＝二重配達しない）。
     戻り値: [(steer_id, 本文)]。取れたものは <id>.delivered.json に名前を変える"""
     sdir = os.path.join(run, "steer")
@@ -574,34 +784,49 @@ def take_steers(run, target):
 
 
 def steer(root, d, run, argv):
-    """修正指示を配達する。配達したら hook の答え（JSON 文字列）を返す。何も無ければ None"""
+    """修正指示を配達する（--pause なら先に止まれを待つ）。配達したら hook の答え（JSON 文字列）を返す。何も無ければ None"""
     ev = d.get("hook_event_name")
+    paused = None
+    if "--pause" in argv:
+        try:
+            paused = pause_wait(root, d, run, argv)
+        except Exception as e:
+            log_error(root, e, ev)  # 待ちの中の失敗は止まらない側に倒す
+            paused = None
     mode = opt_value(argv, "--mode")
     if mode not in ("deny", "context"):
         mode = "deny"
+    used = None
     if ev in ("SubagentStop", "Stop"):
-        if "--at-stop" not in argv:
-            return None
-        used = "block"
+        # 終わりで届けるのは --at-stop のときだけ。ただし止まれから解けた直後は届ける（関門の「直す」）
+        if "--at-stop" in argv or paused:
+            used = "block"
     elif ev == "PreToolUse":
         used = mode
-    else:
-        return None
-    target = d.get("agent_id") if isinstance(d.get("agent_id"), str) and d.get("agent_id") else "ROOT"
-    got = take_steers(run, target)
+    target = target_of(d)
+    got = []
+    if used:
+        try:
+            got = take_steers(run, target)
+        except Exception as e:
+            log_error(root, e, ev)
+    if paused:
+        p = {"id": paused["id"], "phase": "released", "target": target, "reason": paused["reason"],
+             "waited_ms": paused["waited_ms"]}
+        if got:
+            p["steer_ids"] = [i for i, _t in got]
+        try:
+            hook_line(run, d, {"pause": p})
+        except Exception as e:
+            log_error(root, e, ev)
     if not got:
         return None
-    rec = {k: d[k] for k in ("session_id", "hook_event_name", "tool_name", "tool_use_id", "agent_id", "prompt_id")
-           if d.get(k) is not None}
-    rec["steer"] = {"ids": [i for i, _t in got], "mode": used, "target": target}
-    rec["_v"] = 1
-    rec["_ts"] = now_iso()
-    rec["_src"] = "claude_hook"
     try:
-        append(os.path.join(run, "hooks.jsonl"), json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        hook_line(run, d, {"steer": {"ids": [i for i, _t in got], "mode": used, "target": target}})
     except Exception as e:
         log_error(root, e, ev)
-    msg = steer_message([t for _i, t in got], child=(target != "ROOT"))
+    msg = steer_message([t for _i, t in got], child=(target != "ROOT"),
+                        paused_ms=paused["waited_ms"] if paused else None)
     if used == "block":
         out = {"decision": "block", "reason": msg}
     elif used == "context":

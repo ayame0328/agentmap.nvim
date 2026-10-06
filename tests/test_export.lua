@@ -50,7 +50,7 @@ local function hand_state()
 end
 
 local HEADINGS = { "## Run overview", "## Map", "## Agents", "## Reviews and rework", "## Steering instructions",
-  "## Final outputs", "## Changed files", "## Tool calls" }
+  "## Pauses", "## Final outputs", "## Changed files", "## Tool calls" }
 
 local function check_markdown(md, label)
   for _, h in ipairs(HEADINGS) do
@@ -233,6 +233,64 @@ local mdpj = export.to_markdown(prog_state(), { now = NOW, stats = STATS })
 t.matches(mdpj, "\n> 手順: 2/3 済 · 進み具合: ~83%.3%%\n", "日本語: 手順の行")
 t.matches(mdpj, "\n## 修正指示\n", "日本語: 修正指示の見出し")
 t.matches(mdpj, "| 修正指示 | 4 件（未配達 1） |", "日本語: 概要の行")
+require("agentmap.i18n").setup("en")
+
+-- 一時停止（DESIGN-v0.1.2-pause §6.6）：「## Steering instructions」の次に 1 件 1 行。Overview に件数と関門
+local function clk(sec) return os.date("%H:%M:%S", sec) end
+local function pause_state()
+  local x = prog_state()
+  x.steers["a1-1"].n = 2
+  x.pauses = {
+    ["a1-p1"] = { id = "a1-p1", agent_id = "a1", kind = "pause", at = "next", status = "RESUMED", requested_at = iso(NOW - 300),
+      hit_at = iso(NOW - 294), hit_via = "PreToolUse:Read", released_at = iso(NOW - 100), release_reason = "user",
+      steer_id = "a1-1", waited_ms = 194000 },
+    ["a2-p1"] = { id = "a2-p1", agent_id = "a2", kind = "gate", at = "stop", status = "PAUSED", requested_at = iso(NOW - 50),
+      hit_at = iso(NOW - 45), hit_via = "SubagentStop", deadline = NOW + 555 },
+    ["ROOT-p1"] = { id = "ROOT-p1", agent_id = "ROOT", kind = "pause", at = "stop", status = "RESUMED", requested_at = iso(NOW - 800),
+      hit_at = iso(NOW - 790), hit_via = "Stop", released_at = iso(NOW - 190), release_reason = "auto", waited_ms = 600000 },
+    ["a1-p2"] = { id = "a1-p2", agent_id = "a1", kind = "pause", at = "next", status = "EXPIRED", requested_at = iso(NOW - 20),
+      end_reason = "session_ended" },
+  }
+  x.pause_order = { "ROOT-p1", "a1-p1", "a2-p1", "a1-p2" }
+  return x
+end
+local mdz = export.to_markdown(pause_state(), { now = NOW, stats = STATS })
+check_markdown(mdz, "一時停止")
+t.matches(mdz, "\n## Steering instructions\n.-\n## Pauses\n\n", "## Pauses は ## Steering instructions の次")
+t.ok(mdz:find("\n- ROOT — " .. clk(NOW - 800) .. " pause → paused " .. clk(NOW - 790) .. " (Stop) → resumed automatically "
+  .. clk(NOW - 190) .. " (10 min)\n", 1, true), "自動で再開した行")
+t.ok(mdz:find("\n- [1] 調査係 — " .. clk(NOW - 300) .. " pause → paused " .. clk(NOW - 294) .. " (PreToolUse:Read) → resumed by the user "
+  .. clk(NOW - 100) .. " with instruction #2\n", 1, true), "指示つきで再開した行")
+t.ok(mdz:find("\n- [2] レビュー係 — " .. clk(NOW - 50) .. " gate → waiting at SubagentStop since " .. clk(NOW - 45)
+  .. " (at export time)\n", 1, true), "関門で待っている行")
+t.ok(mdz:find("\n- [1] 調査係 — " .. clk(NOW - 20) .. " pause → not reached: the session ended\n", 1, true), "止まらず終わった行")
+local i_root, i_a1 = mdz:find("\n- ROOT — " .. clk(NOW - 800), 1, true), mdz:find("\n- [1] 調査係 — " .. clk(NOW - 300), 1, true)
+t.ok(i_root and i_a1 and i_root < i_a1, "pause_order の順")
+t.matches(mdz, "| Pauses | 4 %(1 waiting%) |", "Overview の件数")
+t.ok(not mdz:find("| Gate |", 1, true), "関門が切なら Gate の行は無い")
+local mz = mc.blocks(mdz)[1] or ""
+t.ok(mz ~= "" and not mz:find("PAUSED", 1, true) and not mz:find("GATE", 1, true) and not mz:find("pause", 1, true), "Mermaid には出さない")
+local zg = pause_state()
+zg.gate = true
+local mdg = export.to_markdown(zg, { now = NOW, stats = STATS })
+t.matches(mdg, "| Gate | on |\n| Status |", "関門が入なら Gate: on（Status の前）")
+zg.gate = nil
+require("agentmap.config").setup({ pause = { gate = true } })
+t.matches(export.to_markdown(zg, { now = NOW, stats = STATS }), "| Gate | on |", "run に記録が無ければ設定の初期値")
+zg.gate = false
+t.ok(not export.to_markdown(zg, { now = NOW, stats = STATS }):find("| Gate |", 1, true), "run で切ったなら設定より run の記録")
+require("agentmap.config").setup({})
+-- 0 件
+t.matches(md, "\n## Pauses\n\n%(no pauses%)\n", "0 件の文")
+t.matches(md, "| Pauses | 0 %(0 waiting%) |", "0 件の概要")
+-- 日本語
+require("agentmap.i18n").setup("ja")
+local mdzj = export.to_markdown(pause_state(), { now = NOW, stats = STATS })
+t.matches(mdzj, "\n## 一時停止\n", "日本語: 見出し")
+t.ok(mdzj:find("\n- [2] レビュー係 — " .. clk(NOW - 50) .. " 関門 → " .. clk(NOW - 45) .. " から SubagentStop で待機中（書き出し時点）\n", 1, true),
+  "日本語: 待機中の行")
+t.matches(mdzj, "| 一時停止 | 4 件（待機中 1） |", "日本語: 概要")
+t.matches(export.to_markdown({ run_id = "r0", agents = { ROOT = { id = "ROOT", status = "RUNNING" } } }), "\n## 一時停止\n\n（一時停止なし）\n", "日本語: 0 件")
 require("agentmap.i18n").setup("en")
 
 -- 5. ファイルに書き出す（markdown / html / pdf）

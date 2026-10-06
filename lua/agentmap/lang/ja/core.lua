@@ -69,7 +69,7 @@ return {
   ["health.claude_projects_missing"] = "Claude の設定フォルダ: %{path}（%{source} から）に projects/ がありません。取り込みと会話記録は使えません",
   ["health.claude_dir_missing"] = "Claude の設定フォルダがありません: %{path}（%{source} から）",
   ["health.hooks_installed"] = "hooks は %{path} に登録済みです",
-  ["health.hooks_outdated"] = "%{path} の hooks は古い形です（v0.1.1 は TaskCreate/TaskUpdate/TaskList の記録と修正指示の配達が増えました）: :AgentMapInstallHooks を実行してください",
+  ["health.hooks_outdated"] = "%{path} の hooks は古い形です（v0.1.2 は一時停止と hook の timeout 延長が増えました）: :AgentMapInstallHooks を実行してください",
   ["health.hooks_partial"] = "%{path} には hooks の一部しか登録されていません。:AgentMapInstallHooks をもう一度実行してください",
   ["health.hooks_missing"] = "%{path} に hooks が登録されていません。:AgentMapInstallHooks を実行してください",
   ["health.store_ok"] = "記録の保存先: %{path}（%{source} から）、書き込み可、run %{runs} 件",
@@ -111,4 +111,17 @@ return {
   ["health.term_missing"] = "Claude の端末: term モジュールがありません。親への指示は hooks に落ちます",
   -- v0.1.1: 子への修正指示を親に知らせる文（モデル向け。どの言語の表でも同じ英文。steer 設計書 付録 E）
   ["steer.notice_to_parent"] = "[AgentMap] The user sent this instruction directly to your sub-agent [%{index}] \"%{name}\": %{text}. If it also affects other sub-agents or your plan, update them.",
+  -- v0.1.2: 一時停止と関門（DESIGN-v0.1.2-pause 付録 A）
+  ["health.pause_on"] = "一時停止: 有効（自動再開 %{s} 秒）。hook の timeout %{timeout} を登録済み",
+  ["health.pause_off"] = "一時停止: 無効（pause.enabled = false）",
+  ["health.pause_outdated"] = "一時停止の設定と登録済み hook が違います（--pause 無しか timeout 不足）: :AgentMapInstallHooks を実行してください",
+  ["health.pause_flag_ok"] = "止まれはありません",
+  ["health.pause_flag_pending"] = "止まれが %{n} 件（待機中を含む）",
+  ["health.pause_flag_stale"] = "pause.pending の印だけ残っています（止まれのファイル無し）。:AgentMap を開くと消えます",
+  ["init.cmd_pause"] = "AgentMap: Agent を一時停止／再開",
+  ["init.cmd_resume"] = "AgentMap: 止めた Agent を再開",
+  ["init.cmd_gate"] = "AgentMap: この実行の関門を入／切",
+  ["init.pause_usage"] = ":AgentMapPause {n|id} [next|stop]",
+  ["init.resume_usage"] = ":AgentMapResume {n|id}",
+  ["init.gate_usage"] = ":AgentMapGate [on|off]",
 }

@@ -13,6 +13,9 @@
 --    :AgentMapInstallHooks [path]        register the recording hooks in Claude Code's settings.json
 --    :AgentMapImport [session_id]        import a run that has no records from Claude's transcript
 --    :AgentMapSteer <index|id> [text]    send a steering instruction to an agent (no text: editor)
+--    :AgentMapPause <index|id> [next|stop]  pause an agent at its next tool call / only at its end
+--    :AgentMapResume <index|id>          resume a paused agent (a gate: let it pass)
+--    :AgentMapGate [on|off]              gate of the run on screen on / off (no argument: toggle)
 -- ============================================================
 local M = {}
 
@@ -210,6 +213,11 @@ local function start_watch(run)
     -- 宛先が終わって届かなかった修正指示を片付ける（知らせるのは ui 側）
     if ui.sweep_steers then
       local ok, r = pcall(ui.sweep_steers)
+      changed = changed or (ok and r)
+    end
+    -- 止まれの掃除・関門の止まれを新しい子に置く・止まった／再開したの知らせ（DESIGN-v0.1.2-pause §4）
+    if ui.sweep_pauses then
+      local ok, r = pcall(ui.sweep_pauses)
       changed = changed or (ok and r)
     end
     if changed then
@@ -614,6 +622,84 @@ function M.steer(arg, ...)
   return ui.steer_send(id, text)
 end
 
+-- 図の run で Agent を探す（見せている流れ → run 全体）。見つからなければ知らせて nil
+local function find_agent(ui, arg)
+  local id = M.resolve(ui.display_state(), arg)
+  if not id and ui.run and ui.run.state then id = M.resolve(ui.run.state, arg) end
+  if not id then notify(tr("init.agent_not_found", { arg = tostring(arg) }), vim.log.levels.WARN) end
+  return id
+end
+
+-- 鍵が言語ファイルに無いときの英語の既定の文（使い方の 1 行）
+local function tr_or(key, fallback)
+  local i18n = require("agentmap.i18n")
+  if i18n.has(key) or i18n.has(key, "en") then return tr(key) end
+  return fallback
+end
+
+local PAUSE_AT = { next = "next", stop = "stop" }
+
+--- Pause an agent (index, "ROOT" or id) at its next tool call or when it finishes (at = "next",
+--- default), or only when it finishes (at = "stop"). See :h agentmap-pause.
+---@param arg string|number
+---@param at? "next"|"stop"
+function M.pause(arg, at)
+  ensure_setup()
+  if at ~= nil and at ~= "" and not PAUSE_AT[tostring(at):lower()] then
+    notify(tr_or("init.pause_usage", ":AgentMapPause {n|id} [next|stop]"), vim.log.levels.WARN)
+    return
+  end
+  local ui = ensure_open()
+  if not ui then return end
+  local id = find_agent(ui, arg)
+  if not id then return end
+  return ui.pause_command(id, at and PAUSE_AT[tostring(at):lower()] or nil)
+end
+
+--- Resume a paused agent (index, "ROOT" or id); a box waiting at the gate is let through.
+---@param arg string|number
+function M.resume(arg)
+  ensure_setup()
+  local ui = ensure_open()
+  if not ui then return end
+  local id = find_agent(ui, arg)
+  if not id then return end
+  return ui.pause_resume(id)
+end
+
+--- Turn the gate of the run on screen on ("on"), off ("off") or over (nil): while it is on, every
+--- running sub-agent waits at its end for Pass / Fix.
+---@param arg? "on"|"off"
+function M.gate(arg)
+  ensure_setup()
+  local on
+  arg = arg and tostring(arg):lower() or ""
+  if arg == "on" then
+    on = true
+  elseif arg == "off" then
+    on = false
+  elseif arg ~= "" then
+    notify(tr_or("init.gate_usage", ":AgentMapGate [on|off]"), vim.log.levels.WARN)
+    return
+  end
+  local ui = ensure_open()
+  if not ui then return end
+  return ui.toggle_gate(on)
+end
+
+--- Neovim を閉じるとき：pause.release_on_exit = true の人だけ、見ている run の止まれを全部解く
+--- （既定 false：止めたまま。hook が自分の期限で再開する。付録 D の Q14）
+function M._on_exit()
+  local okc, config = pcall(require, "agentmap.config")
+  local pc = okc and config.get().pause
+  if type(pc) ~= "table" or pc.enabled == false or pc.release_on_exit ~= true then return 0 end
+  local ui = try("agentmap.ui")
+  local events = try("agentmap.events")
+  if not ui or not ui.run or not events or type(events.release_all) ~= "function" then return 0 end
+  local ok, n = pcall(events.release_all, ui.run, "nvim_exit")
+  return ok and n or 0
+end
+
 --- Register the recording hooks in Claude Code's settings.json (shows a diff and asks first).
 ---@param path? string settings.json to edit (default: config.settings_path())
 ---@return boolean ok, table info see hooks.install
@@ -678,7 +764,7 @@ local function complete_review(arglead, cmdline)
   return {}
 end
 
---- Register the 9 user commands (also called from plugin/agentmap.lua). Re-registering is harmless.
+--- Register the 12 user commands (also called from plugin/agentmap.lua). Re-registering is harmless.
 --- Descriptions are translated at the moment of registration (setup() registers them again).
 function M.commands()
   if not did_setup then
@@ -709,6 +795,24 @@ function M.commands()
     end
     M.steer(unpack(o.fargs))
   end), { nargs = "*", desc = tr("init.cmd_steer") })
+  cmd("AgentMapPause", guard(function(o)
+    if not o.fargs[1] then
+      notify(tr_or("init.pause_usage", ":AgentMapPause {n|id} [next|stop]"), vim.log.levels.WARN)
+      return
+    end
+    M.pause(o.fargs[1], o.fargs[2])
+  end), { nargs = "+", complete = function(arglead, cmdline)
+    local n = #vim.split(vim.trim(cmdline), "%s+") - (cmdline:match("%s$") and 0 or 1)
+    if n == 2 then
+      return vim.tbl_filter(function(f) return f:find(arglead, 1, true) == 1 end, { "next", "stop" })
+    end
+    return {}
+  end, desc = tr_or("init.cmd_pause", "AgentMap: pause / resume an agent") })
+  cmd("AgentMapResume", guard(function(o) M.resume(o.args) end),
+    { nargs = 1, desc = tr_or("init.cmd_resume", "AgentMap: resume a paused agent") })
+  cmd("AgentMapGate", guard(function(o) M.gate(o.fargs[1]) end), { nargs = "?", complete = function(arglead)
+    return vim.tbl_filter(function(f) return f:find(arglead, 1, true) == 1 end, { "on", "off" })
+  end, desc = tr_or("init.cmd_gate", "AgentMap: gate on/off for this run") })
 end
 
 local function keymaps()
@@ -735,11 +839,16 @@ function M.setup(opts)
   local function hl()
     local r = try("agentmap.renderer")
     if r and r.setup_highlights then pcall(r.setup_highlights) end
+    -- 止まっている箱の橙（AgentMapPaused）は graph が定義する（W2。無ければ何もしない）
+    local g = try("agentmap.graph")
+    if g and type(g.setup_highlights) == "function" then pcall(g.setup_highlights) end
   end
   hl()
   vim.api.nvim_create_autocmd("ColorScheme", { group = group, callback = hl })
   -- 矢印の光は背景の明暗で色を変える
   vim.api.nvim_create_autocmd("OptionSet", { group = group, pattern = "background", callback = hl })
+  -- Neovim を閉じるとき（pause.release_on_exit = true の人だけ止まれを解く）
+  vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = function() pcall(M._on_exit) end })
   return M
 end
 

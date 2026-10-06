@@ -161,4 +161,43 @@ for _, c in ipairs({ { "graph.waiting_n", { n = 3 } }, { "graph.ask" } }) do
   t.ok(vim.fn.strdisplaywidth(e) <= vim.fn.strdisplaywidth(j), c[1] .. " は日本語より広くない（" .. e .. " / " .. j .. "）")
 end
 
+-- ------------------------------------------------------------
+-- 5. v0.1.2 の一時停止と関門（DESIGN-v0.1.2-pause 付録 A）：鍵が英日そろい、差し込み口が同じ
+-- ------------------------------------------------------------
+local PAUSE_KEYS = {
+  "keymaps.help_pause", "keymaps.help_gate", "keymaps.desc_pause", "keymaps.desc_gate", "keymaps.help_aux_tdwa",
+  "graph.legend_orange", "graph.legend_paused",
+  "ui.pause_prompt", "ui.pause_next", "ui.pause_stop", "ui.pause_cancel", "ui.pause_resume", "ui.pause_resume_with",
+  "ui.pause_keep", "ui.pause_pass", "ui.pause_fix", "ui.pause_keep_gate", "ui.pause_write_instead", "ui.pause_show",
+  "ui.pause_requested", "ui.pause_requested_stop", "ui.pause_resumed", "ui.pause_resumed_with", "ui.pause_cancelled",
+  "ui.pause_hit", "ui.pause_hit_gate", "ui.pause_auto", "ui.pause_aborted", "ui.pause_expired", "ui.pause_not_target",
+  "ui.pause_run_ended", "ui.pause_disabled", "ui.pause_hooks_outdated", "ui.gate_on", "ui.gate_off",
+  "detail.h_pauses", "detail.pause_requested_next", "detail.pause_requested_stop", "detail.pause_gate",
+  "detail.pause_paused", "detail.pause_waiting", "detail.pause_resumed_user", "detail.pause_resumed_with",
+  "detail.pause_resumed_auto", "detail.pause_resumed_exit", "detail.pause_resumed_gate_off", "detail.pause_aborted",
+  "detail.pause_expired", "detail.pause_reason_finished", "detail.pause_reason_session", "detail.pause_reason_gate_off",
+  "detail.pause_duration", "detail.footer",
+  "export.h_pauses", "export.pause_line", "export.pause_waiting", "export.pause_resumed_user", "export.pause_resumed_with",
+  "export.pause_resumed_auto", "export.pause_resumed_exit", "export.pause_resumed_gate_off", "export.pause_aborted",
+  "export.pause_expired", "export.pause_requested", "export.pause_none", "export.ov_pauses", "export.ov_gate",
+  "health.pause_on", "health.pause_off", "health.pause_outdated", "health.pause_flag_ok", "health.pause_flag_pending",
+  "health.pause_flag_stale", "health.hooks_outdated", "init.cmd_pause", "init.cmd_resume", "init.cmd_gate",
+}
+local miss = {}
+for _, k in ipairs(PAUSE_KEYS) do
+  if en[k] == nil or ja[k] == nil then miss[#miss + 1] = k end
+end
+t.eq(miss, {}, "付録 A の鍵が en と ja の両方にある")
+t.eq(holes(en["ui.pause_hit"]), { "label", "time", "via" }, "ui.pause_hit の差し込み口")
+t.eq(holes(en["detail.pause_waiting"]), { "time", "until", "via" }, "detail.pause_waiting の差し込み口")
+t.matches(en["detail.footer"], "s steer  x pause  Enter", "footer に x pause")
+t.matches(en["keymaps.help_aux_tdwa"], "steer / pause$", "aux の一覧に pause")
+t.matches(en["health.hooks_outdated"], "v0%.1%.2 pauses agents and raises the hook timeout", "古い登録の文を差し替え")
+-- 箱の札は英語のまま（S9）。日本語でも同じ
+i18n.setup("ja")
+t.eq(i18n.t("graph.legend_paused"), "[PAUSED] [GATE]", "ja でも札は英語")
+i18n.setup("en")
+-- 箱の 4 行目に並ぶ札と印は日本語より広くしない（札は英日で同じ。⏸ は言語に依らない）
+t.ok(vim.fn.strdisplaywidth("[PAUSED] ~62.4% 12:34") <= 24, "[PAUSED] ~62.4% 12:34 は内側 24 桁に収まる")
+
 t.done()

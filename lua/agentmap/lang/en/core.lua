@@ -69,7 +69,7 @@ return {
   ["health.claude_projects_missing"] = "Claude config dir: %{path} (from %{source}) has no projects/ folder; import and transcripts are unavailable",
   ["health.claude_dir_missing"] = "Claude config dir does not exist: %{path} (from %{source})",
   ["health.hooks_installed"] = "Hooks are registered in %{path}",
-  ["health.hooks_outdated"] = "Hooks in %{path} are outdated (v0.1.1 records TaskCreate/TaskUpdate/TaskList and delivers steering instructions): run :AgentMapInstallHooks",
+  ["health.hooks_outdated"] = "Hooks in %{path} are outdated (v0.1.2 pauses agents and raises the hook timeout): run :AgentMapInstallHooks",
   ["health.hooks_partial"] = "Only some hooks are registered in %{path}; run :AgentMapInstallHooks again",
   ["health.hooks_missing"] = "Hooks are not registered in %{path}; run :AgentMapInstallHooks",
   ["health.store_ok"] = "Record store: %{path} (from %{source}), writable, %{runs} runs",
@@ -111,4 +111,17 @@ return {
   ["health.term_missing"] = "Claude terminal: term module missing; main-agent steering falls back to hooks",
   -- v0.1.1: notice to the parent of a steered sub-agent (model-facing; the same English text in every language, steer appendix E)
   ["steer.notice_to_parent"] = "[AgentMap] The user sent this instruction directly to your sub-agent [%{index}] \"%{name}\": %{text}. If it also affects other sub-agents or your plan, update them.",
+  -- v0.1.2: pause and gate (DESIGN-v0.1.2-pause appendix A)
+  ["health.pause_on"] = "Pause: on (auto-resume %{s} s); hook timeout %{timeout} registered",
+  ["health.pause_off"] = "Pause: off (pause.enabled = false)",
+  ["health.pause_outdated"] = "Pause settings differ from the registered hook (no --pause or timeout too small): run :AgentMapInstallHooks",
+  ["health.pause_flag_ok"] = "No pending pauses",
+  ["health.pause_flag_pending"] = "%{n} pause(s) pending or waiting",
+  ["health.pause_flag_stale"] = "Stale pause.pending flag (no pause files); opening :AgentMap removes it",
+  ["init.cmd_pause"] = "AgentMap: pause / resume an agent",
+  ["init.cmd_resume"] = "AgentMap: resume a paused agent",
+  ["init.cmd_gate"] = "AgentMap: gate on/off for this run",
+  ["init.pause_usage"] = ":AgentMapPause {n|id} [next|stop]",
+  ["init.resume_usage"] = ":AgentMapResume {n|id}",
+  ["init.gate_usage"] = ":AgentMapGate [on|off]",
 }

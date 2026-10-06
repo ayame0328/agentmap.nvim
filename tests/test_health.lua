@@ -56,6 +56,20 @@ t.eq({ cf.progress.enabled, cf.animation.enabled, cf.steer.enabled }, { false, f
 t.eq(cf.progress.no_steps, "time", "false でも他の既定は残る")
 t.eq(config.setup({ progress = true }).progress.enabled, true, "true は既定のまま有効")
 t.eq(config.setup({ progress = { no_steps = "none" } }).progress.default_ms, 600000, "一部だけ渡しても残りは既定")
+-- v0.1.2 の一時停止（DESIGN-v0.1.2-pause §8.1、付録 D：release_on_exit の既定は false）
+config.setup({})
+c = config.get()
+t.eq({ c.pause.enabled, c.pause.auto_resume_s, c.pause.gate, c.pause.release_on_exit, c.pause.notify },
+  { true, 600, false, false, true }, "pause の既定")
+t.eq(config.setup({ pause = false }).pause.enabled, false, "pause = false は { enabled = false }")
+t.eq(config.setup({ pause = false }).pause.auto_resume_s, 600, "pause = false でも他の既定は残る")
+t.eq(config.setup({ pause = true }).pause.enabled, true, "pause = true は有効")
+t.eq(config.setup({ pause = { gate = true } }).pause.auto_resume_s, 600, "一部だけ渡しても残りは既定")
+t.eq(config.setup({ pause = { auto_resume_s = 1 } }).pause.auto_resume_s, 5, "auto_resume_s は 5 秒より短くしない")
+t.eq(config.setup({ pause = { auto_resume_s = 999999 } }).pause.auto_resume_s, 86400, "auto_resume_s は 86400 秒まで")
+t.eq(config.setup({ pause = { auto_resume_s = 1200.7 } }).pause.auto_resume_s, 1200, "auto_resume_s は整数の秒")
+t.eq(config.setup({ pause = { auto_resume_s = "x" } }).pause.auto_resume_s, 600, "数でなければ既定")
+t.eq(config.defaults.pause.auto_resume_s, 600, "既定の表は書き換えない")
 config.setup({})
 vim.g.agentmap_lang = "ja"
 t.eq(config.setup({}).lang, "ja", "setup に lang が無ければ vim.g.agentmap_lang")
@@ -175,6 +189,68 @@ vim.fn.writefile({ "{}" }, rdir .. "/steer/a1-1.json")
 vim.fn.writefile({ "{}" }, rdir .. "/steer/a1-0.delivered.json")
 run_health()
 t.ok(find("info", "^1 pending steering instruction%(s%)$"), "14: 未配達 1 件（配達済みは数えない）")
+
+-- 7. v0.1.2 の 2 行（DESIGN-v0.1.2-pause §8.2 の 16・17）。担当 W2
+--   settings.json は手で作る（hooks.lua の作業中でも試せるように、§7.1 の形そのもの）
+local function cmd_of(extra) return "'python3' '/x/bin/agentmap-collect' --root '" .. store .. "' --steer --mode deny" .. extra end
+local function write_settings(pause_words, timeout)
+  local guard = "[ -e '" .. store .. "/steer.pending' ] || [ -e '" .. store .. "/pause.pending' ] || exit 0; exec "
+    .. cmd_of(pause_words)
+  local function one(command, to) return { { matcher = "", hooks = { { type = "command", command = command, timeout = to } } } } end
+  vim.fn.writefile({ vim.json.encode({ hooks = {
+    PreToolUse = { { matcher = "*", hooks = { { type = "command", command = guard, timeout = timeout } } } },
+    SubagentStop = one(cmd_of(" --at-stop" .. pause_words .. " --record"), timeout),
+    Stop = one(cmd_of(" --at-stop" .. pause_words .. " --record"), timeout),
+  } }) }, spath)
+end
+local HM = require("agentmap.health")
+write_settings(" --pause --max-wait 600", 630)
+config.setup({})
+t.eq({ HM.pause_registration(spath, config.get().pause) }, { true, 630 }, "16: --pause と timeout 630 → 合格")
+run_health()
+t.ok(find("ok", "^Pause: on %(auto%-resume 600 s%); hook timeout 630 registered$"), "16: ok の行")
+t.ok(find("ok", "^No pending pauses$"), "17: 止まれなし")
+config.setup({ pause = { auto_resume_s = 1200 } })
+t.eq(HM.pause_registration(spath, config.get().pause), false, "16: 設定を 1200 秒に伸ばしたのに timeout 630 → 不合格")
+run_health()
+t.ok(find("warn", "^Pause settings differ from the registered hook %(no %-%-pause or timeout too small%): run :AgentMapInstallHooks$"),
+  "16: timeout 不足は warn")
+write_settings("", 10) -- v0.1.1 の形
+config.setup({})
+t.eq(HM.pause_registration(spath, config.get().pause), false, "16: v0.1.1 の登録（--pause 無し・timeout 10）→ 不合格")
+run_health()
+t.ok(find("warn", "^Pause settings differ"), "16: v0.1.1 の登録は warn")
+write_settings(" --pause --max-wait 600", 10)
+t.eq(HM.pause_registration(spath, config.get().pause), false, "16: --pause があっても timeout 10 → 不合格")
+config.setup({ pause = false })
+run_health()
+t.ok(find("info", "^Pause: off %(pause%.enabled = false%)$"), "16: 無効なら info")
+os.remove(spath)
+config.setup({})
+run_health()
+t.ok(find("warn", "^Pause settings differ"), "16: 登録が無ければ warn")
+-- 17. 止まれの印：印だけ／止まれのファイルあり（.hit.json と GATE は数えない）
+vim.fn.writefile({}, store .. "/pause.pending")
+run_health()
+t.ok(find("warn", "^Stale pause%.pending flag %(no pause files%); opening :AgentMap removes it$"), "17: 印だけ残っている")
+t.ok(vim.uv.fs_stat(store .. "/pause.pending") ~= nil, "17: health は印を消さない")
+vim.fn.mkdir(rdir .. "/pause", "p")
+vim.fn.writefile({ "{}" }, rdir .. "/pause/a1.json")
+vim.fn.writefile({ "{}" }, rdir .. "/pause/a1.hit.json")
+vim.fn.writefile({ "{}" }, rdir .. "/pause/ROOT.json")
+vim.fn.writefile({}, rdir .. "/pause/GATE")
+run_health()
+t.ok(find("info", "^2 pause%(s%) pending or waiting$"), "17: 止まれ 2 件（.hit.json と GATE は数えない）")
+os.remove(store .. "/pause.pending")
+run_health()
+t.ok(find("ok", "^No pending pauses$"), "17: 印が無ければ ok（ファイルが残っていても数えない）")
+-- 日本語
+require("agentmap.i18n").setup("ja")
+config.setup({ lang = "ja", pause = false })
+run_health()
+t.ok(find("info", "^一時停止: 無効（pause%.enabled = false）$"), "16: 日本語")
+require("agentmap.i18n").setup("en")
+config.setup({})
 
 -- 後片付け
 for k, v in pairs(saved) do vim.env[k] = v end

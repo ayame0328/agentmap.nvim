@@ -1,6 +1,7 @@
 -- agentmap/ui.lua ... screens: the map tab, the side (aux) window and the back navigation,
 --   the once-a-second redraw while something runs (progress % and elapsed time move), the flow
---   light (anim.lua) and steering (writing an instruction to a box with `s`).
+--   light (anim.lua), steering (writing an instruction to a box with `s`) and pausing (`x` pauses or
+--   resumes a box, `X` turns the gate of the run on and off; DESIGN-v0.1.2-pause).
 --   図 → 詳細 → transcript/diff → BS → 詳細 → BS → 図、を ui.nav（戻り先の積み重ね）で実現する。
 local graph = require("agentmap.graph")
 local renderer = require("agentmap.renderer")
@@ -32,6 +33,7 @@ local ticker = nil -- 毎秒の描き直しのタイマー
 local log_marks = {} -- { ["<sid>:<id>"] = { last = 秒, running = bool } } 推定の記録（30 秒に 1 回）
 local expired_seen = {} -- { [sid] = { [steer_id] = true } } 「届かなかった」と知らせ済み
 local notice_done = {} -- { [sid] = { [steer_id] = true } } 親への知らせを作った（または作らないと決めた）指示
+local pause_seen = {} -- { [sid] = { [pause_id] = status } } 一時停止の状態の変わり目を知らせ済み
 
 local VIEWS = {
   detail = "agentmap.views.detail",
@@ -45,6 +47,43 @@ local function is_check(id) return type(id) == "string" and id:sub(1, 6) == "che
 local function notify(msg, level)
   vim.notify("AgentMap: " .. msg, level or vim.log.levels.INFO)
 end
+
+-- 一時停止の文（DESIGN-v0.1.2-pause 付録 A）。鍵が言語ファイルに無いあいだは英語の既定の文を使う
+-- （鍵は W2 が書く。無い鍵を t() に渡すと鍵の名前がそのまま画面に出るため）
+local PAUSE_TEXT = {
+  ["ui.pause_prompt"] = "Pause %{label}",
+  ["ui.pause_pass"] = "Pass (let it finish)",
+  ["ui.pause_fix"] = "Fix: write an instruction (it continues)",
+  ["ui.pause_keep_gate"] = "Keep waiting; show the report",
+  ["ui.pause_requested"] = "Pause requested for %{label}: stops at its next tool call (auto-resume after %{min})",
+  ["ui.pause_requested_stop"] = "Pause requested for %{label}: stops when it finishes (auto-resume after %{min})",
+  ["ui.pause_resumed"] = "%{label} resumed",
+  ["ui.pause_resumed_with"] = "%{label} resumed with the instruction",
+  ["ui.pause_cancelled"] = "Pause request for %{label} withdrawn",
+  ["ui.pause_hit"] = "%{label} is paused at %{via} (auto-resume at %{time}): x resume, s instruction",
+  ["ui.pause_hit_gate"] = "%{label} waits before finishing (gate): x pass, s fix (passes by itself at %{time})",
+  ["ui.pause_auto"] = "%{label} resumed by itself after %{min}",
+  ["ui.pause_aborted"] = "The pause of %{label} ended: Claude Code stopped the hook (exit or timeout)",
+  ["ui.pause_expired"] = "%{label} finished before it could pause",
+  ["ui.pause_not_target"] = "This box cannot be paused (choose a running agent box)",
+  ["ui.pause_run_ended"] = "This run has ended; nothing to pause",
+  ["ui.pause_disabled"] = "Pausing is off (pause.enabled = false)",
+  ["ui.pause_hooks_outdated"] = "The registered hooks have no pause support: run :AgentMapInstallHooks first",
+  ["ui.pause_none"] = "%{label} is not paused",
+  ["ui.pause_failed"] = "Could not change the pause of %{label}: %{err}",
+  ["ui.gate_on"] = "Gate on for this run: every sub-agent waits at its end (x pass / s fix)",
+  ["ui.gate_off"] = "Gate off for this run",
+}
+local function pt(key, vars)
+  if i18n.has(key) or i18n.has(key, "en") then return t(key, vars) end
+  local s = PAUSE_TEXT[key] or key
+  return (s:gsub("%%{([%w_]+)}", function(k)
+    local v = vars and vars[k]
+    if v == nil then return nil end
+    return tostring(v)
+  end))
+end
+M._pt = pt
 
 -- 他の担当のモジュールは、無くても落ちないように読み込む
 local function try_require(name)
@@ -160,12 +199,30 @@ function M._stats()
   return ok and S or nil
 end
 
+--- Status shown for agent `id` in state `s`: "PAUSED" / "GATE" while a pause holds it (the hook
+--- waits), else its own status. Uses state.display_status; the same rule is kept here as a fallback.
+function M.display_status(s, id)
+  if type(s) ~= "table" then return nil end
+  if state_mod.display_status then
+    local ok, st = pcall(state_mod.display_status, s, id)
+    if ok and st then return st end
+  end
+  for _, p in pairs(type(s.pauses) == "table" and s.pauses or {}) do
+    if type(p) == "table" and p.agent_id == id and p.status == "PAUSED" then
+      return p.kind == "gate" and "GATE" or "PAUSED"
+    end
+  end
+  local a = s.agents and s.agents[id]
+  return a and a.status or nil
+end
+
 --- { [id] = status } of the agents and HUMAN CHECK boxes in state `s` (what the light follows).
+--- Agents held by a pause are "PAUSED" / "GATE" (not lit).
 function M.status_map(s)
   local out = {}
   if type(s) ~= "table" then return out end
   for id, a in pairs(s.agents or {}) do
-    if type(a) == "table" and a.status then out[id] = a.status end
+    if type(a) == "table" and a.status then out[id] = M.display_status(s, id) or a.status end
   end
   for id, c in pairs(type(s.checks) == "table" and s.checks or {}) do
     if type(c) == "table" and c.status then out[c.id or id] = c.status end
@@ -208,6 +265,10 @@ function M.should_tick(s)
   -- 未配達の修正指示：宛先が終わってから数秒後に期限切れにするのは tick の sweep なので、それまで回す
   for _, st in pairs(type(s.steers) == "table" and s.steers or {}) do
     if type(st) == "table" and st.status == "PENDING" then return true end
+  end
+  -- 止まれ（置いた・止まっている）：止まった・自動で再開したの知らせと、掃除は tick が見る
+  for _, p in pairs(type(s.pauses) == "table" and s.pauses or {}) do
+    if type(p) == "table" and (p.status == "REQUESTED" or p.status == "PAUSED") then return true end
   end
   return false
 end
@@ -346,6 +407,7 @@ function M.open_map(run, flow_id)
     anim.reset() -- 前に見ていたものの「終わった瞬間」を新しい図で光らせない
     M.steer_expanded = {}
     M._seed_expired()
+    M._seed_pauses()
   end
 
   if not valid_buf(M.buf) then
@@ -1056,6 +1118,7 @@ function M.tick()
     if ok and changed and ev.enrich then pcall(ev.enrich, M.run) end
   end
   M.sweep_steers()
+  M.sweep_pauses()
   M.refresh({ aux = false })
 end
 
@@ -1101,8 +1164,13 @@ M._steer_label = label_of
 
 --- How a steering instruction to `id` is delivered: "root" (the terminal), "redo" (a finished
 --- agent: ask the main agent in the terminal to redo it) or "hook" (a running agent: its next tool call).
+---   An agent held by a pause takes it through the hook that holds it (DESIGN-v0.1.2-pause §5.4):
+---   ROOT with a pause placed or waiting, and a sub-agent waiting at its end (the gate; its stop is
+---   already recorded, so it looks finished) both get "hook".
 function M.steer_kind(id)
-  if id == "ROOT" then return "root" end
+  local p = M._live_pause(id)
+  if id == "ROOT" then return p and "hook" or "root" end
+  if p and p.status == "PAUSED" then return "hook" end
   local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
   if a and FINISHED[a.status] then return "redo" end
   return "hook"
@@ -1324,12 +1392,20 @@ function M.steer_send(id, text, cb)
     return done("ended")
   end
   if kind == "hook" then
+    local held = M._live_pause(aid)
+    local held_status = held and held.status
     local sid = request(ev, aid, text, { via = "hook", kind = "steer", prompt_id = prompt_id })
     if not sid then
       notify(t("ui.steer_disabled"), vim.log.levels.WARN)
       return done(nil)
     end
-    notify(t("ui.steer_queued", { label = label_of(aid) }))
+    -- 止まれのある宛先：指示のファイルを置いた**後で**止まれを消す（hook は止まれが消えた後に指示を取りに行く）。
+    -- 止まっていた（PAUSED）なら、その場で指示つきで再開する。まだ止まっていない（REQUESTED）なら止まる意味が無くなる
+    if held and M._resume_raw(aid, { reason = "user", steer_id = sid }) and held_status == "PAUSED" then
+      notify(pt("ui.pause_resumed_with", { label = label_of(aid) }))
+    else
+      notify(t("ui.steer_queued", { label = label_of(aid) }))
+    end
     after_steer()
     return done("queued")
   end
@@ -1364,7 +1440,7 @@ function M.steer_input(id, on_submit)
   on_submit = on_submit or function(text) M.steer_send(aid, text) end
   local cfg = M.steer_cfg()
   local kind = M.steer_kind(aid)
-  local title = aid == "ROOT" and t("ui.steer_prompt", { label = "ROOT (terminal)" })
+  local title = (aid == "ROOT" and kind == "root") and t("ui.steer_prompt", { label = "ROOT (terminal)" })
     or t("ui.steer_prompt", { label = label_of(aid) })
   if cfg.input == "line" then
     vim.ui.input({ prompt = title .. ": " }, function(text)
@@ -1640,6 +1716,394 @@ function M.sweep_steers()
   M.notify_expired()
   local ok, n = pcall(M.notify_parents)
   if ok and n and n > 0 then changed = true end
+  return changed
+end
+
+-- ------------------------------------------------------------
+-- 一時停止と関門（DESIGN-v0.1.2-pause §4・§5.4・§6、付録 D の本人の答え）
+--   x  = 止める（次の道具の直前か終わる直前の早い方）／もう 1 回で再開。メニューは出さない。
+--        関門で終わる前に止まっている箱（[GATE]）だけ「通す／直す」のメニュー。
+--   X  = 見ている run の関門の入／切。
+--   止まっている宛先に s で書いた指示は、止まれを外してその場で届く（steer_send）。
+-- ------------------------------------------------------------
+local PAUSE_DEFAULTS = { enabled = true, auto_resume_s = 600, gate = false, release_on_exit = false, notify = true }
+local LIVE_PAUSE = { REQUESTED = true, PAUSED = true }
+
+--- Effective pause settings (config.get().pause; false = { enabled = false }).
+function M.pause_cfg()
+  local ok, config = pcall(require, "agentmap.config")
+  local raw = nil
+  if ok then raw = config.get().pause end
+  if raw == false then return vim.tbl_extend("force", PAUSE_DEFAULTS, { enabled = false }) end
+  if type(raw) ~= "table" then return vim.deepcopy(PAUSE_DEFAULTS) end
+  return vim.tbl_extend("force", PAUSE_DEFAULTS, raw)
+end
+
+--- The live pause (REQUESTED or PAUSED) of agent `id` in the run on screen, or nil.
+--- Uses state.pause_of; the same rule is kept here as a fallback.
+function M._live_pause(id)
+  local s = M.run and M.run.state
+  if type(s) ~= "table" or type(id) ~= "string" then return nil end
+  if state_mod.pause_of then
+    local ok, p = pcall(state_mod.pause_of, s, id)
+    if ok then return p end
+  end
+  if type(s.pauses) ~= "table" then return nil end
+  local a = s.agents and s.agents[id]
+  local p = a and a.pause and s.pauses[a.pause]
+  if type(p) == "table" and LIVE_PAUSE[p.status] then return p end
+  for _, q in pairs(s.pauses) do
+    if type(q) == "table" and q.agent_id == id and LIVE_PAUSE[q.status] then return q end
+  end
+  return nil
+end
+
+-- events のうち一時停止の関数（W1）。無ければ nil
+local function pause_events(fn)
+  local ev = try_require("agentmap.events")
+  if not ev or type(ev[fn or "request_pause"]) ~= "function" then return nil end
+  return ev
+end
+
+--- True when the registered hooks can pause (the same check as steering: hooks.status() is
+--- "installed", which in v0.1.2 also means the delivery hooks carry --pause and a long timeout).
+function M.pause_hooks_ok() return M.steer_hooks_ok() end
+
+-- 秒 → "10:00"（自動再開までの長さ）
+local function mmss(secs) return graph.util.fmt_elapsed((tonumber(secs) or 600) * 1000) end
+
+-- ミリ秒 → "10 min" / "2 min 31 s" / "45 s"
+local function dur_text(ms)
+  local s = math.floor((tonumber(ms) or 0) / 1000 + 0.5)
+  local m = math.floor(s / 60)
+  s = s % 60
+  if m == 0 then return s .. " s" end
+  if s == 0 then return m .. " min" end
+  return m .. " min " .. s .. " s"
+end
+M._dur_text = dur_text
+
+-- 時刻（epoch 秒・epoch ミリ秒・ISO の文字列）→ "HH:MM:SS"
+local function clock_of(v)
+  local secs = type(v) == "number" and v or (type(v) == "string" and graph.util.parse_iso(v)) or nil
+  if not secs then return "-" end
+  if secs > 1e11 then secs = secs / 1000 end
+  return os.date("%H:%M:%S", math.floor(secs))
+end
+
+-- 止まった時刻 + 自動再開の秒数（deadline が無いとき）
+local function deadline_of(p)
+  if p.deadline then return p.deadline end
+  local hit = p.hit_at and graph.util.parse_iso(p.hit_at)
+  if hit then return hit + (tonumber(p.auto_resume_s) or M.pause_cfg().auto_resume_s or 600) end
+  return nil
+end
+
+-- events.resume_pause を呼ぶだけ（知らせない）。成功なら true
+function M._resume_raw(aid, opts)
+  local ev = pause_events("resume_pause")
+  if not ev or not M.run then return false end
+  local ok, r, err = pcall(ev.resume_pause, M.run, aid, opts or { reason = "user" })
+  if ok and r then return true end
+  return false, ok and err or r
+end
+
+-- 今の止まれの様子を言い直す（:AgentMapPause を重ねて打ったとき）
+local function restate(aid, p)
+  local cfg = M.pause_cfg()
+  local label = label_of(aid)
+  if p.status == "PAUSED" then
+    if p.kind == "gate" then return notify(pt("ui.pause_hit_gate", { label = label, time = clock_of(deadline_of(p)) })) end
+    return notify(pt("ui.pause_hit", { label = label, via = p.hit_via or "?", time = clock_of(deadline_of(p)) }))
+  end
+  local key = p.at == "stop" and "ui.pause_requested_stop" or "ui.pause_requested"
+  notify(pt(key, { label = label, min = mmss(p.auto_resume_s or cfg.auto_resume_s) }))
+end
+
+--- Place a pause for box `id`: it stops at its next tool call or when it finishes (at = "next",
+--- the default), or only when it finishes (at = "stop"). Refused for boxes that cannot be paused,
+--- an ended run, `pause.enabled = false`, and outdated hooks.
+---@param id string map id (gate: ids are accepted)
+---@param at? "next"|"stop"
+---@param opts? { replace?: boolean } withdraw the live pause first (a gate request replaced by a pause)
+---@return string|nil pause_id, string|nil err
+function M.pause_request(id, at, opts)
+  opts = opts or {}
+  at = at == "stop" and "stop" or "next"
+  local cfg = M.pause_cfg()
+  if not cfg.enabled then
+    notify(pt("ui.pause_disabled"))
+    return nil, "disabled"
+  end
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    return nil, "bad_target"
+  end
+  if run_ended() then
+    notify(pt("ui.pause_run_ended"), vim.log.levels.WARN)
+    return nil, "ended"
+  end
+  local a = M.run and M.run.state and M.run.state.agents and M.run.state.agents[aid]
+  if a and aid ~= "ROOT" and FINISHED[a.status] and not M._live_pause(aid) then
+    notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    return nil, "finished"
+  end
+  if not M.pause_hooks_ok() then
+    notify(pt("ui.pause_hooks_outdated"), vim.log.levels.WARN)
+    return nil, "outdated"
+  end
+  local ev = pause_events("request_pause")
+  if not ev or not M.run then
+    notify(pt("ui.pause_failed", { label = label_of(aid), err = "events.request_pause is missing" }), vim.log.levels.WARN)
+    return nil, "unavailable"
+  end
+  if opts.replace and M._live_pause(aid) then M._resume_raw(aid, { reason = "user" }) end
+  local s = M.run.state
+  local prompt_id = M.flow_id or (s and state_mod.latest_flow_id(s)) or nil
+  local ok, pid, err = pcall(ev.request_pause, M.run, aid, { at = at, kind = "pause", prompt_id = prompt_id })
+  if not ok or not pid then
+    err = ok and err or pid
+    if err == "finished" or err == "bad_target" then
+      notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    elseif err == "ended" then
+      notify(pt("ui.pause_run_ended"), vim.log.levels.WARN)
+    elseif err == "exists" and M._live_pause(aid) then
+      restate(aid, M._live_pause(aid))
+    else
+      notify(pt("ui.pause_failed", { label = label_of(aid), err = tostring(err) }), vim.log.levels.WARN)
+    end
+    return nil, tostring(err)
+  end
+  local key = at == "stop" and "ui.pause_requested_stop" or "ui.pause_requested"
+  notify(pt(key, { label = label_of(aid), min = mmss(cfg.auto_resume_s) }))
+  after_steer()
+  return pid
+end
+
+--- Resume box `id` (withdraw a pause that has not stopped it yet; let a gate pass). Allowed even
+--- with `pause.enabled = false` or outdated hooks, so a pause can always be undone.
+---@param id string
+---@param opts? { reason?: string, steer_id?: string, quiet?: boolean }
+---@return boolean ok
+function M.pause_resume(id, opts)
+  opts = opts or {}
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    return false
+  end
+  local p = M._live_pause(aid)
+  if not p then
+    notify(pt("ui.pause_none", { label = label_of(aid) }))
+    return false
+  end
+  -- 状態は記録を書いた瞬間に同じ表の中で変わるので、先に控える
+  local was = p.status
+  local ok, err = M._resume_raw(aid, { reason = opts.reason or "user", steer_id = opts.steer_id })
+  if not ok then
+    notify(pt("ui.pause_failed", { label = label_of(aid), err = tostring(err or "events.resume_pause is missing") }),
+      vim.log.levels.WARN)
+    return false
+  end
+  if not opts.quiet then
+    notify(pt(was == "REQUESTED" and "ui.pause_cancelled" or "ui.pause_resumed", { label = label_of(aid) }))
+  end
+  after_steer()
+  return true
+end
+
+--- The menu of a box that waits at its end because of the gate ([GATE]):
+--- Pass (let it finish) / Fix (write an instruction; it continues) / Keep waiting (show the report).
+function M.gate_menu(id)
+  local aid = M.steer_target(id)
+  if not aid then return end
+  local items = { pt("ui.pause_pass"), pt("ui.pause_fix"), pt("ui.pause_keep_gate") }
+  vim.ui.select(items, { prompt = pt("ui.pause_prompt", { label = label_of(aid) }) }, function(_, idx)
+    if idx == 1 then
+      M.pause_resume(aid)
+    elseif idx == 2 then
+      M.steer_input(aid)
+    elseif idx == 3 then
+      M.open_detail(aid)
+    end
+  end)
+end
+
+--- `x` on a box (appendix D: no menu). No pause → place one (next tool call or the end, whichever
+--- comes first). A pause placed or holding it → resume. A box waiting at the gate ([GATE]) → the
+--- Pass / Fix menu. A gate request that has not stopped the box yet → replaced by a pause now.
+---@param id string map id
+function M.pause_toggle(id)
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    return nil
+  end
+  local p = M._live_pause(aid)
+  if p then
+    if p.kind == "gate" and p.status == "PAUSED" then return M.gate_menu(aid) end
+    if p.kind == "gate" then return M.pause_request(aid, "next", { replace = true }) end
+    return M.pause_resume(aid)
+  end
+  return M.pause_request(aid, "next")
+end
+
+--- :AgentMapPause {n|id} [next|stop]: place a pause at the chosen place. It never resumes (that is
+--- :AgentMapResume): on a box that already has one it says how it stands, a gate request or a
+--- pause placed for the other place is replaced, and a box waiting at the gate gets the Pass / Fix menu.
+---@param id string
+---@param at? "next"|"stop"
+function M.pause_command(id, at)
+  local aid = M.steer_target(id)
+  if not aid then
+    notify(pt("ui.pause_not_target"), vim.log.levels.WARN)
+    return nil
+  end
+  at = at == "stop" and "stop" or "next"
+  local p = M._live_pause(aid)
+  if not p then return M.pause_request(aid, at) end
+  if p.kind == "gate" and p.status == "PAUSED" then return M.gate_menu(aid) end
+  if p.status == "REQUESTED" and (p.kind == "gate" or (p.at or "next") ~= at) then
+    return M.pause_request(aid, at, { replace = true })
+  end
+  restate(aid, p)
+  return nil
+end
+
+--- True when the gate of the run on screen is on (events.gate_on; else the run's last gate_set,
+--- else config pause.gate).
+function M.gate_on()
+  if not M.run then return false end
+  local ev = pause_events("gate_on")
+  if ev then
+    local ok, on = pcall(ev.gate_on, M.run)
+    if ok then return on == true end
+  end
+  local s = M.run.state
+  if type(s) == "table" and s.gate ~= nil then return s.gate == true end
+  return M.pause_cfg().gate == true
+end
+
+--- `X`: turn the gate of the run on screen on or off (on = nil toggles). While it is on, every
+--- running sub-agent waits at its end for Pass (x) or Fix (s). Turning it on needs current hooks.
+---@param on? boolean
+---@return boolean|nil the new state, nil when refused
+function M.toggle_gate(on)
+  local cfg = M.pause_cfg()
+  if not M.run then
+    notify(t("ui.no_runs_to_show"), vim.log.levels.WARN)
+    return nil
+  end
+  if not cfg.enabled then
+    notify(pt("ui.pause_disabled"))
+    return nil
+  end
+  if on == nil then on = not M.gate_on() end
+  if on and run_ended() then
+    notify(pt("ui.pause_run_ended"), vim.log.levels.WARN)
+    return nil
+  end
+  if on and not M.pause_hooks_ok() then
+    notify(pt("ui.pause_hooks_outdated"), vim.log.levels.WARN)
+    return nil
+  end
+  local ev = pause_events("set_gate")
+  if not ev then
+    notify(pt("ui.pause_failed", { label = "gate", err = "events.set_gate is missing" }), vim.log.levels.WARN)
+    return nil
+  end
+  local ok, r = pcall(ev.set_gate, M.run, on)
+  if not ok or r == false then
+    notify(pt("ui.pause_failed", { label = "gate", err = tostring(ok and "write failed" or r) }), vim.log.levels.WARN)
+    return nil
+  end
+  notify(pt(on and "ui.gate_on" or "ui.gate_off"))
+  after_steer()
+  return on
+end
+
+-- 開いた時点の状態を覚える（開く前のことは知らせない）
+function M._seed_pauses()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not sid then return end
+  local seen = {}
+  for k, p in pairs(s and type(s.pauses) == "table" and s.pauses or {}) do
+    if type(p) == "table" then seen[k] = p.status end
+  end
+  pause_seen[sid] = seen
+end
+
+-- 状態の変わり目 1 つ分の知らせ（知らせないものは nil）
+local function pause_message(p)
+  local label = label_of(p.agent_id)
+  if p.status == "PAUSED" then
+    if p.kind == "gate" then
+      return pt("ui.pause_hit_gate", { label = label, time = clock_of(deadline_of(p)) })
+    end
+    return pt("ui.pause_hit", { label = label, via = p.hit_via or "?", time = clock_of(deadline_of(p)) })
+  elseif p.status == "RESUMED" then
+    local r = p.release_reason
+    if r == "auto" or r == "max_wait" then
+      local ms = p.waited_ms or ((tonumber(p.auto_resume_s) or M.pause_cfg().auto_resume_s or 600) * 1000)
+      return pt("ui.pause_auto", { label = label, min = dur_text(ms) })
+    elseif r == "aborted" then
+      return pt("ui.pause_aborted", { label = label }), vim.log.levels.WARN
+    end
+  elseif p.status == "EXPIRED" and p.end_reason == "agent_finished" then
+    return pt("ui.pause_expired", { label = label })
+  end
+  return nil -- 作者自身の操作（再開・取り下げ・関門を切る・Neovim の終了）は、そのとき知らせている
+end
+
+--- Notify (once each) the changes of pauses seen since the map was opened: stopped, stopped at
+--- the gate, resumed by itself, ended by Claude Code, finished before it could stop.
+--- Silent with `pause.notify = false`.
+---@return integer number of notices
+function M.notify_pauses()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not s or not sid or type(s.pauses) ~= "table" then return 0 end
+  local seen = pause_seen[sid]
+  if not seen then
+    M._seed_pauses()
+    return 0
+  end
+  local quiet = M.pause_cfg().notify == false
+  local n = 0
+  for k, p in pairs(s.pauses) do
+    if type(p) == "table" and seen[k] ~= p.status then
+      seen[k] = p.status
+      if not quiet then
+        local msg, lvl = pause_message(p)
+        if msg then
+          notify(msg, lvl)
+          n = n + 1
+        end
+      end
+    end
+  end
+  return n
+end
+
+--- Clean up pauses whose agent finished (events.sweep_pauses), place the gate's pauses on new
+--- running sub-agents (events.sync_gate), then notify the changes.
+---@return boolean changed
+function M.sweep_pauses()
+  local changed = false
+  local ev = try_require("agentmap.events")
+  if ev and M.run then
+    if type(ev.sweep_pauses) == "function" then
+      local ok, r = pcall(ev.sweep_pauses, M.run)
+      changed = changed or (ok and r == true)
+    end
+    if type(ev.sync_gate) == "function" then
+      local ok, n = pcall(ev.sync_gate, M.run)
+      changed = changed or (ok and type(n) == "number" and n > 0)
+    end
+  end
+  pcall(M.notify_pauses)
   return changed
 end
 

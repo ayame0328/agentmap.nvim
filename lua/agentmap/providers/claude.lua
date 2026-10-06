@@ -205,7 +205,17 @@ function M.normalize_hook(rec)
     add("run_started", { cwd = rec.cwd, transcript_path = rec.transcript_path, source = rec.source })
     add("agent_started", { agent_id = "ROOT", cwd = rec.cwd })
   elseif ev == "UserPromptSubmit" then
-    if rec.prompt_head then add("run_prompt", { prompt_head = rec.prompt_head, kind = rec.kind, cwd = rec.cwd }) end
+    if rec.prompt_head then
+      add("run_prompt", { prompt_head = rec.prompt_head, kind = rec.kind, cwd = rec.cwd })
+      -- 背景の子が終わったお知らせ（<task-notification>）：task-id はその子の agent id。state はこれを
+      -- 「終わりを止めて届けたのに子が続かなかった（連続の上限で Claude Code が終わらせた）」の判定に使う
+      if rec.kind == "task_notification" then
+        local aid = rec.prompt_head:match("<task%-id>%s*([%w_%-]+)%s*</task%-id>")
+        if aid then
+          add("agent_notified", { agent_id = aid, status = rec.prompt_head:match("<status>%s*([%w_]+)%s*</status>") })
+        end
+      end
+    end
   elseif ev == "PreToolUse" then
     if rec.tool_name == "Agent" and rec.tool_use_id then
       local ti = rec.tool_input or {}
@@ -244,7 +254,8 @@ function M.normalize_hook(rec)
           brief = type(ti.brief) == "table" and ti.brief or nil,
         })
         if tr.status ~= "async_launched" then
-          add("agent_finished", { agent_id = tr.agentId, duration_ms = rec.duration_ms })
+          -- 同期の Agent が親に戻った（親の記録。子自身の SubagentStop とは別）
+          add("agent_finished", { agent_id = tr.agentId, duration_ms = rec.duration_ms, source = "parent" })
         end
       end
     elseif rec.tool_name then

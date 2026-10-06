@@ -899,8 +899,9 @@ function M.relay_waiting(x)
 end
 
 --- Steering marks on line 4 of a box (DESIGN-v0.2-steer §6.3, DESIGN-v0.1.2-steer2 §7.2):
---- " ✎n" pending, or a relay not passed on yet (purple), " ✎!" not delivered / not relayed (red),
---- " ✎" delivered (or relayed) within the last 60 s (green), otherwise nothing.
+--- " ✎n" pending, or a relay not passed on yet (purple), " ✎!" not delivered / not relayed / delivered
+--- at the agent's end but not held (red), " ✎" delivered (or relayed) within the last 60 s (green),
+--- otherwise nothing.
 function M.steer_marks(state, a, now)
   if not a or type(state) ~= "table" or type(state.steers) ~= "table" then return {} end
   now = now or os.time()
@@ -909,7 +910,7 @@ function M.steer_marks(state, a, now)
     local x = state.steers[sid]
     if x.status == "PENDING" or M.relay_waiting(x) then
       pending = pending + 1
-    elseif x.status == "EXPIRED" then
+    elseif x.status == "EXPIRED" or (x.status == "DELIVERED" and x.held == false) then
       expired = true
     elseif x.status == "DELIVERED" then
       local t = H.parse_iso(x.relayed_at or x.delivered_at)

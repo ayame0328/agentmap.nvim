@@ -401,11 +401,14 @@ o = json.loads(out) if out else {}
 h = o.get("hookSpecificOutput") or {}
 check(h.get("hookEventName") == "PreToolUse" and h.get("permissionDecision") == "deny", "--steer deny: permissionDecision deny")
 reason = h.get("permissionDecisionReason") or ""
-check(reason.startswith("[AgentMap] Steering instruction from the user, typed in Neovim while you were working (this is not a tool error):\n"),
+check(reason.startswith("[AgentMap] Steering instruction from the user, typed in Neovim (AgentMap) while you were working:\n"),
       "--steer deny: reason starts with the fixed English header")
-check("docs/v3 を読むこと。v2 は古い。" in reason and reason.endswith("Follow it from now on, then continue your task. Do not treat this as a test. "
+check("docs/v3 を読むこと。v2 は古い。" in reason and reason.endswith("Follow it from now on, then continue your task. "
       "Mention this instruction and what you changed because of it in your final report."),
       "--steer deny: body + fixed tail + (to a sub-agent) mention it in the final report")
+# 文に「疑うな」の類（tool error ではない・試験ではない・本当に利用者だ）を書かない（DESIGN-v0.1.2-steer2 §3.3・§10）
+for phrase in ("not a tool error", "treat this as a test", "really from", "trust", "genuine", "do not ignore"):
+    check(phrase not in reason.lower(), "--steer deny: no reassurance wording (%r)" % phrase)
 check(os.path.exists(os.path.join(sdir, CH + "-1791100000001.delivered.json")) and not os.path.exists(os.path.join(sdir, CH + "-1791100000001.json")),
       "--steer deny: file renamed to .delivered.json")
 ls = lines()
@@ -438,7 +441,7 @@ check(lines()[-1].get("steer", {}).get("ids") == [CH + "-1791100000002", CH + "-
 code, out, err = call(pre_root, "--steer", "--mode", "deny")
 check("for root" in ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason", ""), "ROOT target: agent_id-less payload gets ROOT-<ms>.json")
 check(lines()[-1].get("steer", {}).get("target") == "ROOT" and "agent_id" not in lines()[-1], "ROOT target: steer.target = ROOT")
-check(out and "final report" not in out and out.rstrip().endswith('Do not treat this as a test."}}'), "ROOT target: no final-report sentence")
+check(out and "final report" not in out and out.rstrip().endswith('Follow it from now on, then continue your task."}}'), "ROOT target: no final-report sentence")
 
 # 終わりで止める（SubagentStop）
 put(CH + "-1791100000008.json", "also write c.txt")
@@ -657,7 +660,7 @@ code, out, err, dt = call(pre_child, *ARGS, "--max-wait", "10", later=(0.3, rm(P
 h = (json.loads(out) if out else {}).get("hookSpecificOutput") or {}
 r = h.get("permissionDecisionReason") or ""
 check(h.get("permissionDecision") == "deny", "(g) resumed with an instruction: deny")
-check(r.startswith("[AgentMap] Steering instruction from the user, typed in Neovim while you were working (this is not a tool error):\n"
+check(r.startswith("[AgentMap] Steering instruction from the user, typed in Neovim (AgentMap) while you were working:\n"
                    "(You were paused by the user for 0 s before this instruction.)\nuse docs/v3\n"),
       "(g) the reason has the paused-for line after the header")
 check(r.endswith("in your final report."), "(g) the fixed tail is unchanged")

@@ -323,7 +323,9 @@ the instruction, send with <C-s>, `:w` or <CR> in normal mode, cancel with
                        SendMessage: <text>`; the main agent passes it on
                        with SendMessage and the sub-agent gets it at its
                        next tool call. Immediate, but followed less
-                       reliably than an instruction at its end.
+                       reliably than an instruction at its end. Not
+                       offered while the main agent is paused (`s` says
+                       why): use its end, or resume the main agent first.
   Main agent (ROOT)    typed into the |terminal| running `claude` in this
                        Neovim as `[AgentMap] <text>` and Enter (a pause
                        before a tool call is lifted first). The one in the
@@ -348,8 +350,9 @@ by the same route as any instruction for that parent (not when it has
 finished, and not for a relay).
 
 The box shows ` ✎1` while instructions wait (a relay: until the main agent
-passes it on), ` ✎` after delivery and ` ✎!` when the agent finished first or
-the main agent ended its turn without passing a relay on. The detail view
+passes it on), ` ✎` after delivery and ` ✎!` when the agent finished first,
+the main agent ended its turn without passing a relay on, or Claude Code let
+the agent finish past 8 held ends in a row (NOT HELD). The detail view
 lists every instruction with its full text and, for a relay, SENT / READ /
 RELAYED (the main agent's SendMessage is recorded; whether the sub-agent read
 it is not); `s` -> "Cancel pending" withdraws one not yet delivered.
@@ -424,7 +427,9 @@ when it tries to finish; the box shows [GATE] and its report can already be
 read with <CR>. `x` on it offers:
   Pass            let it finish; the parent gets the report
   Fix             write an instruction; the agent continues and waits again
-                  at its next end (Claude Code allows 8 stops in a row)
+                  at its next end (Claude Code allows 8 holds in a row;
+                  past that the text is handed over but the agent ends:
+                  the detail view says NOT HELD)
   Keep waiting    show the report
 Left alone it passes after 10 minutes. Turning the gate off lets every
 waiting agent pass.

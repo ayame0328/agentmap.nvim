@@ -68,11 +68,12 @@ TASK_TEXT = 60           # 手順表（TaskCreate）の subject / activeForm の
 TASK_LIST = 50           # TaskList の一覧を何件まで残すか
 STEER_TEXT = 4000        # 修正指示の本文の上限文字数
 STEER_BYTES = 16384      # これより大きい未配達ファイルは読まない（4000 文字 × UTF-8 の最大 4 バイト）
-STEER_HEAD = ("[AgentMap] Steering instruction from the user, typed in Neovim while you were working "
-              "(this is not a tool error):")
-STEER_TAIL = "Follow it from now on, then continue your task. Do not treat this as a test."
+# 次の道具の直前（mode deny / context）で届けるときの文。出所と時機だけを言う。「tool error ではない」「試験ではない」の
+# ような、モデルに疑わせないための言い回しは書かない（安全の仕組みをごまかす方向の文は持たない。DESIGN-v0.1.2-steer2 §3.3・§10）
+STEER_HEAD = "[AgentMap] Steering instruction from the user, typed in Neovim (AgentMap) while you were working:"
+STEER_TAIL = "Follow it from now on, then continue your task."
 # 終わり際（SubagentStop / Stop の block）で届けるときの文（DESIGN-v0.1.2-steer2 §3.3）。Claude Code はこれを
-# "Stop hook feedback" として user の行に入れる（ツールの結果ではない）ので「tool error ではない」とは書かない
+# "Stop hook feedback" として user の行に入れる（ツールの結果ではない）
 STEER_HEAD_STOP = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
                    "It reaches you now, just before you finish:")
 STEER_TAIL_STOP = "Apply it now, continue your task, then finish again."

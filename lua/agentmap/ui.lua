@@ -35,6 +35,7 @@ local expired_seen = {} -- { [sid] = { [steer_id] = true } } 「届かなかっ�
 local notice_done = {} -- { [sid] = { [steer_id] = true } } 親への知らせを作った（または作らないと決めた）指示
 local pause_seen = {} -- { [sid] = { [pause_id] = status } } 一時停止の状態の変わり目を知らせ済み
 local relay_seen = {} -- { [sid] = { [steer_id] = true } } 「親が渡した」「終わり際に届いた」を知らせ済み
+local not_held_seen = {} -- { [sid] = { [steer_id] = true } } 「届けたが止められなかった」を知らせ済み
 
 local VIEWS = {
   detail = "agentmap.views.detail",
@@ -1430,17 +1431,29 @@ local function via_terminal(ev, cfg, agent_id, hook_text, opts, cb, no_pick, pre
 end
 
 --- True when box `id` may be steered through the main agent (relay; DESIGN-v0.1.2-steer2 §4.1,
---- V41, Q19/Q21): `steer.relay` is not "never", the run has not ended, and the box is a direct
+--- V41, Q19/Q21): `steer.relay` is not "never", the run has not ended, the box is a direct
 --- sub-agent of ROOT that has not finished (a grandchild, ROOT itself, a finished box and a box
---- waiting at the gate are not offered). The terminal is checked separately (terminal_present).
-function M.relay_target_ok(id)
+--- waiting at the gate are not offered), and the main agent is not paused (REQUESTED or PAUSED:
+--- the line typed into its terminal would sit there until it resumes, and the map does not resume
+--- a main agent the user stopped; `opts.ignore_root_pause` skips this last test). The terminal is
+--- checked separately (terminal_present).
+---@param id string
+---@param opts? { ignore_root_pause?: boolean }
+function M.relay_target_ok(id, opts)
   if M.steer_cfg().relay == "never" then return false end
   if type(id) ~= "string" or id == "ROOT" or run_ended() then return false end
   local a = M.run and M.run.state and M.run.state.agents and M.run.state.agents[id]
   if type(a) ~= "table" or a.parent_id ~= "ROOT" or FINISHED[a.status] then return false end
   local p = M._live_pause(id)
   if p and p.kind == "gate" and p.status == "PAUSED" then return false end
+  if not (opts and opts.ignore_root_pause) and M._live_pause("ROOT") then return false end
   return true
+end
+
+--- True when relay for box `id` is withheld only because the main agent is paused (a pause placed
+--- or reached): everything else about the box would allow it.
+function M.relay_root_paused(id)
+  return M._live_pause("ROOT") ~= nil and M.relay_target_ok(id, { ignore_root_pause = true })
 end
 
 --- True when the `s` menu offers "relay now through the main agent" for box `id`.
@@ -1491,6 +1504,12 @@ local function via_relay(ev, cfg, aid, text, prompt_id, done)
       notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
       return done("ended")
     end
+    -- 親が止まっている（止まれを置いた・止まった）：打った文は親が再開するまで端末に残るだけで、子には渡らない。
+    -- 作者が止めた親を勝手に動かさないので、理由を言って断る（終わり際の経路か、先に親を再開してもらう）
+    if M.relay_root_paused(aid) then
+      notify(st_text("ui.steer_relay_root_paused"), vim.log.levels.WARN)
+      return done("root_paused")
+    end
     notify(st_text("ui.steer_relay_not_target"), vim.log.levels.WARN)
     return done("not_target")
   end
@@ -1534,7 +1553,7 @@ end
 ---@param cb? fun(result: string|nil) "queued" | "sent" | "relayed" | "fallback_hook" | "clipboard"
 ---   | "none" | "empty" | "outdated" (hooks route, but the registered hooks are outdated or use another
 ---   mode: nothing sent) | "ended" (terminal route, but the run has ended: nothing sent)
----   | "no_terminal" / "not_target" (relay not possible) | nil
+---   | "no_terminal" / "not_target" / "root_paused" (relay not possible; the last: the main agent is paused) | nil
 ---@param opts? { route?: "relay" }
 ---@return string|nil result (nil while waiting for the user to pick a terminal)
 function M.steer_send(id, text, cb, opts)
@@ -1675,7 +1694,9 @@ function M.steer_input(id, on_submit, route)
   end
   if route == "relay" then
     if not M.relay_target_ok(aid) then
-      notify(st_text(run_ended() and "ui.steer_run_ended" or "ui.steer_relay_not_target"), vim.log.levels.WARN)
+      local why = run_ended() and "ui.steer_run_ended" or (M.relay_root_paused(aid) and "ui.steer_relay_root_paused")
+        or "ui.steer_relay_not_target"
+      notify(st_text(why), vim.log.levels.WARN)
       return nil
     end
     if not M.terminal_present() then
@@ -1813,6 +1834,9 @@ function M.steer_menu(id)
       acts[#acts + 1] = "relay"
     end
   end
+  -- 親経由が出せる箱なのに親が止まっている：項目を出さず、題に短い理由を添え、選んだ後に理由を知らせる
+  -- （組み込みの select は一覧を描くときに直前の知らせを消すので、先に知らせても見えない。親は勝手に動かさない）
+  local root_paused = M.terminal_present() and M.relay_root_paused(aid)
   local pend = pending_of(aid)
   if #pend > 0 then
     items[#items + 1] = t("ui.steer_cancel_n", { n = #pend })
@@ -1820,7 +1844,14 @@ function M.steer_menu(id)
   end
   items[#items + 1] = t("ui.steer_show")
   acts[#acts + 1] = "show"
-  vim.ui.select(items, { prompt = t("ui.steer_prompt", { label = label_of(aid) }) }, function(_, idx)
+  local prompt = t("ui.steer_prompt", { label = label_of(aid) })
+  if root_paused then prompt = prompt .. " " .. st_text("ui.steer_prompt_root_paused") end
+  vim.ui.select(items, { prompt = prompt }, function(_, idx)
+    -- the built-in select leaves its list in the message area; clear it so that the notice that follows
+    -- ("queued", "relay typed") does not end in a "Press ENTER" prompt. While that prompt waits, the
+    -- deferred Enter of a line typed into the Claude terminal (term.send) is not sent either
+    pcall(vim.cmd, "redraw")
+    if root_paused then notify(st_text("ui.steer_relay_root_paused")) end
     local act = idx and acts[idx]
     if act == "write" then
       M.steer_input(aid)
@@ -1863,16 +1894,18 @@ function M._seed_expired()
   local s = M.run and M.run.state
   local sid = M.run and M.run.sid
   if not sid then return end
-  local seen, done, relayed = {}, {}, {}
+  local seen, done, relayed, unheld = {}, {}, {}, {}
   for k, st in pairs(s and type(s.steers) == "table" and s.steers or {}) do
     if st.status == "EXPIRED" then seen[k] = true end
     -- 開いた時点でもう届いていた指示の知らせは、今さら作らない（見ていない間のことは分からない）
     if st.status == "DELIVERED" then done[k] = true end
     if st.relayed_at or (st.status == "DELIVERED" and st.via ~= "relay") then relayed[k] = true end
+    if st.held == false then unheld[k] = true end
   end
   expired_seen[sid] = seen
   notice_done[sid] = done
   relay_seen[sid] = relayed
+  not_held_seen[sid] = unheld
 end
 
 --- Notify (once each) steering instructions that expired without being delivered.
@@ -1918,6 +1951,7 @@ function M.notify_relays()
     return 0
   end
   local n = 0
+  local unheld = not_held_seen[sid]
   for k, st in pairs(s.steers) do
     if type(st) == "table" and not seen[k] then
       if st.via == "relay" and st.relayed_at then
@@ -1931,6 +1965,12 @@ function M.notify_relays()
           n = n + 1
         end
       end
+    end
+    -- 終わり際に届けたが止められなかった（連続の上限。state が親の記録から判定する）：配達の知らせの後で 1 回
+    if type(st) == "table" and st.held == false and unheld and not unheld[k] and (st.kind or "steer") == "steer" then
+      unheld[k] = true
+      notify(st_text("ui.steer_not_held", { label = label_of(st.agent_id) }), vim.log.levels.WARN)
+      n = n + 1
     end
   end
   return n

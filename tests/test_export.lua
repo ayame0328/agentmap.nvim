@@ -226,18 +226,23 @@ pr.steers["a1-4"] = { id = "a1-4", agent_id = "a1", text = "typed", via = "relay
   requested_at = iso(NOW - 60), delivered_at = iso(NOW - 59), delivered_via = "terminal" }
 pr.steers["a1-5"] = { id = "a1-5", agent_id = "a1", text = "dropped", via = "relay", expect = "parent", status = "EXPIRED",
   requested_at = iso(NOW - 50), delivered_at = iso(NOW - 49), confirmed_at = iso(NOW - 48), end_reason = "not_relayed" }
-vim.list_extend(pr.steer_order, { "a1-3", "a1-4", "a1-5" })
+pr.steers["a1-6"] = { id = "a1-6", agent_id = "a1", text = "unheld", via = "hook", expect = "stop", status = "DELIVERED",
+  requested_at = iso(NOW - 40), delivered_at = iso(NOW - 30), delivered_via = "SubagentStop", mode = "block", held = false }
+vim.list_extend(pr.steer_order, { "a1-3", "a1-4", "a1-5", "a1-6" })
 local mdr = export.to_markdown(pr, { now = NOW, stats = STATS })
 t.matches(mdr, "\"まだ\" → pending at export time %(arrives when the agent finishes%)\n", "未配達（終わり際）")
 t.matches(mdr, "\"relayed\" → relayed " .. os.date("%H:%M:%S", NOW - 75) .. " by ROOT %(SendMessage%)\n", "親が渡した")
 t.matches(mdr, "\"typed\" → sent to the main agent's terminal " .. os.date("%H:%M:%S", NOW - 59) .. ", not relayed yet\n", "打った・まだ渡っていない")
 t.matches(mdr, "\"dropped\" → not relayed: the main agent ended its turn\n", "渡らなかった")
-t.matches(mdr, "| Steering | 7 %(1 pending%) |", "概要の行はそのまま（PENDING だけ数える）")
+t.matches(mdr, "\"unheld\" → delivered " .. os.date("%H:%M:%S", NOW - 30) .. " at SubagentStop, not held %(Claude Code let the agent finish: its end had been held too many times in a row%)\n",
+  "届けたが止められなかった")
+t.matches(mdr, "| Steering | 8 %(1 pending%) |", "概要の行はそのまま（PENDING だけ数える）")
 require("agentmap.i18n").setup("ja")
 local mdrj = export.to_markdown(pr, { now = NOW, stats = STATS })
 t.matches(mdrj, "書き出し時点で未配達（終わる直前に届く）", "ja: 終わり際")
 t.matches(mdrj, "に ROOT が渡した（SendMessage）", "ja: 渡した")
 t.matches(mdrj, "渡らなかった: 親が番を終えた", "ja: 渡らなかった")
+t.matches(mdrj, "に配達（SubagentStop）、止められず終了（", "ja: 止められなかった")
 require("agentmap.i18n").setup("en")
 -- 修正指示が 0 件
 t.matches(md, "\n## Steering instructions\n\n%(no steering instructions%)\n", "0 件の文")

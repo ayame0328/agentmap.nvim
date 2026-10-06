@@ -306,6 +306,14 @@ local Le = graph.layout(with_steers({ { status = "EXPIRED" }, { status = "CANCEL
 local le4, hle = line4_marks(Le, "a2")
 ok(le4:find("[REWORK] " .. mk .. "!", 1, true) == 1, "届かないまま終了 → ✎!（実際: " .. le4 .. "）")
 ok(vim.tbl_contains(hle, "AgentMapRework"), "✎! は赤")
+local Lnh = graph.layout(with_steers({ { status = "DELIVERED", delivered_at = iso(NOW - 5), delivered_via = "SubagentStop", mode = "block",
+  held = false } }), { width = 200, now = NOW })
+local lnh4, hlnh = line4_marks(Lnh, "a2")
+ok(lnh4:find("[REWORK] " .. mk .. "!", 1, true) == 1, "届けたが止められなかった（held = false）→ ✎!（実際: " .. lnh4 .. "）")
+ok(vim.tbl_contains(hlnh, "AgentMapRework"), "止められなかった ✎! は赤")
+local Lh = graph.layout(with_steers({ { status = "DELIVERED", delivered_at = iso(NOW - 5), delivered_via = "SubagentStop", mode = "block",
+  held = true } }), { width = 200, now = NOW })
+ok(Lh.nodes.a2.lines[4]:find("[REWORK] " .. mk .. " ", 1, true) == 1, "止められた（held = true）→ ✎（実際: " .. Lh.nodes.a2.lines[4] .. "）")
 ok(Ls.lines[2]:find(mk .. " steer", 1, true) ~= nil, "凡例に ✎ steer")
 local Lt = graph.layout(with_steers({ { status = "PENDING" } }), { width = 200, now = NOW, mode = "tree" })
 local trow

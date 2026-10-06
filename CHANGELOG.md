@@ -44,6 +44,13 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
 - Setting `pause` (also accepts `false`): `enabled`, `auto_resume_s`, `gate`,
   `release_on_exit` (default `false`: closing Neovim leaves pauses to resume by themselves),
   `notify`.
+- `NOT HELD`: Claude Code caps held ends in a row (8, `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`); past
+  that the hook still hands an instruction over, but the agent finishes without applying it. The
+  map tells this from the main agent's records (the completion notice of a background sub-agent,
+  or the return of a foreground one, with no work of that sub-agent in between): the box goes back
+  to done, the instruction shows `NOT HELD` with ` ✎!` in the detail view and exports, and a
+  notice says so. The main agent's own turn cannot be judged this way. In a live test on 2.1.291
+  nine instructions in a row to one Haiku sub-agent were all held (README says so).
 
 ### Changed
 
@@ -72,6 +79,16 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
 - `?` and the detail views list `x` / `X`.
 - A line typed into a Claude terminal that ends in `\` gets a space after it: Claude Code reads
   `\` + Enter as a new line, so the line stayed unsent and the next one was glued to it.
+- Relay is not offered while the main agent is paused (a pause placed or reached): the line would
+  wait in its terminal until it resumes, and the map does not resume a main agent you stopped.
+  The `s` menu says why; the route at its end stays available.
+- The text handed over at the next tool call (`steer.mode = "deny"` / `"context"`) no longer
+  says that it is not a tool error or a test; like the text at the end, it only says where it
+  comes from and what to do with it.
+- The `s` menu no longer ends in a `Press ENTER` prompt with the built-in `vim.ui.select`; while
+  that prompt waited, the Enter typed into the Claude terminal after a relay or a redo request
+  was held back too, so the line sat unsent in Claude Code's input box.
+- The unused text `ui.steer_relay_resume` is gone from the language tables.
 
 ### Notes
 

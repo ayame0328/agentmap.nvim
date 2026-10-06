@@ -397,6 +397,52 @@ t.run("relay send", function()
   hooks_status = "installed"
 end)
 
+-- 6b''. 親が一時停止中（止まれを置いた REQUESTED／止まった PAUSED）：親経由は出さず、理由を知らせる。親は勝手に動かさない。
+--       終わり際の経路はそのまま（0.1.2 最終確認の直し 2）
+t.run("relay withheld while ROOT is paused", function()
+  s.pauses = s.pauses or {}
+  s.pause_order = s.pause_order or {}
+  s.pauses["ROOT-live"] = { id = "ROOT-live", agent_id = "ROOT", kind = "pause", at = "next", status = "REQUESTED",
+    requested_at = "2026-09-28T04:31:00.000Z", auto_resume_s = 600 }
+  s.pause_order[#s.pause_order + 1] = "ROOT-live"
+  s.agents.ROOT.pause = "ROOT-live"
+  for _, status in ipairs({ "REQUESTED", "PAUSED" }) do
+    s.pauses["ROOT-live"].status = status
+    if status == "PAUSED" then s.pauses["ROOT-live"].hit_at, s.pauses["ROOT-live"].hit_via = "2026-09-28T04:31:05.000Z", "PreToolUse:Bash" end
+    t.eq(ui.relay_available("a1"), false, status .. ": 親経由は出さない")
+    t.eq(ui.relay_target_ok("a1"), false, status .. ": 宛先としても断る")
+    t.eq(ui.relay_root_paused("a1"), true, status .. ": 理由は親の止まれ")
+    t.eq(ui.relay_root_paused("g1"), false, status .. ": 孫はもともと出さないので理由にもならない")
+    menus, notes = {}, {}
+    ui.steer_menu("a1")
+    t.eq(menus[#menus].items, { T("ui.steer_write"), T("ui.steer_show") }, status .. ": メニューは「書く」と「履歴」だけ")
+    t.eq(menus[#menus].prompt, T("ui.steer_prompt", { label = ui._steer_label("a1") }) .. " " .. ui._st("ui.steer_prompt_root_paused"),
+      status .. ": 題に短い理由（組み込みの select でも見える）")
+    t.ok(noted(ui._st("ui.steer_relay_root_paused")), status .. ": 選んだ後（取り消しでも）に理由を知らせた")
+    notes = {}
+    local n0 = #calls
+    t.eq(ui.steer_send("a1", "x", nil, { route = "relay" }), "root_paused", status .. ": 親経由の送信は断る")
+    t.eq(#calls, n0, status .. ": 記録もしない")
+    t.ok(noted(ui._st("ui.steer_relay_root_paused")), status .. ": 断る理由を知らせた")
+    notes = {}
+    t.eq(ui.steer_input("a1", nil, "relay"), nil, status .. ": 親経由の窓は開かない")
+    t.ok(noted(ui._st("ui.steer_relay_root_paused")), status .. ": 窓でも同じ理由")
+    t.ok(ui._live_pause("ROOT") ~= nil and ui._live_pause("ROOT").status == status, status .. ": 親の止まれはそのまま（勝手に解かない）")
+    notes = {}
+    t.eq(ui.steer_send("a1", "still at its end"), "queued", status .. ": 終わり際の経路は使える")
+    t.eq(last("request").opts.via, "hook", status .. ": via hook")
+  end
+  s.pauses["ROOT-live"].status = "RESUMED"
+  s.agents.ROOT.pause = nil
+  t.eq(ui.relay_available("a1"), true, "親を再開すれば親経由が戻る")
+  t.eq(ui.relay_root_paused("a1"), false, "理由も消える")
+  menus, notes = {}, {}
+  ui.steer_menu("a1")
+  t.eq(#menus[#menus].items, 3, "メニューに親経由が戻る")
+  t.eq(menus[#menus].prompt, T("ui.steer_prompt", { label = ui._steer_label("a1") }), "題に理由は付かない")
+  t.ok(not noted(ui._st("ui.steer_relay_root_paused")), "理由は出ない")
+end)
+
 -- 6c. 終わった実行（SessionEnd 済み）：ROOT・やり直しは端末へ送らない（同じフォルダの別の会話に入る）
 t.run("run ended", function()
   notes = {}
@@ -550,6 +596,22 @@ t.run("relay notices", function()
   notes = {}
   t.eq(ui.notify_relays(), 1, "終わり際の配達だけ知らせる（次の道具での配達は知らせない）")
   t.ok(noted(ui._st("ui.steer_delivered_stop", { label = ui._steer_label("a1") })), "「終わり際で届き、続きを始めました」")
+  -- 届けたが止められなかった（held = false。state が親の記録から判定）：配達の知らせの後、分かった時点で 1 回、警告で
+  s.steers["h3"] = { id = "h3", agent_id = "a1", kind = "steer", via = "hook", status = "DELIVERED", mode = "block",
+    delivered_via = "SubagentStop" }
+  notes = {}
+  t.eq(ui.notify_relays(), 1, "届いた知らせ")
+  t.ok(not noted(ui._st("ui.steer_not_held", { label = ui._steer_label("a1") })), "まだ「止められなかった」とは言わない")
+  s.steers.h3.held = false
+  notes = {}
+  t.eq(ui.notify_relays(), 1, "止められなかったと分かったら 1 回")
+  t.ok(noted(ui._st("ui.steer_not_held", { label = ui._steer_label("a1") })), "「止められませんでした」")
+  t.eq(ui.notify_relays(), 0, "2 回目は知らせない")
+  s.steers["h4"] = { id = "h4", agent_id = "a1", kind = "steer", via = "hook", status = "DELIVERED", mode = "block",
+    delivered_via = "SubagentStop", held = true }
+  notes = {}
+  ui.notify_relays()
+  t.ok(not noted(ui._st("ui.steer_not_held", { label = ui._steer_label("a1") })), "held = true なら言わない")
   s.steers, s.steer_order = {}, {}
   ui._seed_expired()
 end)

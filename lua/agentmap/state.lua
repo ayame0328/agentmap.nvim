@@ -176,6 +176,23 @@ local function elapsed(from, to)
   return nil
 end
 
+--- 終わりを止めて届けた後の決着（a.end_held）。held: 子が続けた（道具・2 回目の終わり）／続けずに終わった（親の記録）
+local function settle_end_held(s, a, held, ev)
+  local eh = a.end_held
+  if not eh then return end
+  a.end_held = nil
+  local st = s.steers and s.steers[eh.steer_id]
+  if st and st.status == "DELIVERED" then st.held = held end
+  if held then return end
+  -- 止められなかった：取り消した「完了」を元に戻す（終わりの時刻は 1 回目の終わりのまま）
+  local cur = cur_attempt(a)
+  if cur and not cur.finished_at then cur.finished_at = eh.finished_at or ev.ts end
+  if a.status == "RUNNING" then a.status = "DONE" end
+  a.finished_at = a.finished_at or eh.finished_at or ev.ts
+  local started = a.started_at or (a.attempts[1] and a.attempts[1].started_at)
+  a.elapsed_ms = elapsed(started, a.finished_at) or a.elapsed_ms
+end
+
 --- 依頼だけ出ていた仮の箱（pending:<tool_use_id>）を、本物の Agent に取り込む
 local function adopt(s, id, tuid, status_if_new)
   local req = tuid and s.spawn_requests[tuid]
@@ -683,6 +700,7 @@ function H.agent_started(s, ev)
   fill(a, "cwd", ev.cwd)
   fill(a, "model", ev.model)
 
+  if a.end_held then settle_end_held(s, a, true, ev) end -- 動き出した = 止められて続いた（見なかった間に）
   if CLOSED[a.status] and a.started_at then
     -- 一度終わった Agent がまた動き出した：同じ id の 2 回目の SubagentStart（親の SendMessage で終わった子が
     -- 再開した。DESIGN-v0.1.2-steer2 E3c・V45）や差し戻し後の再実行。新しい回を開いて RUNNING に戻す
@@ -731,6 +749,11 @@ function H.agent_finished(s, ev)
   tag(s, a, ev.prompt_id, ev.ts)
   link_workflow(s, a, ev)
   fill(a, "agent_type", ev.agent_type)
+  if a.end_held then
+    -- 終わりを止めて届けた後の最初の「終わり」：子自身の SubagentStop なら止められて続けた末の本当の終わり、
+    -- 親の記録（同期の Agent の戻り）だけなら止められずに終わった（settle_end_held）
+    settle_end_held(s, a, ev.source ~= "parent", ev)
+  end
   local cur = cur_attempt(a)
   if created or not cur then
     cur = open_attempt(a, a.started_at)
@@ -794,6 +817,11 @@ function H.tool_used(s, ev)
   local a, created = get_or_create(s, id, "RUNNING")
   if created then open_attempt(a, ev.ts) end
   if id ~= "ROOT" then tag(s, a, ev.prompt_id, ev.ts) end
+  if a.end_held then
+    -- 終わりを止めて届けた後に道具を使った：止められて続けている
+    local t0, t1 = secs(a.end_held.at), secs(ev.ts)
+    if not (t0 and t1) or t1 >= t0 then settle_end_held(s, a, true, ev) end
+  end
   if CLOSED[a.status] then
     local cur = cur_attempt(a)
     local fin = cur and secs(cur.finished_at)
@@ -1015,6 +1043,10 @@ function H.steer_delivered(s, ev)
         local a = s.agents[st.agent_id]
         local cur = a and cur_attempt(a)
         if a and a.status == "DONE" and cur and cur.finished_at then
+          -- 本当に止められたかは、この後の記録で分かる：子が道具を使う・2 回目の終わりが来れば止められた（held = true）。
+          -- 子の記録が無いまま親に「終わった」と伝わった（背景の子のお知らせ・同期の Agent の戻り）なら、Claude Code が
+          -- 連続の上限（既定 8 回）で block を無視して終わらせた（held = false。H.agent_finished / H.agent_notified）
+          a.end_held = { steer_id = ev.steer_id, finished_at = cur.finished_at, at = ev.ts }
           a.status = "RUNNING"
           a.finished_at = nil
           cur.finished_at = nil
@@ -1026,6 +1058,16 @@ function H.steer_delivered(s, ev)
     fill(st, "delivered_via", ev.via)
   end
   attach_steer(s, st)
+end
+
+--- ROOT was told that a background sub-agent stopped (<task-notification>; the task-id is the agent id).
+--- Only used to settle a held end: a sub-agent whose end was held once by a delivered instruction but
+--- that was never seen working again was let go by Claude Code (consecutive block cap). Nothing else
+--- is changed from a notification (the sub-agent's own SubagentStop is the record of its end).
+function H.agent_notified(s, ev)
+  local a = ev.agent_id and s.agents[ev.agent_id]
+  if not a or not a.end_held then return end
+  settle_end_held(s, a, false, ev)
 end
 
 function H.steer_cancelled(s, ev)

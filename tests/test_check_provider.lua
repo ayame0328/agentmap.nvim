@@ -291,6 +291,27 @@ do
     { "steer_delivered", "akid-1", "akid", "PreToolUse:Write", "tw", "deny", "hook" }, "steer_delivered fields")
   local ss = claude.normalize_hook(rec({ hook_event_name = "SubagentStop", agent_id = "akid", steer = { ids = { "akid-3" }, mode = "block", target = "akid" } }))
   t.eq({ #ss, ss[1].event, ss[1].via }, { 1, "steer_delivered", "SubagentStop" }, "steer line on SubagentStop is not an agent_finished")
+  -- 背景の子の終わりのお知らせ（<task-notification>）→ run_prompt（kind）＋ agent_notified（task-id = 子の id）
+  local tn = claude.normalize_hook(rec({ hook_event_name = "UserPromptSubmit", kind = "task_notification",
+    prompt_head = "<task-id>afeed000000000006</task-id> <status>completed</status>" }))
+  t.eq(#tn, 2, "task notification → run_prompt + agent_notified")
+  t.eq({ tn[1].event, tn[1].kind, tn[2].event, tn[2].agent_id, tn[2].status, tn[2].src },
+    { "run_prompt", "task_notification", "agent_notified", "afeed000000000006", "completed", "hook" }, "agent_notified fields")
+  t.eq(#claude.normalize_hook(rec({ hook_event_name = "UserPromptSubmit", prompt_head = "<task-id>x</task-id> please" })), 1,
+    "a plain prompt that mentions task-id is not a notification (no kind)")
+  t.eq(#claude.normalize_hook(rec({ hook_event_name = "UserPromptSubmit", kind = "task_notification", prompt_head = "<status>completed</status>" })), 1,
+    "a notification without task-id → run_prompt only")
+  -- 同期の Agent の戻り（親の PostToolUse）→ agent_finished に source = "parent"。子自身の SubagentStop には無い
+  local pa = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "Agent", tool_use_id = "ta", duration_ms = 5000,
+    tool_input = { description = "sync" }, tool_response = { agentId = "asyncid", status = "completed" } }))
+  local fin
+  for _, e in ipairs(pa) do if e.event == "agent_finished" then fin = e end end
+  t.eq(fin and fin.source, "parent", "agent_finished from the parent's PostToolUse(Agent) has source = parent")
+  local bg = claude.normalize_hook(rec({ hook_event_name = "PostToolUse", tool_name = "Agent", tool_use_id = "tb",
+    tool_input = { description = "bg" }, tool_response = { agentId = "bgid", status = "async_launched", isAsync = true } }))
+  for _, e in ipairs(bg) do t.ok(e.event ~= "agent_finished", "a background launch is not a finish") end
+  local own = claude.normalize_hook(rec({ hook_event_name = "SubagentStop", agent_id = "asyncid", last_head = "done" }))
+  t.eq({ own[1].event, own[1].source }, { "agent_finished", nil }, "agent_finished from SubagentStop has no source")
 
   -- 一時停止の 3 種の行（DESIGN-v0.1.2-pause §5.1）：それぞれ 1 件だけ（tool_used / agent_finished を作らない）
   local ph = claude.normalize_hook(rec({ hook_event_name = "PreToolUse", tool_name = "Read", tool_use_id = "tr", agent_id = "akid",

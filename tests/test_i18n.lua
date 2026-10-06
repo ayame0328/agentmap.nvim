@@ -205,14 +205,15 @@ t.ok(vim.fn.strdisplaywidth("[PAUSED] ~62.4% 12:34") <= 24, "[PAUSED] ~62.4% 12:
 -- ------------------------------------------------------------
 local STEER2_KEYS = {
   "keymaps.help_steer", "ui.steer_write", "ui.steer_write_resume", "ui.steer_write_gate", "ui.steer_write_root_stop",
-  "ui.steer_relay", "ui.steer_relay_resume", "ui.steer_prompt_stop", "ui.steer_prompt_relay", "ui.steer_prompt_resume",
+  "ui.steer_relay", "ui.steer_relay_root_paused", "ui.steer_prompt_root_paused", "ui.steer_prompt_stop", "ui.steer_prompt_relay", "ui.steer_prompt_resume",
   "ui.steer_queued", "ui.steer_queued_eta", "ui.steer_resumed_stop", "ui.steer_queued_root_stop", "ui.steer_relay_sent",
-  "ui.steer_relay_no_terminal", "ui.steer_relayed", "ui.steer_not_relayed", "ui.steer_delivered_stop",
-  "ui.steer_hooks_outdated", "ui.steer_no_terminal_hook",
+  "ui.steer_relay_no_terminal", "ui.steer_relay_not_target", "ui.steer_relayed", "ui.steer_not_relayed", "ui.steer_delivered_stop",
+  "ui.steer_not_held", "ui.steer_hooks_outdated", "ui.steer_no_terminal_hook",
   "detail.steer_pending", "detail.steer_pending_next", "detail.steer_relay_sent", "detail.steer_relay_read",
   "detail.steer_relayed", "detail.steer_relay_as", "detail.steer_relay_line", "detail.steer_reason_not_relayed",
-  "detail.steer_reason_finished", "detail.steer_not_relayed",
+  "detail.steer_reason_finished", "detail.steer_not_relayed", "detail.steer_not_held",
   "export.steer_pending", "export.steer_pending_next", "export.steer_relay_sent", "export.steer_relayed", "export.steer_not_relayed",
+  "export.steer_not_held",
   "health.steer_on", "health.steer_mode_tool_result", "health.steer_at_stop_ignored", "health.steer_outdated",
   "health.term_ok", "health.term_none", "health.sendmessage_ok", "health.sendmessage_missing", "health.hooks_outdated",
   "steer.relay_en", "steer.relay_ja", "init.steer_usage",
@@ -222,6 +223,20 @@ for _, k in ipairs(STEER2_KEYS) do
   if en[k] == nil or ja[k] == nil then miss2[#miss2 + 1] = k end
 end
 t.eq(miss2, {}, "steer2 付録 A の鍵が en と ja の両方にある")
+-- 使われていない鍵は持たない（Q21 で見送った「終わった子を親経由で再開」の項目。0.1.2 の最終確認で削除）
+t.ok(en["ui.steer_relay_resume"] == nil and ja["ui.steer_relay_resume"] == nil, "ui.steer_relay_resume は en にも ja にも無い")
+-- 親が止まっている間は親経由を出さない理由、届けたが止められなかった（連続の上限）の 3 つの鍵
+t.eq(holes(en["ui.steer_relay_root_paused"]), {}, "ui.steer_relay_root_paused に差し込み口は無い")
+t.eq(holes(en["ui.steer_prompt_root_paused"]), {}, "ui.steer_prompt_root_paused に差し込み口は無い")
+t.ok(vim.fn.strdisplaywidth(ja["ui.steer_prompt_root_paused"]) <= 40 and #en["ui.steer_prompt_root_paused"] <= 40, "題に添える理由は短い")
+t.matches(en["ui.steer_relay_root_paused"], "paused", "理由に「止まっている」が入る")
+t.matches(ja["ui.steer_relay_root_paused"], "一時停止中", "日本語の理由")
+t.eq(holes(en["ui.steer_not_held"]), { "label" }, "ui.steer_not_held の差し込み口")
+t.eq(holes(en["detail.steer_not_held"]), { "time", "via" }, "detail.steer_not_held の差し込み口")
+t.eq(holes(en["export.steer_not_held"]), { "time", "via" }, "export.steer_not_held の差し込み口")
+for _, k in ipairs({ "ui.steer_not_held", "detail.steer_not_held", "export.steer_not_held" }) do
+  t.eq(holes(ja[k]), holes(en[k]), k .. " の差し込み口は英日で同じ")
+end
 -- 親経由の文（§4.2）：先頭の [AgentMap] は固定、差し込み口は 4 つ、どちらの言語でも同じ文
 for _, k in ipairs({ "steer.relay_en", "steer.relay_ja" }) do
   t.eq(holes(en[k]), { "id", "index", "name", "text" }, k .. " の差し込み口")

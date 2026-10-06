@@ -1061,7 +1061,9 @@ function M.to_markdown(state, opts)
         outcome = tr("export.steer_relay_sent", { time = fmt_dt(x.delivered_at or x.requested_at):sub(12) })
       end
     elseif x.status == "DELIVERED" then
-      if x.via == "terminal" and (x.delivered_via == nil or x.delivered_via == "terminal") then
+      if x.held == false then
+        outcome = tr("export.steer_not_held", { time = fmt_dt(x.delivered_at):sub(12), via = one_line(x.delivered_via or "-") })
+      elseif x.via == "terminal" and (x.delivered_via == nil or x.delivered_via == "terminal") then
         outcome = tr("export.steer_sent", { time = fmt_dt(x.delivered_at):sub(12) })
       else
         outcome = tr("export.steer_delivered", { time = fmt_dt(x.delivered_at):sub(12), via = one_line(x.delivered_via or "-") })

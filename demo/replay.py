@@ -59,13 +59,14 @@ def prompt_id(n):
 RECORD_MATCH = {
     "PreToolUse": {"Agent", "AskUserQuestion"},
     "PostToolUse": {"Agent", "AskUserQuestion", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
-                    "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskList"},
+                    "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskList", "SendMessage"},
     "PostToolUseFailure": {"Agent", "AskUserQuestion"},
 }
-# SubagentStop / Stop are registered once, synchronously, as "record + deliver" (steer at stop,
-# and since 0.1.2 "--pause --max-wait": the hook waits inside while a pause file exists).
+# SubagentStop / Stop are registered once, synchronously, as "record + deliver": since 0.1.2 a
+# steering instruction is handed over here (`--mode stop`, decision "block": the end is held once and
+# the agent continues), and "--pause --max-wait" makes the hook wait inside while a pause file exists.
 STOP_EVENTS = {"SubagentStop", "Stop"}
-PAUSE_ARGS = ["--pause", "--max-wait", "600"]
+STEER_ARGS = ["--steer", "--mode", "stop", "--pause", "--max-wait", "600"]
 
 
 def run_hooks(python, root, ev, data):
@@ -75,15 +76,15 @@ def run_hooks(python, root, ev, data):
     name = ev.get("hook_event_name")
     t0 = time.monotonic()
     if name == "PreToolUse":
-        # the delivery guard: `[ -e <root>/steer.pending ] || [ -e <root>/pause.pending ] || exit 0;
-        #                      exec ... --steer --mode deny --pause --max-wait 600`
-        if (os.path.exists(os.path.join(root, "steer.pending"))
-                or os.path.exists(os.path.join(root, "pause.pending"))):
-            subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny"] + PAUSE_ARGS,
+        # the pause guard (0.1.2, mode stop): `[ -e <root>/pause.pending ] || exit 0;
+        #                                      exec ... --steer --mode stop --pause --max-wait 600`
+        # (nothing is delivered before a tool call; the hook only waits while the agent is paused)
+        if os.path.exists(os.path.join(root, "pause.pending")):
+            subprocess.run([python, COLLECTOR, "--root", root] + STEER_ARGS,
                            input=data, check=False, stdout=subprocess.DEVNULL)
     if name in STOP_EVENTS:
-        subprocess.run([python, COLLECTOR, "--root", root, "--steer", "--mode", "deny", "--at-stop"] + PAUSE_ARGS
-                       + ["--record"], input=data, check=False, stdout=subprocess.DEVNULL)
+        subprocess.run([python, COLLECTOR, "--root", root] + STEER_ARGS + ["--record"],
+                       input=data, check=False, stdout=subprocess.DEVNULL)
         return time.monotonic() - t0
     match = RECORD_MATCH.get(name)
     if match is not None and ev.get("tool_name") not in match:

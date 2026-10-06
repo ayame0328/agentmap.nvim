@@ -157,4 +157,5 @@ return {
   ["export.steer_relay_sent"] = "sent to the main agent's terminal %{time}, not relayed yet",
   ["export.steer_relayed"] = "relayed %{time} by %{parent} (SendMessage)",
   ["export.steer_not_relayed"] = "not relayed: the main agent ended its turn",
+  ["export.steer_not_held"] = "delivered %{time} at %{via}, not held (Claude Code let the agent finish: its end had been held too many times in a row)",
 }

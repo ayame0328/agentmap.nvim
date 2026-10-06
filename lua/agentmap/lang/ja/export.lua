@@ -157,4 +157,5 @@ return {
   ["export.steer_relay_sent"] = "%{time} に親の端末へ送信、まだ渡っていない",
   ["export.steer_relayed"] = "%{time} に %{parent} が渡した（SendMessage）",
   ["export.steer_not_relayed"] = "渡らなかった: 親が番を終えた",
+  ["export.steer_not_held"] = "%{time} に配達（%{via}）、止められず終了（終わりを止めた回数が上限を超え、Claude Code が終わらせた）",
 }

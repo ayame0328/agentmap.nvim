@@ -509,6 +509,104 @@ do
   eq(state.flow_of(s, P1).ended_at, "2026-10-04T11:00:40.000Z", "second Stop → flow ended")
 end
 
+-- ---------- 12b) 終わりで止めて届けたのに止められなかった（連続の上限）：親の記録で決着 ----------
+print("[12b] blocked stop not held (cap): settled from the parent's records")
+do
+  local P1 = "p2150000-0000-4000-8000-000000000001"
+  local C, D, E2, F, G, K = "afeed125000000001", "afeed125000000002", "afeed125000000003", "afeed125000000004",
+    "afeed125000000005", "afeed125000000006"
+  local function H(ev, ts, f)
+    local r = { session_id = "r12b", hook_event_name = ev, prompt_id = P1, _ts = "2026-10-04T11:" .. ts .. ".000Z" }
+    for k, v in pairs(f or {}) do r[k] = v end
+    return r
+  end
+  local s = state.new("r12b")
+  local function eq(a, b, msg)
+    local same = vim.deep_equal(a, b)
+    ok(same, msg .. (same and "" or ("  (got " .. vim.inspect(a) .. ", want " .. vim.inspect(b) .. ")")))
+  end
+  local function feed(rec) for _, e in ipairs(claude.normalize_hook(rec)) do state.apply(s, e) end end
+  local function notice(id, ts) feed(H("UserPromptSubmit", ts, { kind = "task_notification",
+    prompt_head = "<task-id>" .. id .. "</task-id> <status>completed</status>" })) end
+  feed(H("UserPromptSubmit", "00:00", { prompt_head = "go" }))
+  -- 背景の子 C：1 回目の終わり → block → 子の記録が無いまま親にお知らせ = 止められなかった
+  feed(H("PreToolUse", "00:01", { tool_name = "Agent", tool_use_id = "tC", tool_input = { description = "child C" } }))
+  feed(H("SubagentStart", "00:02", { agent_id = C, agent_type = "general-purpose" }))
+  feed(H("SubagentStop", "00:10", { agent_id = C, last_head = "first end" }))
+  feed(H("SubagentStop", "00:10", { agent_id = C, steer = { ids = { C .. "-1" }, mode = "block", target = C } }))
+  eq(s.agents[C].status, "RUNNING", "C: blocked stop → RUNNING")
+  eq(s.agents[C].end_held and s.agents[C].end_held.steer_id, C .. "-1", "C: end_held remembers the instruction")
+  eq(s.steers[C .. "-1"].held, nil, "C: held unknown yet")
+  notice(C, "00:11")
+  eq(s.agents[C].status, "DONE", "C: the parent's notification with no work in between → DONE (not held)")
+  eq(s.agents[C].finished_at, "2026-10-04T11:00:10.000Z", "C: finished_at = the first end")
+  eq(s.agents[C].attempts[1].finished_at, "2026-10-04T11:00:10.000Z", "C: the attempt is closed at the first end")
+  eq(s.steers[C .. "-1"].status, "DELIVERED", "C: the instruction stays DELIVERED (it was handed over)")
+  eq(s.steers[C .. "-1"].held, false, "C: … but held = false")
+  eq(s.agents[C].end_held, nil, "C: end_held cleared")
+  eq(#s.agents[C].attempts, 1, "C: one attempt")
+  eq(s.agents[C].elapsed_ms, 8000, "C: elapsed = start → first end")
+  notice(C, "00:12")
+  eq(s.agents[C].status .. "/" .. tostring(s.steers[C .. "-1"].held), "DONE/false", "C: a second notification changes nothing")
+  -- 背景の子 D：block → 道具 → 2 回目の終わり → お知らせ = 止められた（お知らせは何もしない）
+  feed(H("PreToolUse", "00:19", { tool_name = "Agent", tool_use_id = "tD", tool_input = { description = "child D" } }))
+  feed(H("SubagentStart", "00:20", { agent_id = D, agent_type = "general-purpose" }))
+  feed(H("SubagentStop", "00:30", { agent_id = D, last_head = "first end" }))
+  feed(H("SubagentStop", "00:30", { agent_id = D, steer = { ids = { D .. "-1" }, mode = "block", target = D } }))
+  feed(H("PostToolUse", "00:35", { agent_id = D, tool_name = "Write", tool_use_id = "tw", target = "c.txt" }))
+  eq(s.steers[D .. "-1"].held, true, "D: a tool call after the hold → held = true")
+  eq(s.agents[D].end_held, nil, "D: end_held cleared by the tool call")
+  eq(s.agents[D].status, "RUNNING", "D: still running")
+  feed(H("SubagentStop", "00:40", { agent_id = D, last_head = "real end" }))
+  notice(D, "00:41")
+  eq(s.agents[D].status, "DONE", "D: DONE")
+  eq(s.agents[D].finished_at, "2026-10-04T11:00:40.000Z", "D: finished_at = the real end (the notification changes nothing)")
+  eq(s.steers[D .. "-1"].held, true, "D: still held")
+  -- 背景の子 E：block → 道具なしで 2 回目の終わり（子自身の SubagentStop）= 止められた
+  feed(H("PreToolUse", "00:49", { tool_name = "Agent", tool_use_id = "tE", tool_input = { description = "child E" } }))
+  feed(H("SubagentStart", "00:50", { agent_id = E2, agent_type = "general-purpose" }))
+  feed(H("SubagentStop", "00:55", { agent_id = E2, last_head = "first end" }))
+  feed(H("SubagentStop", "00:55", { agent_id = E2, steer = { ids = { E2 .. "-1" }, mode = "block", target = E2 } }))
+  feed(H("SubagentStop", "00:58", { agent_id = E2, last_head = "second end" }))
+  eq({ s.agents[E2].status, s.agents[E2].finished_at, s.steers[E2 .. "-1"].held, s.agents[E2].end_held },
+    { "DONE", "2026-10-04T11:00:58.000Z", true, nil }, "E: its own second SubagentStop → held, finished at the second end")
+  notice(E2, "00:59")
+  eq(s.agents[E2].finished_at, "2026-10-04T11:00:58.000Z", "E: the notification changes nothing")
+  -- 同期の子 F：block → 子の記録が無いまま親の PostToolUse(Agent) = 止められなかった
+  feed(H("PreToolUse", "01:00", { tool_name = "Agent", tool_use_id = "tF", tool_input = { description = "sync child F" } }))
+  feed(H("SubagentStart", "01:01", { agent_id = F, agent_type = "general-purpose" }))
+  feed(H("SubagentStop", "01:10", { agent_id = F, last_head = "first end" }))
+  feed(H("SubagentStop", "01:10", { agent_id = F, steer = { ids = { F .. "-1" }, mode = "block", target = F } }))
+  eq(s.agents[F].status, "RUNNING", "F: blocked stop → RUNNING")
+  feed(H("PostToolUse", "01:11", { tool_name = "Agent", tool_use_id = "tF", duration_ms = 10000,
+    tool_input = { description = "sync child F" }, tool_response = { agentId = F, status = "completed" } }))
+  eq({ s.agents[F].status, s.agents[F].finished_at, s.steers[F .. "-1"].held },
+    { "DONE", "2026-10-04T11:01:10.000Z", false }, "F: the parent's return with no work in between → DONE, not held")
+  -- 同期の子 G：block → 道具 → 2 回目の終わり → 親の PostToolUse(Agent) = 止められた
+  feed(H("PreToolUse", "01:20", { tool_name = "Agent", tool_use_id = "tG", tool_input = { description = "sync child G" } }))
+  feed(H("SubagentStart", "01:21", { agent_id = G, agent_type = "general-purpose" }))
+  feed(H("SubagentStop", "01:30", { agent_id = G, last_head = "first end" }))
+  feed(H("SubagentStop", "01:30", { agent_id = G, steer = { ids = { G .. "-1" }, mode = "block", target = G } }))
+  feed(H("PostToolUse", "01:33", { agent_id = G, tool_name = "Edit", tool_use_id = "te", target = "g.txt" }))
+  feed(H("SubagentStop", "01:36", { agent_id = G, last_head = "second end" }))
+  feed(H("PostToolUse", "01:37", { tool_name = "Agent", tool_use_id = "tG", duration_ms = 16000,
+    tool_input = { description = "sync child G" }, tool_response = { agentId = G, status = "completed" } }))
+  eq({ s.agents[G].status, s.agents[G].finished_at, s.steers[G .. "-1"].held },
+    { "DONE", "2026-10-04T11:01:36.000Z", true }, "G: held; finished at its own second end")
+  -- 止めていない子 K へのお知らせは何もしない（記録の順が入れ替わっても DONE にしない）
+  feed(H("PreToolUse", "01:40", { tool_name = "Agent", tool_use_id = "tK", tool_input = { description = "child K" } }))
+  feed(H("SubagentStart", "01:41", { agent_id = K, agent_type = "general-purpose" }))
+  notice(K, "01:42")
+  eq(s.agents[K].status, "RUNNING", "K: a notification alone does not finish an agent")
+  notice("afeed125000000099", "01:43")
+  eq(s.agents["afeed125000000099"], nil, "unknown id: a notification creates no box")
+  -- ROOT の Stop の block は判定しない（親の記録が無い）
+  feed(H("Stop", "01:50", { last_head = "root first" }))
+  feed(H("Stop", "01:50", { steer = { ids = { "ROOT-1" }, mode = "block", target = "ROOT" } }))
+  eq(s.agents.ROOT.end_held, nil, "ROOT: no end_held (not judged)")
+  eq(s.steers["ROOT-1"].held, nil, "ROOT: held stays unknown")
+end
+
 -- ---------- 13) 一時停止（pause。DESIGN-v0.1.2-pause §5.2） ----------
 print("[13] pauses")
 do

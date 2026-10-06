@@ -572,13 +572,15 @@ t.run("v0.1.2 detail: steering at the end and relay through the main agent", fun
     s9 = { id = "s9", agent_id = "a1", n = 9, text = "same words", via = "relay", expect = "parent", status = "DELIVERED",
       requested_at = iso(NOW - 40), delivered_at = iso(NOW - 39), relayed_at = iso(NOW - 30), relayed_by = "ROOT",
       relay_head = "same   words", delivered_via = "SendMessage" },
+    s10 = { id = "s10", agent_id = "a1", n = 10, text = "not-held", via = "hook", expect = "stop", status = "DELIVERED",
+      requested_at = iso(NOW - 30), delivered_at = iso(NOW - 20), delivered_via = "SubagentStop", mode = "block", held = false },
   }
-  s2.steer_order = { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9" }
+  s2.steer_order = { "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10" }
   s2.agents.a1.steers = vim.deepcopy(s2.steer_order)
   local d = detail.build(s2, s2.agents.a1, { width = 160, now = NOW, stats = STATS })
   local T = text(d)
   local mk = require("agentmap.graph").steer_mark()
-  has(d, "■ Steering (9)", "見出し")
+  has(d, "■ Steering (10)", "見出し")
   t.matches(T, mk .. " #1 " .. clk(NOW - 600) .. "  PENDING %(arrives when the agent finishes%)  \"資料は docs/v3 を読むこと\"", "1: expect stop")
   t.matches(T, "#2 " .. clk(NOW - 590) .. "  PENDING %(arrives at its next tool call%)  \"急いで\"", "2: expect next")
   t.matches(T, "#3 [%d:]+  DELIVERED " .. clk(NOW - 290) .. " at SubagentStop  \"b%.txt に書いて\"", "3: 終わり際に配達")
@@ -589,6 +591,8 @@ t.run("v0.1.2 detail: steering at the end and relay through the main agent", fun
   t.matches(T, "#7 [%d:]+  NOT RELAYED %(the main agent ended its turn without passing it on%)  \"relay%-not\"", "7: 渡さず番を終えた")
   t.matches(T, "#8 [%d:]+  NOT DELIVERED %(the agent finished before it could be delivered%)  \"too%-late\"", "8: 届く前に終わった")
   t.matches(T, "#9 [%d:]+  RELAYED", "9: 渡した（同じ文）")
+  t.matches(T, "#10 [%d:]+  DELIVERED " .. clk(NOW - 20) .. " at SubagentStop, NOT HELD %(Claude Code let the agent finish: its end had been held too many times in a row%)  \"not%-held\"",
+    "10: 届けたが止められなかった（連続の上限）")
   local n_as = select(2, T:gsub("→ sent as:", ""))
   t.eq(n_as, 1, "→ sent as: は本文と違うときだけ（空白の違いは同じとみなす）")
   hasnt(d, "typed: ", "閉じているときは端末に打った文を出さない")

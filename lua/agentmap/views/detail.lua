@@ -421,7 +421,10 @@ function M.build(state, agent, extra)
       return t("detail.steer_relay_sent", { time = H.fmt_clock(x.delivered_at or x.requested_at) }), "AgentMapWaiting"
     end
     if x.status == "DELIVERED" then
-      if x.delivered_via == "UserPromptSubmit" then
+      if x.held == false then
+        -- 終わり際に届けたが止められなかった（連続の上限で Claude Code が終わらせた。state が親の記録から判定）
+        return t("detail.steer_not_held", { time = H.fmt_clock(x.delivered_at), via = or_dash(x.delivered_via) }), "AgentMapRework"
+      elseif x.delivered_via == "UserPromptSubmit" then
         return t("detail.steer_confirmed", { time = H.fmt_clock(x.confirmed_at or x.delivered_at) }), "AgentMapDone"
       elseif x.via == "terminal" or x.delivered_via == "terminal" then
         return t("detail.steer_sent", { time = H.fmt_clock(x.delivered_at) }), "AgentMapDone"

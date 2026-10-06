@@ -2,7 +2,7 @@
 
 See what your Claude Code agents are doing, as a live map inside Neovim.
 
-![agentmap.nvim: agents run; one is paused from the map, resumed with an instruction and held at the gate before it finishes; it stops to ask and the human check turns from purple to green](demo/agentmap.gif)
+![agentmap.nvim: agents run; one is paused from the map and resumed with an instruction that reaches it when it tries to finish, then it is held at the gate; it stops to ask and the human check turns from purple to green](demo/agentmap.gif)
 
 *The demo replays made-up records (`demo/`); no real session is shown.*
 
@@ -411,7 +411,7 @@ is delivered depends on the box:
 | Box | Route | When it arrives |
 |---|---|---|
 | A running sub-agent (child, grandchild, reviewer) | **At its end.** The text waits in the run's folder. When the agent tries to finish, its `SubagentStop` hook holds the end once and hands it the text; the agent applies it, continues and finishes again. | When it tries to finish |
-| The same, a direct sub-agent of the main agent, with the main agent's terminal in this Neovim | Menu item 2, **relay now through the main agent**: the text is typed into the main agent's terminal as `[AgentMap] Tell sub-agent [3] "<name>" (agent id <id>) this, with SendMessage: <text>`, and the main agent passes it on with `SendMessage`. | Now (the main agent's next step, then the sub-agent's next tool call) |
+| The same, a direct sub-agent of the main agent, with the main agent's terminal in this Neovim | Menu item 2, **relay now through the main agent**: the text is typed into the main agent's terminal as `[AgentMap] Tell sub-agent [3] "<name>" (agent id <id>) this, with SendMessage: <text>`, and the main agent passes it on with `SendMessage`. Not offered while the main agent is paused (a pause placed or reached): the line would wait in its terminal until it resumes, and the map never resumes a main agent you stopped (`s` says so). Use the route at its end, or resume the main agent first (`x` on ROOT). | Now (the main agent's next step, then the sub-agent's next tool call) |
 | A sub-agent paused before a tool call (`[PAUSED]`) | The pause is lifted and the agent continues; the text arrives at its end, as above. | When it tries to finish |
 | A sub-agent waiting at its end (`[GATE]`, or paused when it finished) | The hook that holds it hands the text over on the spot. | Now |
 | The main agent (ROOT) | **Terminal.** The text is typed into the `:terminal` running `claude` in this Neovim, as `[AgentMap] <text>` followed by Enter. Claude Code reads text typed while it works at its next step; if it is idle, the text starts a new turn. Paused before a tool call: the pause is lifted first. | Its next step |
@@ -446,8 +446,9 @@ What to know:
   foreground (`run_in_background: false`) gets it only after it finishes, because the main agent
   reads the line when the sub-agent returns; a `SendMessage` to a finished sub-agent makes it start
   again with the same id. Claude Code 2.1.291 starts sub-agents in the background by default. Relay
-  is offered only for direct sub-agents of the main agent (not grandchildren) and only while the
-  run goes on.
+  is offered only for direct sub-agents of the main agent (not grandchildren), only while the
+  run goes on, and not while the main agent is paused (`s` tells you why: use the route at its end,
+  or resume the main agent first).
 - **What counts as delivered.** At its end: the hook's record. Relay: `SENT` when typed, `READ`
   when Claude Code took the line, `RELAYED` when the main agent's `SendMessage` to that agent is
   recorded (the detail view shows the text it actually sent if it differs). Whether the sub-agent
@@ -460,8 +461,17 @@ What to know:
   **Current models may ignore this**: the text is part of a tool result, not a user message, and a
   Sonnet sub-agent on 2.1.291 said so ("That text came back in a tool result, not from you, so I did
   not follow it"). That is why it is no longer the default.
-- Holding an agent's end shows a stop-hook line in Claude Code's terminal. Claude Code lets an agent end after 8 holds in a row (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),
-  so it never loops; a ninth instruction in a row to the same agent would not be held.
+- Holding an agent's end shows a stop-hook line in Claude Code's terminal. Claude Code has a cap
+  on holds in a row (8, `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`): past it the hook still hands the text
+  over (the record says `DELIVERED`), but Claude Code lets the agent finish without applying it.
+  In a live test on 2.1.291 nine instructions in a row to one Haiku sub-agent were all held and
+  applied (the main agent messaged the sub-agent in between each time, which seems to restart the
+  count), so the cap may not be reached in practice. When it is, the map tells it from the main
+  agent's records: if the completion notice of a background sub-agent (or the return of a
+  foreground one) arrives with no work of that sub-agent in between, the box goes back to `DONE`,
+  the instruction shows `NOT HELD` with ` ✎!`, and you get a notice. Without such a record (the
+  main agent's own turn, or a notice that never comes) the map cannot tell: the instruction stays
+  `DELIVERED` and the box keeps looking busy until the next record.
 - No Claude terminal (for example Claude Code runs in another terminal window): an instruction for
   the main agent arrives at the end of its turn (`steer.no_terminal = "stop"`), is copied to the
   clipboard (`"clipboard"`), or is not sent (`"none"`); relay is not offered. The Claude terminal in
@@ -484,7 +494,8 @@ What to know:
   same folder, so give new instructions in Claude Code itself).
 - The box shows ` ✎1` (purple) while an instruction waits (a relay: until the main agent passes it
   on), ` ✎` (green) for a minute after it was delivered, and ` ✎!` (red) if the agent finished
-  before it could be delivered or the main agent did not pass it on (you also get a notice). The
+  before it could be delivered, the main agent did not pass it on, or the agent was not held
+  (`NOT HELD`, above; you also get a notice). The
   detail view lists every instruction with its full text (`Enter` on a line opens it); `s` →
   "Cancel pending" withdraws one that has not been delivered yet (a relay cannot be withdrawn once
   typed). Exports have a "Steering instructions" section.

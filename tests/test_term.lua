@@ -19,6 +19,11 @@ t.run("parse / is_claude_cmd", function()
   local ja = "[AgentMap] サブエージェント [1]「調査」（agent id a1）に SendMessage で次を伝えてください：v3 を読むこと。\n次に進む"
   t.eq(term.sanitize(ja), "[AgentMap] サブエージェント [1]「調査」（agent id a1）に SendMessage で次を伝えてください：v3 を読むこと。 次に進む",
     "日本語の親経由の文は壊さない（改行だけ空白に）")
+  -- 末尾の \ は Claude Code では「改行」になり送信されない（2.1.291 実測）→ 後ろに空白を 1 つ
+  t.eq(term.sanitize("put it in C:\\temp\\"), "put it in C:\\temp\\ ", "末尾の \\ の後ろに空白（Enter で送信される）")
+  t.eq(term.sanitize("ends with \\\n\n"), "ends with \\ ", "改行を落とした後の末尾の \\ も")
+  t.eq(term.sanitize(term.sanitize("x\\")), "x\\ ", "2 回通しても同じ")
+  t.eq(term.sanitize("a \\ b"), "a \\ b", "途中の \\ はそのまま")
 end)
 
 -- 2. 本物の :terminal で偽の claude を動かす

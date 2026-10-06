@@ -565,5 +565,27 @@ config.setup({ claude_config_dir = "/home/user/.claude-x", hooks = { settings_pa
 t.eq(hooks.default_path(), "/etc/x/settings.json", "hooks.settings_path が優先")
 config.setup({})
 
+-- 8. ui.steer_hooks_ok() を本物の hooks.status / features で（差し替えずに）確かめる。
+--    既定の設定（mode stop・一時停止あり）で入れた登録で s が断られないこと（一時停止の門番＝PreToolUse の
+--    配達用の組があっても「余分」と見ない）。v0.1.1 の登録は断る（Q22）。一時停止を切った登録も届く
+do
+  local ui = require("agentmap.ui")
+  local p8 = dir .. "/s8.json"
+  config.setup({ hooks = { settings_path = p8 } })
+  write(p8, "{}\n")
+  t.ok(hooks.install({ path = p8, root = "/tmp/agentmap-test/store", yes = true, quiet = true }), "既定で登録")
+  t.eq(hooks.status(p8), "installed", "既定の登録は installed")
+  t.eq(ui.steer_hooks_ok(), true, "既定の登録（一時停止の門番あり）で s の hooks 経路は通る")
+  write(p8, J.encode(J.obj({ { "hooks", v011_hooks(CMD) } })) .. "\n")
+  t.eq(ui.steer_hooks_ok(), false, "v0.1.1 の登録（--mode deny --at-stop）では hooks 経路を断る（Q22）")
+  config.setup({ hooks = { settings_path = p8 }, pause = { enabled = false } })
+  write(p8, "{}\n")
+  t.ok(hooks.install({ path = p8, root = "/tmp/agentmap-test/store", yes = true, quiet = true }), "一時停止なしで登録")
+  t.eq(ui.steer_hooks_ok(), true, "一時停止なしの登録でも通る")
+  config.setup({ hooks = { settings_path = p8 } })
+  t.eq(ui.steer_hooks_ok(), true, "設定で一時停止を戻しても、登録し直す前の s は通る（届け方は同じ stop）")
+  config.setup({})
+end
+
 vim.fn.delete(dir, "rf")
 t.done()

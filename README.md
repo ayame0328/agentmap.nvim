@@ -469,8 +469,9 @@ What to know:
   folders, you pick one, once per run.
   Glance at the terminal after sending: agentmap.nvim cannot see whether Claude Code is waiting at
   a different prompt (for example the folder trust question).
-- Text typed into the terminal is sent as one line, and Enter follows `steer.submit_delay_ms`
-  (300 ms) later. With `0` a long line (about 250 characters, the length of a parent notice) is
+- Text typed into the terminal is sent as one line (line breaks and other control characters
+  become spaces; a trailing `\` gets a space after it, because Claude Code reads `\` + Enter as a
+  new line instead of sending), and Enter follows `steer.submit_delay_ms` (300 ms) later. With `0` a long line (about 250 characters, the length of a parent notice) is
   treated as a paste by Claude Code 2.1.289 and stays unsent in its input box; short lines are
   submitted either way. The detail view shows `SENT` until Claude Code reads the line, then
   `DELIVERED (read by Claude Code)`, so you can tell the two apart.

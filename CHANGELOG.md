@@ -70,6 +70,8 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   `SubagentStart` for the same agent id (a finished sub-agent started again by `SendMessage`) opens a
   new attempt and sets the box back to running.
 - `?` and the detail views list `x` / `X`.
+- A line typed into a Claude terminal that ends in `\` gets a space after it: Claude Code reads
+  `\` + Enter as a new line, so the line stayed unsent and the next one was glued to it.
 
 ### Notes
 

@@ -1298,10 +1298,16 @@ end
 function M.steer_hooks_ok()
   local hooks = try_require("agentmap.hooks")
   if not hooks or type(hooks.status) ~= "function" then return true end
-  -- 一時停止の条件（--pause と長い timeout）は見ない（修正指示だけなら要らない）
-  local ok, st = pcall(hooks.status, nil, nil, false)
+  -- 今の一時停止の設定で見た登録か、一時停止を外した登録のどちらかと一致すればよい（修正指示だけなら
+  -- --pause と長い timeout は要らない）。一時停止を外した形だけで見ると、既定の登録（一時停止の門番＝
+  -- PreToolUse の配達用 hook がある）が「余分な組がある」で outdated になり、s が必ず断られる
+  local ok, st = pcall(hooks.status)
   if not ok then return true end
-  if st ~= "installed" then return false end
+  if st ~= "installed" then
+    local ok2, st2 = pcall(hooks.status, nil, nil, false)
+    if not ok2 then return true end
+    if st2 ~= "installed" then return false end
+  end
   -- 届け方（--mode）が設定と同じか。features().mode が無い（読めない）ときは組の一致だけで決める
   if type(hooks.features) == "function" then
     local okf, f = pcall(hooks.features)
@@ -1501,9 +1507,12 @@ local function via_relay(ev, cfg, aid, text, prompt_id, done)
       return done("no_terminal")
     end
     if ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, sid) end
-    -- 止まっている子は、伝言を次の道具の切れ目で受け取れるように止まれを解く
+    -- 止まっている子は、伝言を次の道具の切れ目で受け取れるように止まれを解く。止まれを置いただけ（REQUESTED）の
+    -- 子は取り下げる（残すと次の道具の直前で止まり、伝言は再開まで届かない。hooks の経路と同じ扱い）。関門は残す
     local p = M._live_pause(aid)
-    if p and p.status == "PAUSED" and p.kind ~= "gate" then M._resume_raw(aid, { reason = "user" }) end
+    if p and (p.status == "PAUSED" or p.status == "REQUESTED") and p.kind ~= "gate" then
+      M._resume_raw(aid, { reason = "user" })
+    end
     notify(st_text("ui.steer_relay_sent"))
     after_steer()
     return done("relayed")

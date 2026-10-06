@@ -91,11 +91,15 @@ function M.find(cwd, bufs)
   return nil, list, true
 end
 
---- One line of text: control characters (CR, LF, ESC, …) become spaces.
+--- One line of text: control characters (CR, LF, ESC, …) become spaces. A trailing backslash gets a
+--- space after it: Claude Code reads "\" + Enter as "new line" instead of "submit", so the line would
+--- stay in its input box and the next one sent would be glued to it (measured with 2.1.291).
 function M.sanitize(text)
   text = tostring(text or "")
   text = text:gsub("[%c\127]", " ")
-  return (vim.trim(text:gsub("  +", " ")))
+  text = vim.trim(text:gsub("  +", " "))
+  if text:sub(-1) == "\\" then text = text .. " " end
+  return text
 end
 
 -- Lines whose Enter is delayed are sent one at a time per terminal job: text, "\r" after the

@@ -61,9 +61,21 @@ function M.runs_claude(pid, depth)
   for _, k in ipairs(kids) do
     local okp, info = pcall(vim.api.nvim_get_proc, k)
     if okp and type(info) == "table" and M.is_claude_cmd(tostring(info.name or "")) then return true end
+    -- 名前で分からないとき（macOS では台本や中継のプロセスの名前が sh などになる）は起動したときのコマンドを見る
+    if M.is_claude_cmd(M.proc_command(k) or "") then return true end
     if depth > 1 and M.runs_claude(k, depth - 1) then return true end
   end
   return false
+end
+
+--- The command line a process was started with (`ps -o command=`), or nil on Windows / failure.
+---@param pid integer
+function M.proc_command(pid)
+  if type(pid) ~= "number" or pid <= 0 or vim.fn.has("win32") == 1 then return nil end
+  local ok, out = pcall(vim.fn.system, { "ps", "-o", "command=", "-p", tostring(pid) })
+  if not ok or vim.v.shell_error ~= 0 or type(out) ~= "string" then return nil end
+  out = out:gsub("%s+$", "")
+  return out ~= "" and out or nil
 end
 
 --- Claude terminals, best first. score: 3 = same folder as `cwd`, 2 = a parent of `cwd`, 1 = other.

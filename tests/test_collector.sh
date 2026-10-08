@@ -1068,7 +1068,9 @@ n0 = len(lines())
 code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "deny", "--pause", "--max-wait", "10", later=(0.3, rm(PF)))
 r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason") or ""
 new = lines()[n0:]
-check(r == HB_HEAD + "(You were paused by the user for 0 s before this instruction.)\nfix the report\n" + HB_TAIL,
+# 止まっていた秒数は機械の速さで変わる（macOS の CI では 1 s になった）。形だけを確かめる
+import re as _re
+check(_re.fullmatch(_re.escape(HB_HEAD) + r"\(You were paused by the user for \d+ s before this instruction\.\)\nfix the report\n" + _re.escape(HB_TAIL), r) is not None,
       "(h5) deny after a gate: the paused-for line right after the header")
 check([("pause" in l and l["pause"]["phase"]) or ("steer" in l and "steer") for l in new] == ["hit", "released", "steer"]
       and new[1]["pause"].get("steer_ids") == [s6], "(h5) deny after a gate: hit, released (steer_ids), steer")

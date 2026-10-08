@@ -3,7 +3,7 @@
 All notable changes are listed here. Records written by older versions stay readable: when the
 state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next open.
 
-## [0.1.2] - unreleased
+## [0.1.2] - 2026-10-09
 
 ### Added
 
@@ -135,6 +135,13 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   again (Haiku 3 of 3, Sonnet 1 of 1); a hook can hold at `PreToolUse:SubagentHandback`, and a
   relay sent while it holds arrives after the report, when the agent starts again. Hook payloads
   carry `permission_mode`; the parent gets `<agent-message from="<id>">[Subagent hand-back]`.
+
+### Fixed
+
+- The Claude terminal is found when Claude Code was started inside a shell (for example through an
+  alias such as `claude-personal`): the terminal buffer is then named after the shell, so relaying
+  and steering the main agent found no terminal. A `claude` process under the terminal's job now
+  counts too.
 
 ## [0.1.1] - 2026-10-05
 

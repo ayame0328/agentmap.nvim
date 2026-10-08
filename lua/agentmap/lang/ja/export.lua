@@ -154,6 +154,7 @@ return {
   ["export.ov_gate"] = "入",
   -- v0.1.2: steering at the end of an agent and relay through the main agent (DESIGN-v0.1.2-steer2 appendix A)
   ["export.steer_pending_next"] = "書き出し時点で未配達（次の道具の呼び出しで届く）",
+  ["export.steer_pending_hb"] = "書き出し時点で未配達（終わり際に置いた。報告を SubagentHandback で返す子なので、親の端末があれば親経由に回し、無ければ届かない）",
   ["export.steer_relay_sent"] = "%{time} に親の端末へ送信、まだ渡っていない",
   ["export.steer_relayed"] = "%{time} に %{parent} が渡した（SendMessage）",
   ["export.steer_not_relayed"] = "渡らなかった: 親が番を終えた",

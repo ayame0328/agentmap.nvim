@@ -430,6 +430,13 @@ function M.build(state, agent, extra)
     local o = id and type(state.steers) == "table" and state.steers[id] or nil
     return (o and o.n) or "?"
   end
+  -- 報告を SubagentHandback で返す子らしいか（state.handback_likely。無い版では false）
+  local function hb_likely(id)
+    local ok, r = pcall(function()
+      return require("agentmap.state").handback_likely(state, type(state.agents) == "table" and state.agents[id] or nil)
+    end)
+    return ok and r == true
+  end
   local function steer_outcome0(x)
     -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §5.3）。届いていないのに届いたと書かない
     if x.status == "CANCELLED" and (x.end_reason == "rerouted" or x.rerouted_to) then
@@ -487,7 +494,11 @@ function M.build(state, agent, extra)
       return t("detail.steer_cancelled", { time = H.fmt_clock(x.ended_at) }), "AgentMapDim"
     end
     -- 未配達: いつ届くかは要求時の expect（無い = v0.1.1 の記録 = 次の道具）
-    if x.expect == "stop" then return t("detail.steer_pending"), "AgentMapWaiting" end
+    if x.expect == "stop" then
+      -- 報告を SubagentHandback で返す子の終わり際に置いた指示：「終わる直前に届く」とは書かない（DESIGN-v0.1.2-handback §3.4・Q25）
+      if x.via ~= "relay" and x.via ~= "terminal" and hb_likely(x.agent_id) then return t("detail.steer_pending_hb"), "AgentMapWaiting" end
+      return t("detail.steer_pending"), "AgentMapWaiting"
+    end
     return t("detail.steer_pending_next"), "AgentMapWaiting"
   end
   local function squash(v)

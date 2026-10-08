@@ -390,11 +390,14 @@ agent would reach another conversation's terminal in the same folder; give
 new instructions in Claude Code itself).
 
                                                            *agentmap-handback*
-In Claude Code's auto permission mode (a main model that supports it, such as
-Sonnet; Haiku as the main model turns it off), sub-agents other than forks end
-by calling the SubagentHandback tool. Its result ends the turn, and Claude Code
-discards any Stop / SubagentStop / PostToolUse block after it ("[end-turn] Stop
-hook block discarded"): an instruction at the end never arrives. This is
+In Claude Code's auto permission mode (the default on 2.1.294, also with
+--setting-sources project; a main model that does not support it turns it off:
+Haiku 4.5 on 2.1.292 did, Haiku 5.5 keeps it on), sub-agents other than forks
+end by calling the SubagentHandback tool; with --permission-mode default they
+report with plain text and the route at their end works as before. The
+hand-back result ends the turn, and Claude Code discards any Stop /
+SubagentStop / PostToolUse block after it ("[end-turn] Stop hook block
+discarded"): an instruction at the end never arrives. This is
 Claude Code's design. The recorder then leaves the instruction undelivered and
 records `skipped (handback)` instead of claiming delivery.
 

@@ -436,6 +436,7 @@ return {
   ["ui.pause_hit_hb"] = "%{label} stopped just before handing back its report: x pass, s fix (Enter shows the report)",
   ["ui.pause_fixed_relay_hb"] = "%{label} passed; the text goes through the main agent and it starts again",
   ["detail.steer_skipped_hb"] = "PENDING (skipped at its end %{time}: it reports through SubagentHandback)",
+  ["detail.steer_pending_hb"] = "PENDING (placed for its end; it reports through SubagentHandback, so it is relayed when the main agent's terminal is here, else not delivered)",
   ["detail.steer_rerouted"] = "CANCELLED %{time} (rerouted through the main agent as #%{n})",
   ["detail.steer_rerouted_from"] = " · rerouted from #%{n}",
   ["detail.steer_not_held_hb"] = "NOT HELD (hand-back: it had already reported)",

@@ -641,8 +641,10 @@ t.run("v0.1.2 detail: sub-agents that report through SubagentHandback", function
       requested_at = iso(NOW - 200), delivered_at = iso(NOW - 150), delivered_via = "PreToolUse:SubagentHandback", mode = "deny" },
     h7 = { id = "h7", agent_id = "a1", n = 7, text = "expired one", via = "hook", expect = "stop", status = "EXPIRED",
       requested_at = iso(NOW - 100), skipped_at = iso(NOW - 60), skip_reason = "handback", end_reason = "agent_finished" },
+    h8 = { id = "h8", agent_id = "a1", n = 8, text = "placed one", via = "hook", expect = "stop", status = "PENDING",
+      requested_at = iso(NOW - 20) },
   }
-  sh.steer_order = { "h2", "h3", "h4", "h5", "h6", "h7" }
+  sh.steer_order = { "h2", "h3", "h4", "h5", "h6", "h7", "h8" }
   sh.agents.a1.steers = vim.deepcopy(sh.steer_order)
   local hb = "## 報告\n- やったこと: a.txt を書いた\n- 方向: 指示どおり\n- 理由: 速い\n- 残った課題: なし"
   local function with_pause(x, p)
@@ -667,6 +669,9 @@ t.run("v0.1.2 detail: sub-agents that report through SubagentHandback", function
     "deny の任意設定")
   t.matches(T, "#7 [%d:]+  NOT DELIVERED %(the agent finished before it could be delivered; it reports through SubagentHandback, so its end cannot be held%)",
     "見送りのまま期限切れ")
+  -- 終わり際に置いたまま（まだ見送られていない）：「終わる直前に届く」とは書かない（最終確認 2026-10-08 で見つけた食い違い）
+  t.matches(T, "#8 [%d:]+  PENDING %(placed for its end; it reports through SubagentHandback, so it is relayed when the main agent's terminal is here, else not delivered%)  \"placed one\"",
+    "handback の子に置いた未配達")
   t.matches(T, "#1 " .. clk(NOW - 80) .. " gate → held just before its hand%-back " .. clk(NOW - 50) .. " %(report below%)",
     "関門：報告の直前で止めている")
   has(d, "■ Report about to be handed back", "止めている間は返そうとしている報告")
@@ -703,6 +708,7 @@ t.run("v0.1.2 detail: sub-agents that report through SubagentHandback", function
   require("agentmap.i18n").setup("ja")
   with_pause(sh, held)
   local J = text(detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS }))
+  t.matches(J, "#8 [%d:]+  未配達（終わり際に置いた。報告を SubagentHandback で返す子なので、親の端末があれば親経由に回し、無ければ届かない）", "ja: handback の子に置いた未配達")
   t.matches(J, "未配達（" .. clk(NOW - 300) .. " 終わり際で見送り：報告を SubagentHandback で返す子）", "ja: skipped")
   t.matches(J, "取り消し " .. clk(NOW - 299) .. "（#5 として親経由に回した）", "ja: rerouted")
   t.matches(J, "· #4 から回した", "ja: rerouted from")

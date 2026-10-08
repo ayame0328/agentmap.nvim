@@ -436,6 +436,7 @@ return {
   ["ui.pause_hit_hb"] = "%{label} が報告を返す直前で止まっています。x で通す、s で直す（Enter で報告を表示）",
   ["ui.pause_fixed_relay_hb"] = "%{label} を通しました。指示は親経由で渡し、子は報告してから再開します",
   ["detail.steer_skipped_hb"] = "未配達（%{time} 終わり際で見送り：報告を SubagentHandback で返す子）",
+  ["detail.steer_pending_hb"] = "未配達（終わり際に置いた。報告を SubagentHandback で返す子なので、親の端末があれば親経由に回し、無ければ届かない）",
   ["detail.steer_rerouted"] = "取り消し %{time}（#%{n} として親経由に回した）",
   ["detail.steer_rerouted_from"] = " · #%{n} から回した",
   ["detail.steer_not_held_hb"] = "止められず（報告済みだった）",

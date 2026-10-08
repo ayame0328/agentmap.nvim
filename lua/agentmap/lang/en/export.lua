@@ -154,6 +154,7 @@ return {
   ["export.ov_gate"] = "on",
   -- v0.1.2: steering at the end of an agent and relay through the main agent (DESIGN-v0.1.2-steer2 appendix A)
   ["export.steer_pending_next"] = "pending at export time (arrives at its next tool call)",
+  ["export.steer_pending_hb"] = "pending at export time (placed for its end; it reports through SubagentHandback, so it is relayed when the main agent's terminal is here, else not delivered)",
   ["export.steer_relay_sent"] = "sent to the main agent's terminal %{time}, not relayed yet",
   ["export.steer_relayed"] = "relayed %{time} by %{parent} (SendMessage)",
   ["export.steer_not_relayed"] = "not relayed: the main agent ended its turn",

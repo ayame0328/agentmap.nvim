@@ -124,7 +124,9 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   (14–17 s for six more tool calls in tests).
 - Claude Code 2.1.294 facts behind the hand-back change (the author's own settings, a Sonnet main
   model): in auto mode sub-agents (not forks) are told to report through `SubagentHandback`, whose
-  result carries `toolEndsTurn`; Haiku as the main model turns auto mode off, and
+  result carries `toolEndsTurn`; auto mode is the default permission mode even with
+  `--setting-sources project` (a Haiku 5.5 main model keeps it; Haiku 4.5 on 2.1.292 turned it
+  off; `--permission-mode default` gives sub-agents that report with plain text), and
   `CLAUDE_CODE_SENDMESSAGE_HANDBACK` is not read in this version. After the hand-back, `Stop` /
   `SubagentStop` / `PostToolUse` blocks are discarded (`[end-turn] Stop hook block discarded (turn
   ended by tool result, no model re-invoke)`). A deny of `SubagentHandback` with the text was

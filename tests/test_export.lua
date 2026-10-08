@@ -260,19 +260,23 @@ ph.steers["h4"] = { id = "h4", agent_id = "a1", n = 4, text = "old", via = "hook
   held = false, held_reason = "handback" }
 ph.steers["h5"] = { id = "h5", agent_id = "a1", n = 5, text = "denied", via = "hook", expect = "stop", status = "DELIVERED",
   requested_at = iso(NOW - 30), delivered_at = iso(NOW - 20), delivered_via = "PreToolUse:SubagentHandback", mode = "deny" }
-ph.steer_order = { "a2-1", "a1-1", "ROOT-1", "h1", "h2", "h3", "h4", "h5" }
+ph.steers["h6"] = { id = "h6", agent_id = "a1", n = 6, text = "placed", via = "hook", expect = "stop", status = "PENDING",
+  requested_at = iso(NOW - 10) }
+ph.steer_order = { "a2-1", "a1-1", "ROOT-1", "h1", "h2", "h3", "h4", "h5", "h6" }
 local mdh = export.to_markdown(ph, { now = NOW, stats = STATS })
 local function hclk(sec) return os.date("%H:%M:%S", sec) end
 t.matches(mdh, "\"skipped\" → pending at export time %(skipped at its end " .. hclk(NOW - 70)
   .. ": it reports through SubagentHandback%)\n", "skipped（未配達のまま）")
 t.matches(mdh, "\"moved\" → cancelled " .. hclk(NOW - 69) .. " %(rerouted through the main agent as #3%)\n", "親経由に回した")
+t.matches(mdh, "\"placed\" → pending at export time %(placed for its end; it reports through SubagentHandback, so it is relayed when the main agent's terminal is here, else not delivered%)\n",
+  "handback の子に置いた未配達（見送り前）")
 t.matches(mdh, "\"moved\" → relayed " .. hclk(NOW - 60) .. " by ROOT %(SendMessage%) · rerouted from #2\n", "回した先")
 t.matches(mdh, "\"old\" → delivered " .. hclk(NOW - 40) .. " at SubagentStop, not held %(hand%-back: it had already reported%)\n",
   "古い記録の決着")
 t.matches(mdh, "\"denied\" → delivered " .. hclk(NOW - 20) .. " via PreToolUse:SubagentHandback %(tool result; may be ignored%)\n",
   "deny の任意設定")
 t.matches(mdh, "| Permission mode | Sub%-agents report through SubagentHandback %(permission mode auto%) |", "概要の 1 行")
-t.matches(mdh, "| Steering | 8 %(1 pending%) |", "skipped は PENDING として数える")
+t.matches(mdh, "| Steering | 9 %(2 pending%) |", "skipped と置いたままの指示は PENDING として数える")
 t.ok(not mdr:find("| Permission mode |", 1, true), "auto でない run には概要の行を出さない")
 require("agentmap.i18n").setup("ja")
 local mdhj = export.to_markdown(ph, { now = NOW, stats = STATS })

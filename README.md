@@ -521,10 +521,12 @@ What to know:
 
 ### Sub-agents that report through SubagentHandback
 
-In Claude Code's **auto** permission mode (`permissions.defaultMode = "auto"`, with a main model
-that supports it, such as Sonnet; Haiku as the main model turns auto mode off), sub-agents other
-than forks end by calling the `SubagentHandback` tool, which hands their report to the parent.
-The author works this way every day.
+In Claude Code's **auto** permission mode (`permissions.defaultMode = "auto"`; on 2.1.294 it is the
+default even without that setting and even with `--setting-sources project`; a main model that does
+not support auto mode turns it off, seen with Haiku 4.5 on 2.1.292, while Haiku 5.5 keeps it on),
+sub-agents other than forks end by calling the `SubagentHandback` tool, which hands their report to
+the parent. With `--permission-mode default` they report with plain text and the route at their end
+works as before. The author works this way every day.
 
 - **Why the end cannot be held.** The `SubagentHandback` result ends the agent's turn
   (`toolEndsTurn`), and Claude Code then discards any `Stop` / `SubagentStop` / `PostToolUse` block
@@ -728,7 +730,7 @@ real hook payloads (see `tests/fixtures/`).
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList payloads; steering (deny wording, `stop_hook_active`, typing into a running `claude`) |
 | 2.1.289 | 2026-10-04 | Full run through Neovim: progress, light, steering, parent notice, HUMAN CHECK, export. A long line typed into `claude` needs Enter sent separately (`steer.submit_delay_ms`, now 300) |
 | 2.1.291 | 2026-10-06 | Stop / SubagentStop `decision: block` feedback followed (sub-agents 17/17, main agent 9/9); text in a `PreToolUse` deny ignored by Sonnet; the Agent tool runs in the background by default; relay with `SendMessage` (queued to the sub-agent's next tool round); a message to a finished sub-agent starts it again; hidden helper agents send a `SubagentStop` without a start in interactive mode (ignored) |
-| 2.1.294 | 2026-10-08 | Auto mode: sub-agents report through `SubagentHandback` (`toolEndsTurn`); `Stop` / `SubagentStop` / `PostToolUse` blocks after it are discarded (`[end-turn] Stop hook block discarded`); a deny just before the hand-back followed by Sonnet 2/2, Haiku 0/2; relay followed by Haiku 2/2 + Sonnet 1/1 (running) and Haiku 3/3 + Sonnet 1/1 (finished: it starts again); the hook can hold at `PreToolUse:SubagentHandback`; payloads carry `permission_mode`; the parent gets `<agent-message>[Subagent hand-back]`; Haiku as main model turns auto mode off; `-p` with a Sonnet main model is auto |
+| 2.1.294 | 2026-10-08 | Auto mode: sub-agents report through `SubagentHandback` (`toolEndsTurn`); `Stop` / `SubagentStop` / `PostToolUse` blocks after it are discarded (`[end-turn] Stop hook block discarded`); a deny just before the hand-back followed by Sonnet 2/2, Haiku 0/2; relay followed by Haiku 2/2 + Sonnet 1/1 (running) and Haiku 3/3 + Sonnet 1/1 (finished: it starts again); the hook can hold at `PreToolUse:SubagentHandback`; payloads carry `permission_mode`; the parent gets `<agent-message>[Subagent hand-back]`; auto mode is the default permission mode even with `--setting-sources project`; a Haiku 5.5 main model stays in auto mode (its sub-agents hand back), while Haiku 4.5 on 2.1.292 turned it off; `--permission-mode default` gives sub-agents that report with plain text (their end is held as before); `-p` with a Sonnet main model is auto |
 | 2.1.289 | 2026-10-05 | Pausing: a hook without `timeout` is stopped after 600 s; an explicit `timeout` is kept (630 s and 7200 s tested). Past the timeout Claude Code ends the hook (SIGTERM) and runs the tool, showing nothing. Esc does not stop background sub-agents; `/exit` with background work asks (stop tasks / move to background / stay). A hook that waits on the main agent's tool shows `running PreToolUse hooks…` in the spinner; on a sub-agent nothing is shown |
 
 Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion,

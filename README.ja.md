@@ -461,8 +461,9 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
 
 ### 報告を SubagentHandback で返す子
 
-Claude Code の権限モードが **auto**（`permissions.defaultMode = "auto"`。auto モードに対応したモデル、たとえば Sonnet を主に使うとき。
-Haiku を主にすると auto モードは切れます）のとき、fork 以外の子は最後に `SubagentHandback` という道具を呼び、それで報告を親に返して終わります。
+Claude Code の権限モードが **auto**（`permissions.defaultMode = "auto"`。2.1.294 ではこの設定が無くても、`--setting-sources project` でも既定が auto。
+auto モードに対応しない主モデルでは切れる（2.1.292 の Haiku 4.5 で確認）が、Haiku 5.5 では auto のまま）のとき、fork 以外の子は最後に
+`SubagentHandback` という道具を呼び、それで報告を親に返して終わります。`--permission-mode default` なら子は文章で報告し、終わり際の届け方が今までどおり効きます。
 作者は毎日この使い方をしています。
 
 - **終わりを止められない理由。** `SubagentHandback` の結果は子の番を終わらせ（`toolEndsTurn`）、そのあと Claude Code は
@@ -637,7 +638,7 @@ Claude Code が hooks に渡す中身には版の番号が入っていません�
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList の中身。修正指示（止めたときの文言、`stop_hook_active`、動いている `claude` への打ち込み） |
 | 2.1.289 | 2026-10-04 | Neovim からの通しの確認（進み具合・光・修正指示・親への知らせ・HUMAN CHECK・書き出し）。`claude` に打ち込む長い行は Enter を分けて送る必要がある（`steer.submit_delay_ms`、既定を 300 に） |
 | 2.1.291 | 2026-10-06 | Stop / SubagentStop の `decision: block` で渡した文に従う（子 17/17、親 9/9）。`PreToolUse` の deny に入れた文は Sonnet が無視。Agent の道具は既定で背景。`SendMessage` での親経由（子の次の道具の切れ目に届く）。終わった子に送ると再開する。対話モードでは開始の記録の無い内部の Agent の `SubagentStop` が届く（無視する） |
-| 2.1.294 | 2026-10-08 | auto モード：子は `SubagentHandback` で報告を返す（`toolEndsTurn`）。その後の `Stop` / `SubagentStop` / `PostToolUse` の止める指示は捨てられる（`[end-turn] Stop hook block discarded`）。報告の直前の deny に入れた文に Sonnet 2/2・Haiku 0/2 が従った。親経由に Haiku 2/2・Sonnet 1/1（動いている子）、Haiku 3/3・Sonnet 1/1（終わった子。再開する）が従った。hook は `PreToolUse:SubagentHandback` で待てる。hooks の中身に `permission_mode` が入る。親には `<agent-message>[Subagent hand-back]` が届く。Haiku を主にすると auto モードが切れる。Sonnet を主にした `-p` は auto |
+| 2.1.294 | 2026-10-08 | auto モード：子は `SubagentHandback` で報告を返す（`toolEndsTurn`）。その後の `Stop` / `SubagentStop` / `PostToolUse` の止める指示は捨てられる（`[end-turn] Stop hook block discarded`）。報告の直前の deny に入れた文に Sonnet 2/2・Haiku 0/2 が従った。親経由に Haiku 2/2・Sonnet 1/1（動いている子）、Haiku 3/3・Sonnet 1/1（終わった子。再開する）が従った。hook は `PreToolUse:SubagentHandback` で待てる。hooks の中身に `permission_mode` が入る。親には `<agent-message>[Subagent hand-back]` が届く。`--setting-sources project` でも auto モードが既定。Haiku 5.5 を主にしても auto のまま（子は hand-back で報告。2.1.292 の Haiku 4.5 では切れた）。`--permission-mode default` なら子は文章で報告し、終わり際の届け方が今までどおり効く。Sonnet を主にした `-p` は auto |
 | 2.1.289 | 2026-10-05 | 一時停止：`timeout` を書かない hook は 600 秒で打ち切られる。書いた `timeout` は守られる（630 秒・7200 秒で確認）。timeout を超えると Claude Code は hook を終わらせ（SIGTERM）、何も表示せずに道具を動かす。Esc は裏で動いている子を止めない。裏の仕事があるときの `/exit` は 3 択（止めて終わる／裏に回して終わる／とどまる）を聞く。親の道具で hook が待つと待ち表示に `running PreToolUse hooks…` が出る。子のときは何も出ない |
 
 使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion・SubagentHandback。一時停止用に全部の道具・待たせる形でもう 1 つ。

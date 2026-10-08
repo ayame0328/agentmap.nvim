@@ -1056,6 +1056,11 @@ function M.to_markdown(state, opts)
     local o = id and type(state.steers) == "table" and state.steers[id] or nil
     return (o and o.n) or "?"
   end
+  -- 報告を SubagentHandback で返す子らしいか（state.handback_likely。無い版では false）
+  local function hb_likely(id)
+    local ok, r = pcall(function() return require("agentmap.state").handback_likely(s, s.agents and s.agents[id] or nil) end)
+    return ok and r == true
+  end
   local function agent_with_name(id)
     if id == nil or id == "ROOT" then return "ROOT" end
     local ag = s.agents[id]
@@ -1095,7 +1100,8 @@ function M.to_markdown(state, opts)
     elseif x.status == "CANCELLED" then
       outcome = tr("export.steer_cancelled")
     elseif x.expect == "stop" then
-      outcome = tr("export.steer_pending")
+      -- 報告を SubagentHandback で返す子の終わり際に置いた指示：届かない見込みを正直に（DESIGN-v0.1.2-handback §3.4）
+      outcome = tr(x.via ~= "relay" and x.via ~= "terminal" and hb_likely(x.agent_id) and "export.steer_pending_hb" or "export.steer_pending")
     else
       outcome = tr("export.steer_pending_next") -- expect "next"、または v0.1.1 の記録（expect 無し）
     end

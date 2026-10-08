@@ -389,6 +389,12 @@ function M.poll_steps(run)
             local ok, idx = pcall(prov.agent_steps, path, memo.idx)
             if ok and type(idx) == "table" then
               memo.idx = idx
+              -- 報告を SubagentHandback で返す子の印①（transcript の先頭の固定文）。1 回だけ記録する
+              if idx.handback and id ~= "ROOT" and a.handback == nil and not memo.handback then
+                memo.handback = true
+                M.emit(run, { event = "agent_handback", agent_id = id, src = "system", source = "transcript" })
+                changed = true
+              end
               local steps = prov.steps_of(idx)
               if steps and not vim.deep_equal(steps, a.steps) then
                 M.emit(run, { event = "steps_updated", agent_id = id, src = "system", steps = steps })
@@ -499,7 +505,10 @@ M._sweep_flag = sweep_flag
 ---@param run table
 ---@param agent_id string "ROOT" or an agent id
 ---@param text string the instruction (clipped to steer.text_max characters)
----@param opts? { via?: "hook"|"terminal"|"relay", relay_line?: string, expect?: string, kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string }
+---   rerouted_from = <steer_id>: this relay replaces an instruction the collector skipped because its target
+---   reports through SubagentHandback (DESIGN-v0.1.2-handback §3.6); the caller then cancels the old one with
+---   cancel_steer(run, old, { reason = "rerouted", rerouted_to = <new id> }).
+---@param opts? { via?: "hook"|"terminal"|"relay", relay_line?: string, expect?: string, kind?: "steer"|"redo"|"notice", redo_of?: string, notice_of?: string, prompt_id?: string, rerouted_from?: string }
 ---   kind = "notice" with notice_of = <steer_id>: a notice to the parent about an instruction delivered to its
 ---   sub-agent (DESIGN-v0.2-steer appendix E; created by the UI). The state links them both ways
 ---   (s.steers[id].notice_of and s.steers[notice_of].notice_id). Before writing, the records are read once
@@ -539,6 +548,7 @@ function M.request_steer(run, agent_id, text, opts)
     relay_line = relay_line,
     prompt_id = opts.prompt_id or state_mod.latest_flow_id(run.state),
     kind = opts.kind or "steer", redo_of = opts.redo_of, notice_of = opts.notice_of,
+    rerouted_from = type(opts.rerouted_from) == "string" and opts.rerouted_from or nil,
   })
   return id
 end
@@ -554,8 +564,10 @@ end
 
 --- Cancel a pending instruction. Removes its file; if the file is gone, a hook already took it and
 --- nothing is recorded (returns false, "delivered").
+---@param opts? { reason?: string, rerouted_to?: string }  reason "rerouted" with rerouted_to: replaced by a relay
 ---@return boolean ok, string|nil err
-function M.cancel_steer(run, steer_id)
+function M.cancel_steer(run, steer_id, opts)
+  opts = opts or {}
   local st = run and run.state and state_mod.steer_of(run.state, steer_id)
   if not st then return false, "unknown" end
   if st.status ~= "PENDING" then return false, st.status:lower() end
@@ -563,7 +575,9 @@ function M.cancel_steer(run, steer_id)
     local ok = os.remove(steer_dir(run) .. "/" .. steer_id .. ".json")
     if not ok then return false, "delivered" end
   end
-  M.emit(run, { event = "steer_cancelled", steer_id = steer_id })
+  M.emit(run, { event = "steer_cancelled", steer_id = steer_id,
+    reason = type(opts.reason) == "string" and opts.reason or nil,
+    rerouted_to = type(opts.rerouted_to) == "string" and opts.rerouted_to or nil })
   pcall(sweep_flag, run)
   return true
 end
@@ -621,7 +635,9 @@ end
 
 --- Expire pending instructions whose target finished (or whose session ended): remove the file and
 --- record steer_expired. A relay that Claude Code read but the main agent did not pass on before its turn
---- ended expires with reason "not_relayed". Also removes <root>/steer.pending when no pending file is left anywhere.
+--- ended expires with reason "not_relayed". An instruction the collector skipped (its target reports through
+--- SubagentHandback) expires the same way and the record carries skip_reason = "handback".
+--- Also removes <root>/steer.pending when no pending file is left anywhere.
 ---@return boolean changed
 function M.sweep_steers(run, now)
   if not run or not run.state or not run.dir then return false end
@@ -648,7 +664,8 @@ function M.sweep_steers(run, now)
           end
         end
         if gone then
-          M.emit(run, { event = "steer_expired", steer_id = sid, reason = reason })
+          M.emit(run, { event = "steer_expired", steer_id = sid, reason = reason,
+            skip_reason = st.skipped_at and st.skip_reason or nil })
           changed = true
         end
       end

@@ -383,4 +383,67 @@ local st1, st2 = claude.normalize_hook(S2[1]), claude.normalize_hook(S2[7])
 t.eq({ st1[1].event, st1[1].agent_id, st2[1].event, st2[1].agent_id },
   { "agent_started", "afeed000000000030", "agent_started", "afeed000000000030" }, "再開の SubagentStart も agent_started（同じ id）")
 
+-- ---------- 報告を SubagentHandback で返す子（v0.1.2。DESIGN-v0.1.2-handback §4.3） ----------
+do
+  local CHB = "afeed000000000040"
+  local function rec(ev, extra)
+    local r = { session_id = "c0ffee40-0000-4000-8000-000000000040", hook_event_name = ev, prompt_id = "p1", _ts = "2026-10-08T06:00:00.000Z" }
+    for k, v in pairs(extra or {}) do r[k] = v end
+    return r
+  end
+  -- UserPromptSubmit：permission_mode と、hand-back の知らせ（新しい collector の kind / from）
+  local up = claude.normalize_hook(rec("UserPromptSubmit", { prompt_head = "go", permission_mode = "auto" }))
+  t.eq({ #up, up[1].event, up[1].permission_mode }, { 1, "run_prompt", "auto" }, "run_prompt に permission_mode")
+  local head = '<agent-message from="' .. CHB .. '"> [Subagent hand-back] The text below is the final report'
+  local am = claude.normalize_hook(rec("UserPromptSubmit", { prompt_head = head, kind = "agent_message", from = CHB, permission_mode = "auto" }))
+  t.eq(#am, 2, "agent_message → run_prompt と agent_notified")
+  t.eq({ am[1].kind, am[1].from }, { "agent_message", CHB }, "run_prompt に kind / from")
+  t.eq({ am[2].event, am[2].agent_id, am[2].kind }, { "agent_notified", CHB, "handback" }, "agent_notified { kind = handback }")
+  -- 古い記録（kind 無し・prompt_head だけ）からも
+  local old = claude.normalize_hook(rec("UserPromptSubmit", { prompt_head = head }))
+  t.eq({ #old, old[2] and old[2].event, old[2] and old[2].agent_id, old[2] and old[2].kind },
+    { 2, "agent_notified", CHB, "handback" }, "古い prompt_head（<agent-message …>[Subagent hand-back]）からも agent_notified handback")
+  local plain = claude.normalize_hook(rec("UserPromptSubmit", { prompt_head = '<agent-message from="' .. CHB .. '"> hello' }))
+  t.eq(#plain, 1, "[Subagent hand-back] の無い <agent-message> は run_prompt だけ")
+  -- PreToolUse SubagentHandback → tool_used ＋ agent_handback
+  local hb = claude.normalize_hook(rec("PreToolUse", { agent_id = CHB, tool_name = "SubagentHandback", tool_use_id = "tH",
+    report = "## Report\n- Done: x" }))
+  t.eq({ #hb, hb[1].event, hb[1].tool_name, hb[1].agent_id }, { 2, "tool_used", "SubagentHandback", CHB }, "PreToolUse SubagentHandback → tool_used")
+  t.eq({ hb[2].event, hb[2].agent_id, hb[2].tool_use_id, hb[2].report, hb[2].source },
+    { "agent_handback", CHB, "tH", "## Report\n- Done: x", "hook" }, "… と agent_handback（report・tool_use_id）")
+  -- SubagentStop の report_via
+  local fin = claude.normalize_hook(rec("SubagentStop", { agent_id = CHB, agent_type = "general-purpose", report = "r",
+    report_via = "handback", permission_mode = "auto" }))
+  t.eq({ fin[1].event, fin[1].report_via, fin[1].permission_mode }, { "agent_finished", "handback", "auto" }, "agent_finished に report_via")
+  -- steer の skipped 行 → steer_skipped（ids ごと。steer_delivered にはしない）
+  local sk = claude.normalize_hook(rec("SubagentStop", { agent_id = CHB,
+    steer = { ids = { CHB .. "-1", CHB .. "-2" }, mode = "skipped", reason = "handback", target = CHB } }))
+  t.eq(#sk, 2, "skipped の 2 件 → 2 件")
+  t.eq({ sk[1].event, sk[1].steer_id, sk[1].agent_id, sk[1].reason, sk[2].steer_id },
+    { "steer_skipped", CHB .. "-1", CHB, "handback", CHB .. "-2" }, "steer_skipped { steer_id, agent_id, reason }")
+  -- pause released reason handback_end
+  local pr = claude.normalize_hook(rec("SubagentStop", { agent_id = CHB,
+    pause = { id = CHB .. "-9", phase = "released", reason = "handback_end", target = CHB } }))
+  t.eq({ #pr, pr[1].event, pr[1].reason }, { 1, "pause_released", "handback_end" }, "pause released handback_end → pause_released")
+  -- deny の任意設定の配達：via = PreToolUse:SubagentHandback
+  local dv = claude.normalize_hook(rec("PreToolUse", { agent_id = CHB, tool_name = "SubagentHandback", tool_use_id = "tH",
+    steer = { ids = { CHB .. "-3" }, mode = "deny", target = CHB } }))
+  t.eq({ dv[1].event, dv[1].via, dv[1].mode }, { "steer_delivered", "PreToolUse:SubagentHandback", "deny" }, "deny の配達 → via PreToolUse:SubagentHandback")
+  -- 実物から作った fixture（hook_payloads_handback.jsonl を collector に通した形）と同じ形の行は、hooks_handback_h0 の古い記録でも読める
+  local H0 = {}
+  for i, l in ipairs(vim.fn.readfile(FIX .. "/hooks_handback_h0.jsonl")) do H0[i] = dec(l) end
+  local n0 = claude.normalize_hook(H0[8])
+  t.eq({ n0[2] and n0[2].event, n0[2] and n0[2].kind }, { "agent_notified", "handback" }, "fixture hooks_handback_h0 の知らせ → agent_notified handback")
+  -- 印①：transcript の先頭の固定文（agent_steps が idx.handback を立てる）
+  local idx = claude.agent_steps(FIX .. "/transcript_handback.jsonl", nil)
+  t.eq(idx.handback, true, "transcript_handback.jsonl：印①（SubagentHandback の reminder）を見つける")
+  t.eq(claude.agent_steps(FIX .. "/transcript_handback_relay.jsonl", nil).handback, true, "transcript_handback_relay.jsonl：印①")
+  t.eq(claude.agent_steps(FIX .. "/agent_report_text.jsonl", nil).handback, nil, "handback でない子の transcript：印は立たない")
+  t.eq(claude.agent_steps(FIX .. "/agent_steps.jsonl", nil).handback, nil, "agent_steps.jsonl：印は立たない")
+  -- 報告は最後の SubagentHandback（再開した子は 2 回目）
+  local r1, k1 = claude.agent_report(FIX .. "/transcript_handback_resumed.jsonl")
+  t.eq(k1, "handback", "再開した子の報告も handback から")
+  t.ok(type(r1) == "string" and r1:find("b.txt", 1, true) ~= nil, "再開した子の報告は 2 回目（b.txt）")
+end
+
 t.done()

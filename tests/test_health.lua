@@ -69,6 +69,15 @@ t.eq({ cf.progress.enabled, cf.animation.enabled, cf.steer.enabled }, { false, f
 t.eq(cf.progress.no_steps, "time", "false でも他の既定は残る")
 t.eq(config.setup({ progress = true }).progress.enabled, true, "true は既定のまま有効")
 t.eq(config.setup({ progress = { no_steps = "none" } }).progress.default_ms, 600000, "一部だけ渡しても残りは既定")
+-- 報告を SubagentHandback で返す子への届け方（DESIGN-v0.1.2-handback §7.1、付録 D：Q25・Q26 は既定案 1）
+config.setup({})
+t.eq({ config.get().steer.handback, config.get().steer.handback_reroute }, { "relay", true }, "handback の既定（relay・自動で回す）")
+t.eq(config.setup({ steer = { handback = "deny" } }).steer.handback, "deny", "handback deny は任意で残る")
+t.eq(config.setup({ steer = { handback = "bogus" } }).steer.handback, "relay", "知らない handback は relay")
+t.eq(config.setup({ steer = { handback_reroute = false } }).steer.handback_reroute, false, "handback_reroute false")
+t.eq(config.setup({ steer = { handback_reroute = 0 } }).steer.handback_reroute, false, "handback_reroute 0 は false")
+t.eq(config.setup({ steer = { handback_reroute = "yes" } }).steer.handback_reroute, true, "handback_reroute は boolean に直す")
+t.eq(config.setup({ steer = false }).steer.handback, "relay", "steer = false でも handback の既定は残る")
 -- v0.1.2 の一時停止（DESIGN-v0.1.2-pause §8.1、付録 D：release_on_exit の既定は false）
 config.setup({})
 c = config.get()
@@ -151,7 +160,7 @@ vim.env.AGENTMAP_DIR, vim.env.AGENTFLOW_DIR = store, nil
 require("agentmap.stats").reset()
 config.setup({})
 run_health()
-t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.291", "確かめた Claude Code の版")
+t.eq(require("agentmap.health").VERIFIED_CLAUDE_CODE, "2.1.294", "確かめた Claude Code の版（DESIGN-v0.1.2-handback §7.2）")
 t.ok(find("warn", "^Progress history: only 0 finished agents; estimates use the default 10:00 until records accumulate$"), "10: 記録が無ければ warn")
 t.ok(find("info", "^Estimate check: not enough samples yet %(0 of 20%)$"), "11: 標本が足りなければ info")
 t.ok(find("warn", "^Animation: low%-color terminal") or find("ok", "^Animation: on %(frame 100 ms, termguicolors o[nf]+%)$"), "12: 光の行")
@@ -341,6 +350,79 @@ run_health()
 t.ok(find("info", "^一時停止: 無効（pause%.enabled = false）$"), "16: 日本語")
 require("agentmap.i18n").setup("en")
 config.setup({})
+
+-- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §7.2 の 3 行）。担当 W2
+do
+  local HB = require("agentmap.health")
+  local hpath = dir .. "/claude/settings.json"
+  local function write_hb(cmds)
+    local pre = {}
+    for _, c in ipairs(cmds) do
+      pre[#pre + 1] = { matcher = "SubagentHandback", hooks = { { type = "command", timeout = 630,
+        command = "[ -e '" .. store .. "/pause.pending' ] || exit 0; exec python3 /x/bin/agentmap-collect --root " .. store
+          .. " --steer --mode stop --handback " .. c .. " --pause --max-wait 600" } } }
+    end
+    vim.fn.writefile({ vim.json.encode({ hooks = { PreToolUse = pre } }) }, hpath)
+  end
+  -- 経路の行（steering の段）
+  config.setup({})
+  t.eq(HB.handback_route(config.get().steer), "relay", "route: 既定は relay")
+  t.eq(HB.handback_route({ handback = "deny" }), "deny", "route: handback deny")
+  t.eq(HB.handback_route({ mode = "context" }), "deny", "route: mode context は deny（道具の直前にも渡す設定）")
+  run_health()
+  t.ok(find("info", "^Hand%-back route: relay %(sub%-agents that report through SubagentHandback get the text through the main agent%)$"),
+    "経路 relay")
+  t.ok(find("warn", "^PreToolUse SubagentHandback hook: missing or different from the settings; run :AgentMapInstallHooks$"),
+    "登録が無ければ warn")
+  config.setup({ steer = { handback = "deny" } })
+  run_health()
+  t.ok(find("info", "^Hand%-back route: deny %(.*as a tool result just before they hand back; current models may ignore it%)$"), "経路 deny")
+  -- 登録の確認
+  write_hb({ "relay" })
+  config.setup({})
+  t.eq(HB.handback_registration(hpath), "relay", "registration: relay")
+  run_health()
+  t.ok(find("ok", "^PreToolUse SubagentHandback hook: registered %(%-%-handback relay%)$"), "登録が設定どおりなら ok")
+  config.setup({ steer = { handback = "deny" } })
+  run_health()
+  t.ok(find("warn", "^PreToolUse SubagentHandback hook: missing"), "設定 deny・登録 relay なら warn")
+  write_hb({ "deny" })
+  run_health()
+  t.ok(find("ok", "^PreToolUse SubagentHandback hook: registered %(%-%-handback deny%)$"), "登録 deny")
+  -- relay で止まれも無効なら登録は要らない（行を出さない）
+  os.remove(hpath)
+  config.setup({ pause = false })
+  run_health()
+  t.ok(not find("warn", "^PreToolUse SubagentHandback hook") and not find("ok", "^PreToolUse SubagentHandback hook"),
+    "relay・止まれ無効なら登録の行なし")
+  t.eq(HB.handback_registration(hpath), nil, "registration: 無ければ nil")
+  -- 見ている run の権限モード（ui が読み込まれていなければ行なし）
+  config.setup({})
+  local saved_ui = package.loaded["agentmap.ui"]
+  package.loaded["agentmap.ui"] = nil
+  run_health()
+  t.ok(not find("info", "^This run: "), "図を開いていなければ run の行なし")
+  package.loaded["agentmap.ui"] = { run = { state = { permission_mode = "auto" } } }
+  run_health()
+  t.ok(find("info", "^This run: permission mode auto → sub%-agents report through SubagentHandback; instructions go through the main agent$"),
+    "run: auto")
+  package.loaded["agentmap.ui"] = { run = { state = { permission_mode = "default" } } }
+  run_health()
+  t.ok(find("info", "^This run: permission mode default → instructions arrive at the agent's end$"), "run: auto 以外")
+  package.loaded["agentmap.ui"] = { run = { state = {} } }
+  run_health()
+  t.ok(not find("info", "^This run: "), "権限モードの記録が無い run（W1 の前の state）は行なし")
+  -- 日本語
+  require("agentmap.i18n").setup("ja")
+  config.setup({ lang = "ja" })
+  package.loaded["agentmap.ui"] = { run = { state = { permission_mode = "auto" } } }
+  run_health()
+  t.ok(find("info", "^報告を SubagentHandback で返す子への経路: 親経由（relay）$"), "ja: 経路")
+  t.ok(find("info", "^この run: 権限モード auto → "), "ja: run")
+  require("agentmap.i18n").setup("en")
+  package.loaded["agentmap.ui"] = saved_ui
+  config.setup({})
+end
 
 -- 後片付け
 for k, v in pairs(saved) do vim.env[k] = v end

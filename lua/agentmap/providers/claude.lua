@@ -23,6 +23,10 @@ local HEAD = 200
 local LEAD = 400          -- 親の直前の発言を何文字まで残すか
 local REPORT_TAIL = 65536 -- 子の transcript の末尾何バイトから報告を探すか（収集係と同じ）
 local NOTE = 120          -- 作業の経過の 1 行（子の text）を何文字まで残すか
+-- 報告を SubagentHandback で返す子の transcript に Claude Code が入れる固定文の先頭（DESIGN-v0.1.2-handback §3.1 の印①。
+-- 2.1.294 実測 H2）。全文は比べない
+local HANDBACK_REMINDER = "Your final report is delivered through SubagentHandback"
+local HANDBACK_SCAN_BYTES = 256 * 1024 -- 印①を探すのは transcript の先頭のこの範囲だけ（子が動き出してすぐの行）
 
 -- ---------- 小道具 ----------
 
@@ -168,7 +172,13 @@ function M.normalize_hook(rec)
     local st = rec.steer
     local via = tostring(ev or "") .. (rec.tool_name and (":" .. rec.tool_name) or "")
     for _, sid in ipairs(type(st.ids) == "table" and st.ids or {}) do
-      if type(sid) == "string" and sid ~= "" then
+      if type(sid) == "string" and sid ~= "" and st.mode == "skipped" then
+        -- handback で終わった子の SubagentStop：配達していない（DESIGN-v0.1.2-handback §3.2。指示は PENDING のまま）
+        add("steer_skipped", {
+          steer_id = sid, agent_id = type(st.target) == "string" and st.target or who,
+          reason = type(st.reason) == "string" and st.reason or "handback", via = via,
+        })
+      elseif type(sid) == "string" and sid ~= "" then
         add("steer_delivered", {
           steer_id = sid, agent_id = type(st.target) == "string" and st.target or who,
           via = via, tool_use_id = rec.tool_use_id, mode = st.mode,
@@ -206,7 +216,11 @@ function M.normalize_hook(rec)
     add("agent_started", { agent_id = "ROOT", cwd = rec.cwd })
   elseif ev == "UserPromptSubmit" then
     if rec.prompt_head then
-      add("run_prompt", { prompt_head = rec.prompt_head, kind = rec.kind, cwd = rec.cwd })
+      add("run_prompt", {
+        prompt_head = rec.prompt_head, kind = rec.kind, cwd = rec.cwd,
+        permission_mode = type(rec.permission_mode) == "string" and rec.permission_mode or nil,
+        from = type(rec.from) == "string" and rec.from or nil,
+      })
       -- 背景の子が終わったお知らせ（<task-notification>）：task-id はその子の agent id。state はこれを
       -- 「終わりを止めて届けたのに子が続かなかった（連続の上限で Claude Code が終わらせた）」の判定に使う
       if rec.kind == "task_notification" then
@@ -214,6 +228,15 @@ function M.normalize_hook(rec)
         if aid then
           add("agent_notified", { agent_id = aid, status = rec.prompt_head:match("<status>%s*([%w_]+)%s*</status>") })
         end
+      else
+        -- 子が SubagentHandback で報告を返した知らせ（<agent-message from="X">[Subagent hand-back]。H12）。
+        -- 新しい collector は kind = "agent_message" と from、古い記録は prompt_head から読む（§3.7）
+        local from = rec.kind == "agent_message" and type(rec.from) == "string" and rec.from or nil
+        if not from and rec.kind == nil then
+          local f = rec.prompt_head:match('^%s*<agent%-message from="([%w_%-]+)">')
+          if f and rec.prompt_head:find("[Subagent hand-back]", 1, true) then from = f end
+        end
+        if from then add("agent_notified", { agent_id = from, kind = "handback" }) end
       end
     end
   elseif ev == "PreToolUse" then
@@ -229,6 +252,14 @@ function M.normalize_hook(rec)
       add("check_asked", {
         tool_use_id = rec.tool_use_id, asker_id = who,
         questions = M.norm_questions((rec.tool_input or {}).questions),
+      })
+    elseif rec.tool_name == "SubagentHandback" and rec.agent_id then
+      -- 子が報告を SubagentHandback で返そうとしている（DESIGN-v0.1.2-handback §3.1 の印②）。この道具は
+      -- PostToolUse を記録しないので、道具の記録もここで作る
+      add("tool_used", { agent_id = who, tool_name = rec.tool_name, tool_use_id = rec.tool_use_id, cwd = rec.cwd })
+      add("agent_handback", {
+        agent_id = who, tool_use_id = rec.tool_use_id,
+        report = type(rec.report) == "string" and rec.report ~= "" and rec.report or nil, source = "hook",
       })
     end
   elseif ev == "PostToolUse" then
@@ -333,6 +364,8 @@ function M.normalize_hook(rec)
         agent_id = rec.agent_id, transcript_path = rec.agent_transcript_path, last_head = rec.last_head,
         wf_id = wf_of_path(rec.agent_transcript_path), agent_type = rec.agent_type ~= "" and rec.agent_type or nil,
         report = type(rec.report) == "string" and rec.report ~= "" and rec.report or nil,
+        report_via = type(rec.report_via) == "string" and rec.report_via or nil,
+        permission_mode = type(rec.permission_mode) == "string" and rec.permission_mode or nil,
       })
     end
   elseif ev == "Stop" then
@@ -490,6 +523,8 @@ end
 ---   読むのは type == "assistant" の行の text ブロックだけ（tool_use の中身・tool_result・user 行は読まない）。
 ---   一覧が 2 回以上出たら後の一覧が勝つ（済んだ印は番号で持ち越す）。一覧より前の印は捨てる。
 ---   20 MB を超えたら、それより先は読まない（idx.truncated = true）
+---   ついでに、先頭 256 KB の中の user 行（isMeta）に SubagentHandback の固定文があれば idx.handback = true
+---   （報告を SubagentHandback で返す子の印①。DESIGN-v0.1.2-handback §3.1。その文を含む行だけ decode する）
 ---@return table idx
 function M.agent_steps(path, idx)
   idx = idx or { off = 0 }
@@ -499,7 +534,7 @@ function M.agent_steps(path, idx)
   local st = type(path) == "string" and uv.fs_stat(path)
   if not st then return idx end
   if st.size < idx.off then -- 作り直された
-    idx.off, idx.list, idx.marks, idx.items, idx.listed_at, idx.truncated = 0, nil, {}, {}, nil, nil
+    idx.off, idx.list, idx.marks, idx.items, idx.listed_at, idx.truncated, idx.handback = 0, nil, {}, {}, nil, nil, nil
   end
   if idx.off >= STEPS_MAX_BYTES then
     if st.size > idx.off then idx.truncated = true end
@@ -519,6 +554,17 @@ function M.agent_steps(path, idx)
     if not nl then break end -- 書きかけの最後の行は次回
     if nl > pos then
       local line = data:sub(pos, nl - 1)
+      if not idx.handback and idx.off + pos <= HANDBACK_SCAN_BYTES and line:find(HANDBACK_REMINDER, 1, true)
+          and line:find('"type":"user"', 1, true) then
+        local t = decode(line)
+        local c = t and t.isMeta and type(t.message) == "table" and t.message.content
+        if type(c) == "table" then -- text ブロックの形でも受ける
+          local parts = {}
+          for _, b in ipairs(c) do if type(b) == "table" and type(b.text) == "string" then parts[#parts + 1] = b.text end end
+          c = table.concat(parts, "\n")
+        end
+        if type(c) == "string" and c:find("^%s*<system%-reminder>%s*" .. HANDBACK_REMINDER) then idx.handback = true end
+      end
       -- 目印の語（Step / 手順）を含む assistant の text の行だけ decode する（大きな transcript でも軽く）
       if line:find('"type":"assistant"', 1, true) and line:find('"type":"text"', 1, true)
           and (line:find("[Ss][Tt][Ee][Pp]") or line:find("手順", 1, true)) then

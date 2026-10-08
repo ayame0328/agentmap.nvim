@@ -244,6 +244,43 @@ t.matches(mdrj, "に ROOT が渡した（SendMessage）", "ja: 渡した")
 t.matches(mdrj, "渡らなかった: 親が番を終えた", "ja: 渡らなかった")
 t.matches(mdrj, "に配達（SubagentStop）、止められず終了（", "ja: 止められなかった")
 require("agentmap.i18n").setup("en")
+-- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §5.4）：4 種の結果の語と概要の 1 行。担当 W2
+local ph = prog_state()
+ph.permission_mode = "auto"
+ph.steers["a1-2"] = nil
+ph.steers["h1"] = { id = "h1", agent_id = "a1", n = 1, text = "skipped", via = "hook", expect = "stop", status = "PENDING",
+  requested_at = iso(NOW - 80), skipped_at = iso(NOW - 70), skip_reason = "handback" }
+ph.steers["h2"] = { id = "h2", agent_id = "a1", n = 2, text = "moved", via = "hook", expect = "stop", status = "CANCELLED",
+  requested_at = iso(NOW - 79), skipped_at = iso(NOW - 70), ended_at = iso(NOW - 69), end_reason = "rerouted", rerouted_to = "h3" }
+ph.steers["h3"] = { id = "h3", agent_id = "a1", n = 3, text = "moved", via = "relay", expect = "parent", status = "DELIVERED",
+  requested_at = iso(NOW - 69), delivered_at = iso(NOW - 68), delivered_via = "SendMessage", relayed_at = iso(NOW - 60),
+  relayed_by = "ROOT", rerouted_from = "h2" }
+ph.steers["h4"] = { id = "h4", agent_id = "a1", n = 4, text = "old", via = "hook", expect = "stop", status = "DELIVERED",
+  requested_at = iso(NOW - 50), delivered_at = iso(NOW - 40), delivered_via = "SubagentStop", mode = "block",
+  held = false, held_reason = "handback" }
+ph.steers["h5"] = { id = "h5", agent_id = "a1", n = 5, text = "denied", via = "hook", expect = "stop", status = "DELIVERED",
+  requested_at = iso(NOW - 30), delivered_at = iso(NOW - 20), delivered_via = "PreToolUse:SubagentHandback", mode = "deny" }
+ph.steer_order = { "a2-1", "a1-1", "ROOT-1", "h1", "h2", "h3", "h4", "h5" }
+local mdh = export.to_markdown(ph, { now = NOW, stats = STATS })
+local function hclk(sec) return os.date("%H:%M:%S", sec) end
+t.matches(mdh, "\"skipped\" → pending at export time %(skipped at its end " .. hclk(NOW - 70)
+  .. ": it reports through SubagentHandback%)\n", "skipped（未配達のまま）")
+t.matches(mdh, "\"moved\" → cancelled " .. hclk(NOW - 69) .. " %(rerouted through the main agent as #3%)\n", "親経由に回した")
+t.matches(mdh, "\"moved\" → relayed " .. hclk(NOW - 60) .. " by ROOT %(SendMessage%) · rerouted from #2\n", "回した先")
+t.matches(mdh, "\"old\" → delivered " .. hclk(NOW - 40) .. " at SubagentStop, not held %(hand%-back: it had already reported%)\n",
+  "古い記録の決着")
+t.matches(mdh, "\"denied\" → delivered " .. hclk(NOW - 20) .. " via PreToolUse:SubagentHandback %(tool result; may be ignored%)\n",
+  "deny の任意設定")
+t.matches(mdh, "| Permission mode | Sub%-agents report through SubagentHandback %(permission mode auto%) |", "概要の 1 行")
+t.matches(mdh, "| Steering | 8 %(1 pending%) |", "skipped は PENDING として数える")
+t.ok(not mdr:find("| Permission mode |", 1, true), "auto でない run には概要の行を出さない")
+require("agentmap.i18n").setup("ja")
+local mdhj = export.to_markdown(ph, { now = NOW, stats = STATS })
+t.matches(mdhj, "書き出し時点で未配達（" .. hclk(NOW - 70) .. " 終わり際で見送り：報告を SubagentHandback で返す子）", "ja: skipped")
+t.matches(mdhj, "に取り消し（#3 として親経由に回した）", "ja: rerouted")
+t.matches(mdhj, "、止められず（報告済みだった）", "ja: not held")
+t.matches(mdhj, "| 権限モード | 子は報告を SubagentHandback で返す（権限モード auto） |", "ja: 概要の 1 行")
+require("agentmap.i18n").setup("en")
 -- 修正指示が 0 件
 t.matches(md, "\n## Steering instructions\n\n%(no steering instructions%)\n", "0 件の文")
 t.matches(md, "| Steering | 0 %(0 pending%) |", "0 件の概要")

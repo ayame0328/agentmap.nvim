@@ -158,4 +158,12 @@ return {
   ["export.steer_relayed"] = "relayed %{time} by %{parent} (SendMessage)",
   ["export.steer_not_relayed"] = "not relayed: the main agent ended its turn",
   ["export.steer_not_held"] = "delivered %{time} at %{via}, not held (Claude Code let the agent finish: its end had been held too many times in a row)",
+  -- v0.1.2: sub-agents that report through SubagentHandback (DESIGN-v0.1.2-handback appendix A)
+  ["export.steer_skipped_hb"] = "pending at export time (skipped at its end %{time}: it reports through SubagentHandback)",
+  ["export.steer_rerouted"] = "cancelled %{time} (rerouted through the main agent as #%{n})",
+  ["export.steer_not_held_hb"] = "not held (hand-back: it had already reported)",
+  ["export.steer_delivered_hb_deny"] = "delivered %{time} via PreToolUse:SubagentHandback (tool result; may be ignored)",
+  ["export.ov_permission_label"] = "Permission mode",
+  ["export.steer_join"] = ", ",
+  ["export.ov_handback"] = "Sub-agents report through SubagentHandback (permission mode auto)",
 }

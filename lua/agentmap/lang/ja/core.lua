@@ -131,4 +131,11 @@ return {
   ["health.steer_at_stop_ignored"] = "steer.at_stop は 0.1.2 から無視されます（常に有効）",
   ["health.sendmessage_ok"] = "SendMessage を記録します（親経由の確認用）",
   ["health.sendmessage_missing"] = "PostToolUse の matcher に SendMessage がありません: :AgentMapInstallHooks を実行してください（親経由の確認ができません）",
+  -- v0.1.2: sub-agents that report through SubagentHandback (DESIGN-v0.1.2-handback appendix A)
+  ["health.handback_relay"] = "報告を SubagentHandback で返す子への経路: 親経由（relay）",
+  ["health.handback_deny"] = "報告を SubagentHandback で返す子への経路: 報告の直前にツールの結果として渡す（deny。今のモデルは無視することがある）",
+  ["health.handback_hook_ok"] = "PreToolUse SubagentHandback の hook: 登録済み（--handback %{mode}）",
+  ["health.handback_hook_missing"] = "PreToolUse SubagentHandback の hook: 無いか設定と違います。:AgentMapInstallHooks を実行してください",
+  ["health.run_auto"] = "この run: 権限モード auto → 子は報告を SubagentHandback で返す。指示は親経由で渡す",
+  ["health.run_not_auto"] = "この run: 権限モード %{mode} → 指示は子の終わり際に届く",
 }

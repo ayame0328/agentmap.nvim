@@ -649,6 +649,215 @@ t.run("expired notice", function()
   t.eq(ui.sweep_steers(), false, "sweep_steers が無くても落ちない")
 end)
 
+-- 10. 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.4・§3.6・§5.1・§5.5、付録 D の Q24〜Q26）
+--     終わり際の block は Claude Code が捨てるので、親経由が既定。端末が無い・孫・親が止まっているときは置いて正直に知らせる。
+--     終わり際で見送られた（skipped）指示は、親経由できれば自動で回す
+local A1_EN_HB = A1_EN
+t.run("handback: likely", function()
+  s.permission_mode = nil
+  s.agents.a1.handback = nil
+  t.eq(ui.handback_likely("a1"), false, "印も権限モードも無ければ handback の子とはみなさない")
+  s.permission_mode = "auto"
+  t.eq(ui.handback_likely("a1"), true, "permission_mode auto ＋ a.handback 未定 → handback らしい")
+  s.agents.a1.agent_type = "fork"
+  t.eq(ui.handback_likely("a1"), false, "fork は handback を使わない")
+  s.agents.a1.agent_type = "general-purpose"
+  s.agents.a1.handback = false
+  t.eq(ui.handback_likely("a1"), false, "a.handback = false（印で違うと分かった）なら違う")
+  s.permission_mode = nil
+  s.agents.a1.handback = true
+  t.eq(ui.handback_likely("a1"), true, "a.handback = true（記録の印）なら権限モードに関係なく")
+  t.eq(ui.handback_likely("ROOT"), false, "ROOT は対象外")
+  t.eq(ui.handback_likely("nope"), false, "知らない id")
+end)
+
+t.run("handback: menu and relay", function()
+  s.agents.a1.handback = true
+  t.eq(ui.steer_kind("a1"), "relay", "端末あり・ROOT の直接の子 → 親経由")
+  menus, picks = {}, {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items, { ui._st("ui.steer_write_relay_hb"), T("ui.steer_show") },
+    "1 番が親経由（終わり際の項目と普通の親経由の項目は出さない）")
+  config.get().steer.handback = "deny"
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items, { ui._st("ui.steer_write_relay_hb"), ui._st("ui.steer_write_hb_deny"), T("ui.steer_show") },
+    "handback = deny なら 2 番に「報告の直前に渡す」")
+  config.get().steer.handback = nil
+  -- s → 1 番 → 窓 → ROOT の端末へ親経由の文
+  notes = {}
+  menus, picks = {}, { 1 }
+  ui.steer_menu("a1")
+  local b = input_buf()
+  t.ok(b ~= nil, "窓が開いた")
+  t.eq(vim.b[b].agentmap_steer_kind, "relay", "窓の種類は relay")
+  vim.api.nvim_buf_set_lines(b, 1, -1, false, { "also check docs/v3" })
+  settle()
+  local before = #read(out1)
+  vim.cmd("write")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN_HB .. "also check docs/v3", "受け取った文（偽の claude が書き出した行）")
+  local c = last("request")
+  t.eq({ c.agent_id, c.opts.via, c.opts.kind }, { "a1", "relay", "steer" }, "via relay で記録")
+  t.ok(noted(ui._st("ui.steer_relay_hb", { label = ui._steer_label("a1") })), "§5.5 の知らせ（次の道具か、終わってから再開）")
+  -- steer_send を直接呼んでも同じ（:AgentMapSteer 1 <本文>）
+  settle()
+  before = #read(out1)
+  t.eq(ui.steer_send("a1", "direct"), "relayed", "steer_send も親経由")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN_HB .. "direct", "端末に届いた")
+  -- route = hook で置ける（deny の項目）
+  notes = {}
+  config.get().steer.handback = "deny"
+  t.eq(ui.steer_send("a1", "as a tool result", nil, { route = "hook" }), "queued", "route = hook はファイルを置く")
+  t.eq(last("request").opts.via, "hook", "via hook")
+  t.ok(noted(ui._st("ui.steer_hb_deny", { label = ui._steer_label("a1") })), "ツールの結果として渡る（無視されることがある）と知らせた")
+  config.get().steer.handback = nil
+end)
+
+t.run("handback: no relay", function()
+  s.agents.a1.handback = true
+  local real_present = ui.terminal_present
+  ui.terminal_present = function() return false end
+  t.eq(ui.steer_kind("a1"), "hook", "端末が無ければ置く")
+  menus, picks = {}, {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items, { ui._st("ui.steer_write_hb_pending"), T("ui.steer_show") },
+    "1 番は「書く。この子の終わり際には届かない」")
+  notes = {}
+  t.eq(ui.steer_send("a1", "placed"), "queued", "置いた")
+  t.eq(last("request").opts.via, "hook", "via hook")
+  t.ok(noted(ui._st("ui.steer_hb_pending", { label = ui._steer_label("a1") })), "届かない見込みを正直に知らせた")
+  t.ok(not noted(ui._st("ui.steer_queued", { label = ui._steer_label("a1") })), "「終わり際に届く」とは言わない")
+  config.get().steer.handback = "deny"
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.steer_write_hb_deny"), "deny なら「報告の直前に渡す」")
+  notes = {}
+  t.eq(ui.steer_send("a1", "deny"), "queued", "置いた")
+  t.ok(noted(ui._st("ui.steer_hb_deny", { label = ui._steer_label("a1") })), "deny の知らせ")
+  config.get().steer.handback = nil
+  ui.terminal_present = real_present
+  -- 孫：親経由はできない
+  s.agents.g1.status = "RUNNING"
+  s.agents.g1.handback = true
+  t.eq(ui.steer_kind("g1"), "hook", "孫は置く")
+  notes = {}
+  t.eq(ui.steer_send("g1", "grandchild"), "queued", "孫に置いた")
+  t.ok(noted(ui._st("ui.steer_hb_pending", { label = ui._steer_label("g1") })), "孫も正直に知らせる")
+  s.agents.g1.status = "DONE"
+  s.agents.g1.handback = nil
+  -- 終わった handback の子に s：今までどおりやり直し依頼（Q21）
+  s.agents.a1.status = "DONE"
+  t.eq(ui.steer_kind("a1"), "redo", "終わった子はやり直し依頼のまま")
+  s.agents.a1.status = "RUNNING"
+end)
+
+t.run("handback: reroute skipped", function()
+  s.steers, s.steer_order = {}, {}
+  s.agents.a1.handback = true
+  ui._seed_expired()
+  local cancels = {}
+  local orig_cancel = events.cancel_steer
+  events.cancel_steer = function(run, id, o) cancels[#cancels + 1] = { id = id, opts = o } end
+  events.sweep_steers = nil
+  -- 開く前から見送られていた指示は回さない
+  s.steers["old"] = { id = "old", agent_id = "a1", kind = "steer", via = "hook", status = "PENDING", text = "old",
+    skipped_at = "2026-09-28T04:30:00.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:29:00.000Z" }
+  ui._seed_expired()
+  -- 子が handback で終わり、collector が skipped を書いた（箱は DONE）
+  s.agents.a1.status = "DONE"
+  s.steers["sk1"] = { id = "sk1", agent_id = "a1", kind = "steer", via = "hook", status = "PENDING", text = "use v3",
+    skipped_at = "2026-09-28T04:31:02.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:30:40.000Z",
+    prompt_id = "p1" }
+  notes = {}
+  settle()
+  local before = #read(out1)
+  t.eq(ui.sweep_steers(), true, "回したので changed")
+  vim.wait(3000, function() return #read(out1) > before end, 20)
+  t.eq(read(out1)[#read(out1)], A1_EN_HB .. "use v3", "ROOT の端末に親経由の文（子は同じ id で再開する）")
+  local c = last("request")
+  t.eq({ c.agent_id, c.text, c.opts.via, c.opts.rerouted_from, c.opts.prompt_id }, { "a1", "use v3", "relay", "sk1", "p1" },
+    "新しい relay の指示（rerouted_from）")
+  t.eq(#cancels, 1, "元の指示を 1 回取り消した（old は回さない）")
+  t.eq({ cancels[1].id, cancels[1].opts.reason, cancels[1].opts.rerouted_to }, { "sk1", "rerouted", c.id },
+    "取り消しの理由は rerouted、回した先の id")
+  t.ok(noted(ui._st("ui.steer_rerouted_hb", { label = ui._steer_label("a1") })), "§5.5 の知らせ")
+  -- 1 回だけ（state がまだ PENDING のままでも）
+  notes = {}
+  local n0 = #calls
+  ui.sweep_steers()
+  t.eq(#calls, n0, "2 回目は回さない")
+  t.eq(#notes, 0, "知らせもしない")
+  -- handback_reroute = false：知らせだけ
+  config.get().steer.handback_reroute = false
+  s.steers["sk2"] = { id = "sk2", agent_id = "a1", kind = "steer", via = "hook", status = "PENDING", text = "x",
+    skipped_at = "2026-09-28T04:32:00.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:31:50.000Z" }
+  notes = {}
+  n0 = #calls
+  t.eq(ui.reroute_skipped(), 0, "回さない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(ui._st("ui.steer_skipped_hb", { label = ui._steer_label("a1") })), "届かなかったと知らせた")
+  config.get().steer.handback_reroute = nil
+  -- 期限切れになっても「届かなかった」を重ねて言わない
+  s.steers.sk2.status = "EXPIRED"
+  notes = {}
+  ui.notify_expired()
+  t.ok(not noted(T("ui.steer_expired_notice", { label = ui._steer_label("a1") })), "期限切れの知らせは重ねない")
+  -- 親経由できない（孫）：知らせだけ
+  s.steers["sk3"] = { id = "sk3", agent_id = "g1", kind = "steer", via = "hook", status = "PENDING", text = "x",
+    skipped_at = "2026-09-28T04:33:00.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:32:50.000Z" }
+  notes = {}
+  n0 = #calls
+  t.eq(ui.reroute_skipped(), 0, "孫は回さない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(ui._st("ui.steer_skipped_hb", { label = ui._steer_label("g1") })), "孫も知らせる")
+  -- 親が止まっている：回さない
+  s.pauses["ROOT-live"].status = "PAUSED"
+  s.agents.ROOT.pause = "ROOT-live"
+  s.steers["sk4"] = { id = "sk4", agent_id = "a1", kind = "steer", via = "hook", status = "PENDING", text = "x",
+    skipped_at = "2026-09-28T04:34:00.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:33:50.000Z" }
+  notes = {}
+  n0 = #calls
+  t.eq(ui.reroute_skipped(), 0, "親が止まっていれば回さない")
+  t.eq(#calls, n0, "記録もしない")
+  t.ok(noted(ui._st("ui.steer_skipped_hb", { label = ui._steer_label("a1") })), "知らせた")
+  s.pauses["ROOT-live"].status = "RESUMED"
+  s.agents.ROOT.pause = nil
+  -- 端末が無い
+  local real_present = ui.terminal_present
+  ui.terminal_present = function() return false end
+  s.steers["sk5"] = { id = "sk5", agent_id = "a1", kind = "steer", via = "hook", status = "PENDING", text = "x",
+    skipped_at = "2026-09-28T04:35:00.000Z", skip_reason = "handback", requested_at = "2026-09-28T04:34:50.000Z" }
+  notes = {}
+  t.eq(ui.reroute_skipped(), 0, "端末が無ければ回さない")
+  t.ok(noted(ui._st("ui.steer_skipped_hb", { label = ui._steer_label("a1") })), "知らせた")
+  ui.terminal_present = real_present
+  events.cancel_steer = orig_cancel
+  s.agents.a1.status = "RUNNING"
+  s.steers, s.steer_order = {}, {}
+  ui._seed_expired()
+end)
+
+t.run("handback: not held notice", function()
+  s.steers, s.steer_order = {}, {}
+  ui._seed_expired()
+  -- 古い hooks が終わり際に block を出した記録 → 親の hand-back の知らせで NOT HELD (hand-back) に決着（state が held = false）
+  s.steers["o1"] = { id = "o1", agent_id = "a1", kind = "steer", via = "hook", status = "DELIVERED", mode = "block",
+    delivered_via = "SubagentStop" }
+  ui.notify_relays()
+  s.steers.o1.held = false
+  s.steers.o1.held_reason = "handback"
+  notes = {}
+  t.eq(ui.notify_relays(), 1, "1 回")
+  t.ok(noted(ui._st("ui.steer_not_held_hb", { label = ui._steer_label("a1") })), "「報告済みだったので止められなかった」")
+  t.ok(not noted(ui._st("ui.steer_not_held", { label = ui._steer_label("a1") })), "普通の「止められなかった」は出さない")
+  t.eq(ui.notify_relays(), 0, "2 回目は知らせない")
+  s.steers, s.steer_order = {}, {}
+  s.agents.a1.handback = nil
+  ui._seed_expired()
+end)
+
 vim.fn.jobstop(tj1)
 local _ = tb1
 t.done()

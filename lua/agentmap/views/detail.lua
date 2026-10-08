@@ -245,6 +245,9 @@ local function clock_of(v)
   return tsec and os.date("%H:%M:%S", tsec) or "-"
 end
 
+-- 報告を SubagentHandback で返す子の「終わり際」は PreToolUse:SubagentHandback（DESIGN-v0.1.2-handback §3.5）
+local HANDBACK_VIA = "PreToolUse:SubagentHandback"
+
 --- One line of the "■ Pauses" section (DESIGN-v0.1.2-pause §6.4), without the leading mark.
 --- Returns segs, link ("steer:<id>" when resumed with an instruction, else nil) and the line color.
 ---@param state table
@@ -267,15 +270,27 @@ function M.pause_line(state, p, i, now)
   local function add(text, h) segs[#segs + 1] = { " " .. text, h } end
   local waited = graph.pause_waited_ms(p, now)
   local dur = waited and t("detail.pause_duration", { dur = graph.fmt_duration(waited) }) or ""
-  if p.status == "PAUSED" then
+  local at_handback = p.hit_via == HANDBACK_VIA
+  if p.status == "PAUSED" and at_handback then
+    -- 報告を返す直前で止めている（報告は下の「返そうとしている報告」で読める）
+    add("→ " .. t("detail.pause_hit_hb", { time = clock_of(p.hit_at) }), hl)
+  elseif p.status == "PAUSED" then
     add(t("detail.pause_waiting", { time = clock_of(p.hit_at), via = via, ["until"] = clock_of(p.deadline) }), hl)
   elseif p.status == "REQUESTED" then
     add(t("detail.pause_not_yet"), hl)
   elseif p.status == "RESUMED" then
     hl = "AgentMapDone"
-    if p.hit_at then add(t("detail.pause_paused", { time = clock_of(p.hit_at), via = via })) end
+    if p.hit_at and at_handback then
+      add("→ " .. t("detail.pause_hit_hb", { time = clock_of(p.hit_at) }))
+    elseif p.hit_at then
+      add(t("detail.pause_paused", { time = clock_of(p.hit_at), via = via }))
+    end
     local r, rt = p.release_reason, clock_of(p.released_at)
-    if r == "auto" or r == "max_wait" then
+    if r == "handback_end" then
+      -- 終わり際（SubagentStop）で止めようとしたが、子はもう SubagentHandback で報告を返していた（収集係が解いた）
+      hl = "AgentMapDim"
+      add("→ " .. rt .. " " .. t("detail.pause_reason_handback_end"), hl)
+    elseif r == "auto" or r == "max_wait" then
       add(t("detail.pause_resumed_auto", { time = rt, min = graph.fmt_duration(waited) }), hl)
     elseif r == "nvim_exit" then
       add(t("detail.pause_resumed_exit", { time = rt }) .. dur, hl)
@@ -408,8 +423,37 @@ function M.build(state, agent, extra)
 
   -- 修正指示（DESIGN-v0.2-steer §6.4、DESIGN-v0.1.2-steer2 §7.3）。1 件以上あるときだけ
   local STEER_REASON = { agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
-    no_terminal = "detail.steer_reason_no_terminal", not_relayed = "detail.steer_reason_not_relayed" }
+    no_terminal = "detail.steer_reason_no_terminal", not_relayed = "detail.steer_reason_not_relayed",
+    handback = "detail.steer_reason_handback" }
+  local steer_outcome1 -- 従来の結果の文（下で定義）
+  local function steer_n(id)
+    local o = id and type(state.steers) == "table" and state.steers[id] or nil
+    return (o and o.n) or "?"
+  end
+  local function steer_outcome0(x)
+    -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §5.3）。届いていないのに届いたと書かない
+    if x.status == "CANCELLED" and (x.end_reason == "rerouted" or x.rerouted_to) then
+      return t("detail.steer_rerouted", { time = H.fmt_clock(x.ended_at), n = steer_n(x.rerouted_to) }), "AgentMapDim"
+    end
+    if (x.status == nil or x.status == "PENDING") and x.skipped_at then
+      return t("detail.steer_skipped_hb", { time = H.fmt_clock(x.skipped_at) }), "AgentMapRework"
+    end
+    if x.status == "DELIVERED" and x.via ~= "relay" then
+      if x.held == false and x.held_reason == "handback" then
+        return t("detail.steer_delivered", { time = H.fmt_clock(x.delivered_at), via = or_dash(x.delivered_via) })
+          .. " · " .. t("detail.steer_not_held_hb"), "AgentMapRework"
+      elseif x.delivered_via == HANDBACK_VIA then
+        return t("detail.steer_delivered_hb_deny", { time = H.fmt_clock(x.delivered_at) }), "AgentMapDone"
+      end
+    end
+    return steer_outcome1(x)
+  end
   local function steer_outcome(x)
+    local o, h = steer_outcome0(x)
+    if x.rerouted_from then o = o .. t("detail.steer_rerouted_from", { n = steer_n(x.rerouted_from) }) end
+    return o, h
+  end
+  steer_outcome1 = function(x)
     if x.via == "relay" and x.status ~= "EXPIRED" and x.status ~= "CANCELLED" then
       -- 親経由: 打った（SENT）→ Claude Code が読んだ（READ）→ ROOT が SendMessage で渡した（RELAYED）
       if x.relayed_at then
@@ -433,6 +477,10 @@ function M.build(state, agent, extra)
     elseif x.status == "EXPIRED" then
       local rk = STEER_REASON[x.end_reason]
       local reason = rk and t(rk) or or_dash(x.end_reason)
+      -- 終わり際で見送られた（skipped）まま期限切れになった：理由に「報告を SubagentHandback で返す子」を足す
+      if x.skip_reason == "handback" and x.end_reason ~= "handback" then
+        reason = reason .. "; " .. t("detail.steer_reason_handback")
+      end
       if x.end_reason == "not_relayed" then return t("detail.steer_not_relayed", { reason = reason }), "AgentMapRework" end
       return t("detail.steer_expired", { reason = reason }), "AgentMapRework"
     elseif x.status == "CANCELLED" then
@@ -573,7 +621,28 @@ function M.build(state, agent, extra)
   -- 報告（## 報告 の 4 項目）／要確認（## 要確認）／決まりどおりでなければ原文
   b:add("")
   local rf = type(a.report_fields) == "table" and a.report_fields or nil
-  if ask then
+  -- 報告を返す直前（PreToolUse:SubagentHandback）の報告（DESIGN-v0.1.2-handback §5.3）。
+  --   そこで止めている間、または終わりの記録（SubagentStop の report）がまだ無い間だけ出す。来たらそちらが正
+  local hb = type(a.handback_report) == "string" and a.handback_report ~= "" and a.handback_report or nil
+  local hb_held = false
+  for _, pid in ipairs(hb and graph.pauses_of(state, a.id) or {}) do
+    local p = state.pauses[pid]
+    if p and p.status == "PAUSED" and p.hit_via == HANDBACK_VIA then hb_held = true end
+  end
+  if hb and (hb_held or not (type(a.report) == "string" and a.report ~= "")) then
+    b:add({ { t("detail.h_handback_report"), hb_held and "AgentMapPaused" or "AgentMapHeader" } })
+    local r = brief.parse_report(hb)
+    if r.kind == "report" then
+      kv(b, width, t("detail.done"), r.done)
+      kv(b, width, t("detail.approach"), r.direction)
+      kv(b, width, t("detail.why"), r.reason)
+      kv(b, width, t("detail.open_issues"), r.issues)
+    else
+      local clipped = brief.clip(hb, cfg.report_chars)
+      for _, l in ipairs(wrap(clipped, width - 4)) do b:add("  " .. l) end
+      if clipped ~= hb then b:add({ { t("detail.clipped"), "AgentMapDim" } }) end
+    end
+  elseif ask then
     b:add({ { t("detail.h_ask"), "AgentMapWaiting" } })
     kv(b, width, t("detail.working_on"), ask.working)
     kv(b, width, t("detail.blocked_at"), ask.stuck)

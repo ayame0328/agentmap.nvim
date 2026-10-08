@@ -616,4 +616,99 @@ t.run("v0.1.2 detail: steering at the end and relay through the main agent", fun
   require("agentmap.i18n").setup("en")
 end)
 
+t.run("v0.1.2 detail: sub-agents that report through SubagentHandback", function()
+  -- DESIGN-v0.1.2-handback §5.3 の 6 行と、関門で止めている間の「返そうとしている報告」。担当 W2
+  --   state の新しい欄（skipped_at / skip_reason / rerouted_to / rerouted_from / held_reason / handback_report）は
+  --   W1 の契約（§12.2）どおりの形をここで直接書く
+  local NOW = 1790600000
+  local function iso(sec) return os.date("!%Y-%m-%dT%H:%M:%S.000Z", sec) end
+  local function clk(sec) return os.date("%H:%M:%S", sec) end
+  local STATS = { all = {}, by_type = {}, by_model = {}, runs = {} }
+  local sh = fixture()
+  sh.steers = {
+    h3 = { id = "h3", agent_id = "a1", n = 3, text = "skipped one", via = "hook", expect = "stop", status = "PENDING",
+      requested_at = iso(NOW - 600), skipped_at = iso(NOW - 300), skip_reason = "handback" },
+    h4 = { id = "h4", agent_id = "a1", n = 4, text = "rerouted one", via = "hook", expect = "stop", status = "CANCELLED",
+      requested_at = iso(NOW - 590), skipped_at = iso(NOW - 300), skip_reason = "handback", ended_at = iso(NOW - 299),
+      end_reason = "rerouted", rerouted_to = "h5" },
+    h5 = { id = "h5", agent_id = "a1", n = 5, text = "rerouted one", via = "relay", expect = "parent", status = "DELIVERED",
+      requested_at = iso(NOW - 299), delivered_at = iso(NOW - 298), delivered_via = "SendMessage", relayed_at = iso(NOW - 293),
+      relayed_by = "ROOT", rerouted_from = "h4" },
+    h2 = { id = "h2", agent_id = "a1", n = 2, text = "old record", via = "hook", expect = "stop", status = "DELIVERED",
+      requested_at = iso(NOW - 700), delivered_at = iso(NOW - 650), delivered_via = "SubagentStop", mode = "block",
+      held = false, held_reason = "handback" },
+    h6 = { id = "h6", agent_id = "a1", n = 6, text = "deny one", via = "hook", expect = "stop", status = "DELIVERED",
+      requested_at = iso(NOW - 200), delivered_at = iso(NOW - 150), delivered_via = "PreToolUse:SubagentHandback", mode = "deny" },
+    h7 = { id = "h7", agent_id = "a1", n = 7, text = "expired one", via = "hook", expect = "stop", status = "EXPIRED",
+      requested_at = iso(NOW - 100), skipped_at = iso(NOW - 60), skip_reason = "handback", end_reason = "agent_finished" },
+  }
+  sh.steer_order = { "h2", "h3", "h4", "h5", "h6", "h7" }
+  sh.agents.a1.steers = vim.deepcopy(sh.steer_order)
+  local hb = "## 報告\n- やったこと: a.txt を書いた\n- 方向: 指示どおり\n- 理由: 速い\n- 残った課題: なし"
+  local function with_pause(x, p)
+    x.pauses, x.pause_order = { [p.id] = p }, { p.id }
+    x.agents.a1.pauses = { p.id }
+  end
+  local held = { id = "a1-1", agent_id = "a1", n = 1, kind = "gate", at = "stop", status = "PAUSED",
+    requested_at = iso(NOW - 80), hit_at = iso(NOW - 50), hit_via = "PreToolUse:SubagentHandback", deadline = iso(NOW + 550) }
+  with_pause(sh, held)
+  sh.agents.a1.handback = true
+  sh.agents.a1.handback_report = hb
+  local d = detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS })
+  local T = text(d)
+  t.matches(T, "#3 " .. clk(NOW - 600) .. "  PENDING %(skipped at its end " .. clk(NOW - 300)
+    .. ": it reports through SubagentHandback%)  \"skipped one\"", "skipped（未配達のまま）")
+  t.matches(T, "#4 [%d:]+  CANCELLED " .. clk(NOW - 299) .. " %(rerouted through the main agent as #5%)", "自動で親経由に回した")
+  t.matches(T, "#5 [%d:]+  RELAYED " .. clk(NOW - 293) .. " by ROOT with SendMessage · rerouted from #4  \"rerouted one\"", "回した先の RELAYED に 1 句")
+  t.matches(T, "#2 [%d:]+  DELIVERED " .. clk(NOW - 650) .. " at SubagentStop · NOT HELD %(hand%-back: it had already reported%)",
+    "古い記録の決着")
+  hasnt(d, "held too many times in a row)  \"old record", "hand-back の NOT HELD は連続上限の文にしない")
+  t.matches(T, "#6 [%d:]+  DELIVERED " .. clk(NOW - 150) .. " via PreToolUse:SubagentHandback %(tool result; may be ignored%)",
+    "deny の任意設定")
+  t.matches(T, "#7 [%d:]+  NOT DELIVERED %(the agent finished before it could be delivered; it reports through SubagentHandback, so its end cannot be held%)",
+    "見送りのまま期限切れ")
+  t.matches(T, "#1 " .. clk(NOW - 80) .. " gate → held just before its hand%-back " .. clk(NOW - 50) .. " %(report below%)",
+    "関門：報告の直前で止めている")
+  has(d, "■ Report about to be handed back", "止めている間は返そうとしている報告")
+  t.matches(T, "Report about to be handed back\n.-a%.txt を書いた", "報告の 4 項目を読む")
+  hasnt(d, "■ Report\n", "通常の報告の見出しは出さない")
+  -- 通した後（RESUMED）：見出しは通常の報告。SubagentStop の report が正
+  local passed = vim.tbl_extend("force", held, { status = "RESUMED", released_at = iso(NOW - 40), release_reason = "user" })
+  with_pause(sh, passed)
+  sh.agents.a1.report = "## 報告\n- やったこと: 最終\n- 方向: x\n- 理由: y\n- 残った課題: なし"
+  sh.agents.a1.report_fields = { done = "最終", direction = "x", reason = "y", issues = "なし" }
+  local d2 = detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS })
+  local T2 = text(d2)
+  t.matches(T2, "gate → held just before its hand%-back " .. clk(NOW - 50) .. " %(report below%) → resumed by you "
+    .. clk(NOW - 40), "通した関門の行")
+  hasnt(d2, "Report about to be handed back", "通して終わりの報告が来たら返そうとしている報告は出さない")
+  t.matches(T2, "■ Report\n.-最終", "終わりの報告")
+  -- 終わり際（SubagentStop）で止めようとしたが、もう報告済みだった（収集係が解いた）
+  with_pause(sh, { id = "a1-1", agent_id = "a1", n = 1, kind = "pause", at = "stop", status = "RESUMED",
+    requested_at = iso(NOW - 80), released_at = iso(NOW - 30), release_reason = "handback_end" })
+  t.matches(text(detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS })),
+    "requested %(when it finishes%) → " .. clk(NOW - 30) .. " %(not held at its end: it had already handed back%)", "handback_end")
+  -- 終わりの記録がまだ無い間（止めていない）も返そうとしている報告を出す
+  sh.agents.a1.report, sh.agents.a1.report_fields = nil, nil
+  sh.pauses, sh.pause_order, sh.agents.a1.pauses = {}, {}, nil
+  has(detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS }), "■ Report about to be handed back",
+    "終わりの記録が無い間")
+  -- 新しい欄が無い（W1 の前の state）でも落ちない
+  local plain = fixture()
+  plain.steers = { z = { id = "z", agent_id = "a1", n = 1, text = "z", status = "PENDING", expect = "stop", requested_at = iso(NOW) } }
+  plain.steer_order, plain.agents.a1.steers = { "z" }, { "z" }
+  t.matches(text(detail.build(plain, plain.agents.a1, { width = 200, now = NOW, stats = STATS })),
+    "PENDING %(arrives when the agent finishes%)", "新しい欄が無い state")
+  -- 日本語
+  require("agentmap.i18n").setup("ja")
+  with_pause(sh, held)
+  local J = text(detail.build(sh, sh.agents.a1, { width = 200, now = NOW, stats = STATS }))
+  t.matches(J, "未配達（" .. clk(NOW - 300) .. " 終わり際で見送り：報告を SubagentHandback で返す子）", "ja: skipped")
+  t.matches(J, "取り消し " .. clk(NOW - 299) .. "（#5 として親経由に回した）", "ja: rerouted")
+  t.matches(J, "· #4 から回した", "ja: rerouted from")
+  t.matches(J, "· 止められず（報告済みだった）", "ja: not held")
+  t.matches(J, "■ 返そうとしている報告", "ja: 返そうとしている報告")
+  require("agentmap.i18n").setup("en")
+end)
+
 t.done()

@@ -370,7 +370,7 @@ do
     listed_at = "2026-10-04T09:00:30.000Z", items = { { n = 1, text = "root step" } } } }))
   ok(state.flow_view(s, P1).agents.ROOT.steps ~= nil, "flow_view: ROOT steps listed in flow 1 shown in flow 1")
   eq(state.flow_view(s, P2).agents.ROOT.steps, nil, "flow_view: … and not in flow 2")
-  eq(state.SV, 11, "SV = 11")
+  eq(state.SV, 12, "SV = 12")
 end
 
 -- ---------- 11) 修正指示（steer。DESIGN-v0.2-steer §5.2） ----------
@@ -749,7 +749,7 @@ do
   eq(v2.agents.ROOT.pause, nil, "… but it is not ROOT's live pause")
   eq(state.pause_of(v2, "ROOT"), nil, "pause_of(ROOT) in flow 2 = nil")
   eq(s.pauses[A .. "-10"].owner_id, nil, "flow_view does not change the original")
-  eq(state.SV, 11, "SV = 11")
+  eq(state.SV, 12, "SV = 12")
 end
 
 -- ---------- 14) 親経由の修正指示（relay）と、終わった子の再開（DESIGN-v0.1.2-steer2 §6.4、E3c） ----------
@@ -873,7 +873,138 @@ do
   state.apply(s, U("steer_delivered", "01:30", { steer_id = R5, agent_id = CH, via = "terminal" }))
   state.apply(s, U("run_prompt", "01:31", { prompt_id = "pX", prompt_head = RL5:sub(1, 200), src = "hook" }))
   eq(s.steers[R5].confirmed_at, "2026-10-06T09:01:31.000Z", "relay READ by the typed line's head (prompt_head cut at 200)")
-  eq(state.SV, 11, "SV = 11")
+  eq(state.SV, 12, "SV = 12")
+end
+
+-- ---------- 15) 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.7・§4.4） ----------
+print("[15] hand-back sub-agents")
+do
+  -- (a) H0 の形：0.1.2（この変更の前）の hooks が block を出し → 親に <agent-message>[Subagent hand-back] →
+  --     NOT HELD (hand-back)、箱は DONE に戻り、指示は held = false・held_reason = handback
+  local recs = util.json_lines(here .. "/fixtures/hooks_handback_h0.jsonl", 0)
+  eq(#recs, 9, "fixture hooks_handback_h0: 9 lines")
+  local CH = "afeed000000000050"
+  local S1, S2 = CH .. "-1791439904492", CH .. "-1791439988059"
+  local s = state.new("h0")
+  local function U(event, ts, f)
+    local e = { v = 1, event = event, ts = "2026-10-08T06:" .. ts .. "Z", src = "user" }
+    for k, v in pairs(f or {}) do e[k] = v end
+    return e
+  end
+  local function feed(i) for _, e in ipairs(claude.normalize_hook(recs[i])) do state.apply(s, e) end end
+  for i = 1, 5 do feed(i) end
+  state.apply(s, U("steer_requested", "11:44.492", { steer_id = S1, agent_id = CH, text = "one", via = "hook", expect = "stop" }))
+  state.apply(s, U("steer_requested", "13:08.059", { steer_id = S2, agent_id = CH, text = "two", via = "hook", expect = "stop" }))
+  feed(6) feed(7)
+  eq(s.agents[CH].status, "RUNNING", "H0: block at its end → RUNNING (end_held)")
+  ok(s.agents[CH].end_held ~= nil, "H0: end_held is set")
+  feed(8)
+  eq(s.agents[CH].status, "DONE", "H0: the hand-back notice settles it → DONE")
+  eq(s.agents[CH].end_held, nil, "H0: end_held cleared")
+  eq(s.steers[S1].held, false, "H0: the instruction was not held (held = false)")
+  eq(s.steers[S1].held_reason, "handback", "H0: held_reason = handback")
+  eq(s.steers[S1].status, "DELIVERED", "H0: status stays DELIVERED (shown NOT HELD)")
+  eq(s.agents[CH].finished_at, "2026-10-08T06:13:20.000Z", "H0: finished_at = the first end")
+  eq(s.agents[CH].handback, true, "H0: the notice marks the child as a hand-back child")
+  eq(#s.flows, 1, "H0: the notice does not start a flow")
+  feed(9)
+  eq(s.agents[CH].status, "DONE", "H0: still DONE after ROOT's Stop")
+
+  -- (b) 新しい記録：permission_mode、agent_handback、skipped、rerouted、再開して 2 回目の終わり
+  local C2 = "afeed000000000040"
+  local s2 = state.new("hb")
+  local function H(ev, ts, f)
+    local r = { session_id = "hb", hook_event_name = ev, prompt_id = "q1", _ts = "2026-10-08T07:" .. ts .. "Z" }
+    for k, v in pairs(f or {}) do r[k] = v end
+    for _, e in ipairs(claude.normalize_hook(r)) do state.apply(s2, e) end
+  end
+  H("UserPromptSubmit", "00:00.000", { prompt_head = "go", permission_mode = "auto" })
+  H("UserPromptSubmit", "00:00.500", { prompt_head = "again", permission_mode = "default", prompt_id = "q0" })
+  eq(s2.permission_mode, "auto", "permission_mode = the first value (not overwritten)")
+  H("SubagentStart", "00:01.000", { agent_id = C2, agent_type = "general-purpose" })
+  eq(s2.agents[C2].handback, nil, "no mark yet: a.handback = nil")
+  eq(state.handback_likely(s2, s2.agents[C2]), true, "handback_likely: permission mode auto + no mark → true")
+  eq(state.handback_likely(s2, C2), true, "handback_likely also takes an id")
+  eq(state.handback_likely(s2, "ROOT"), false, "handback_likely(ROOT) = false")
+  s2.agents[C2].agent_type = "fork"
+  eq(state.handback_likely(s2, C2), false, "a fork is not hand-back-likely")
+  s2.agents[C2].agent_type = "general-purpose"
+  local sx = state.new("x")
+  state.apply(sx, U("run_prompt", "00:00.000", { prompt_head = "go", permission_mode = "bypassPermissions" }))
+  state.apply(sx, U("agent_started", "00:01.000", { agent_id = "z1", agent_type = "general-purpose" }))
+  eq(state.handback_likely(sx, "z1"), false, "permission mode other than auto → not likely")
+  state.apply(sx, U("agent_handback", "00:02.000", { agent_id = "z1", source = "transcript" }))
+  eq(state.handback_likely(sx, "z1"), true, "a mark (agent_handback) wins over the permission mode")
+  -- 止まれ：handback の直前で止まる（関門）
+  state.apply(s2, U("pause_requested", "00:02.000", { pause_id = C2 .. "-p1", agent_id = C2, at = "stop", kind = "gate" }))
+  H("PreToolUse", "00:05.000", { agent_id = C2, tool_name = "SubagentHandback", tool_use_id = "tH",
+    pause = { id = C2 .. "-p1", phase = "hit", kind = "gate", at = "stop", target = C2 } })
+  H("PreToolUse", "00:05.100", { agent_id = C2, tool_name = "SubagentHandback", tool_use_id = "tH", report = "## Report\n- Done: a.txt" })
+  local p = s2.pauses[C2 .. "-p1"]
+  eq(p.hit_via, "PreToolUse:SubagentHandback", "pause hit via PreToolUse:SubagentHandback")
+  eq(state.held_at_end(p), true, "held_at_end: true at PreToolUse:SubagentHandback")
+  eq(state.display_status(s2, C2), "GATE", "display_status: GATE while held before the hand-back")
+  eq(s2.agents[C2].handback, true, "agent_handback → a.handback = true")
+  eq(s2.agents[C2].handback_report, "## Report\n- Done: a.txt", "a.handback_report = the report about to be handed back")
+  eq(s2.agents[C2].status, "RUNNING", "still RUNNING while held")
+  H("PreToolUse", "00:09.000", { agent_id = C2, tool_name = "SubagentHandback", tool_use_id = "tH",
+    pause = { id = C2 .. "-p1", phase = "released", reason = "user", target = C2, waited_ms = 3900 } })
+  eq(state.held_at_end(p), false, "held_at_end: false after release")
+  -- 終わり際の指示：SubagentStop で skipped（PENDING のまま）
+  local K = C2 .. "-1791500000000"
+  state.apply(s2, U("steer_requested", "00:08.000", { steer_id = K, agent_id = C2, text = "write b.txt", via = "hook", expect = "stop" }))
+  H("SubagentStop", "00:10.000", { agent_id = C2, agent_type = "general-purpose", report = "## Report\n- Done: a.txt (final)",
+    report_via = "handback", permission_mode = "auto" })
+  H("SubagentStop", "00:10.050", { agent_id = C2, steer = { ids = { K }, mode = "skipped", reason = "handback", target = C2 } })
+  eq(s2.agents[C2].status, "DONE", "skipped: the child is DONE (no end_held)")
+  eq(s2.agents[C2].end_held, nil, "skipped: no end_held")
+  eq(s2.steers[K].status, "PENDING", "steer_skipped: stays PENDING")
+  eq(s2.steers[K].skipped_at, "2026-10-08T07:00:10.050Z", "steer_skipped: skipped_at")
+  eq(s2.steers[K].skip_reason, "handback", "steer_skipped: skip_reason = handback")
+  eq(s2.agents[C2].handback_report, "## Report\n- Done: a.txt (final)", "SubagentStop's report wins for handback_report")
+  eq(s2.counts.steers_pending, 1, "skipped counts as pending")
+  -- 自動で親経由に回す：新しい relay（rerouted_from）→ 元は CANCELLED（rerouted）
+  local K2 = C2 .. "-1791500000100"
+  state.apply(s2, U("steer_requested", "00:11.000", { steer_id = K2, agent_id = C2, text = "write b.txt", via = "relay", expect = "parent",
+    relay_line = "[AgentMap] Tell …", rerouted_from = K }))
+  state.apply(s2, U("steer_cancelled", "00:11.010", { steer_id = K, reason = "rerouted", rerouted_to = K2 }))
+  eq(s2.steers[K2].rerouted_from, K, "steer_requested: rerouted_from")
+  eq(s2.steers[K].status, "CANCELLED", "the skipped one → CANCELLED")
+  eq(s2.steers[K].end_reason, "rerouted", "cancel reason = rerouted")
+  eq(s2.steers[K].rerouted_to, K2, "rerouted_to = the new id")
+  eq(s2.steers[K].skip_reason, "handback", "skip_reason is kept")
+  -- 親が SendMessage → 子は同じ id で再開（V45）→ 2 回目の handback と終わり
+  H("PostToolUse", "00:16.000", { tool_name = "SendMessage", tool_use_id = "tS", tool_input = { to = C2, head = "write b.txt" } })
+  eq(s2.steers[K2].relayed_at, "2026-10-08T07:00:16.000Z", "the relay is passed on (RELAYED)")
+  H("SubagentStart", "00:16.100", { agent_id = C2, agent_type = "general-purpose" })
+  eq(s2.agents[C2].status, "RUNNING", "resumed: DONE → RUNNING")
+  eq(#s2.agents[C2].attempts, 2, "resumed: a second attempt")
+  H("PreToolUse", "00:20.000", { agent_id = C2, tool_name = "SubagentHandback", tool_use_id = "tH2", report = "## Report\n- Done: b.txt" })
+  eq(s2.agents[C2].status, "RUNNING", "second hand-back: still RUNNING until SubagentStop")
+  H("SubagentStop", "00:20.400", { agent_id = C2, agent_type = "general-purpose", report = "## Report\n- Done: b.txt", report_via = "handback" })
+  eq(s2.agents[C2].status, "DONE", "second agent_finished → DONE")
+  eq(s2.agents[C2].attempts[2].finished_at, "2026-10-08T07:00:20.400Z", "the second attempt closes")
+  eq(s2.agents[C2].report, "## Report\n- Done: b.txt", "the report is the second one")
+  H("UserPromptSubmit", "00:20.450", { prompt_id = "q9", kind = "agent_message", from = C2,
+    prompt_head = '<agent-message from="' .. C2 .. '"> [Subagent hand-back] …' })
+  eq(s2.agents[C2].status, "DONE", "the notice after a plain hand-back changes nothing")
+  eq(s2.steers[K2].held, nil, "… and settles no instruction")
+  -- 止まれが handback で終わった子の SubagentStop で消された（released handback_end）
+  state.apply(s2, U("pause_requested", "00:21.000", { pause_id = C2 .. "-p2", agent_id = C2, at = "next", kind = "pause" }))
+  state.apply(s2, U("pause_resumed", "00:21.500", { pause_id = C2 .. "-p2", agent_id = C2, reason = "user" }))
+  H("SubagentStop", "00:21.600", { agent_id = C2, pause = { id = C2 .. "-p2", phase = "released", reason = "handback_end", target = C2 } })
+  eq(s2.pauses[C2 .. "-p2"].release_reason, "handback_end", "released handback_end wins over Neovim's reason (hook's own)")
+  local p3 = C2 .. "-p3"
+  state.apply(s2, U("pause_requested", "00:22.000", { pause_id = p3, agent_id = C2, at = "stop", kind = "gate" }))
+  H("SubagentStop", "00:22.100", { agent_id = C2, pause = { id = p3, phase = "released", reason = "handback_end", target = C2 } })
+  eq(s2.pauses[p3].status .. "/" .. s2.pauses[p3].release_reason, "RESUMED/handback_end", "REQUESTED → RESUMED (handback_end)")
+  -- 期限切れの記録の skip_reason
+  local K3 = C2 .. "-1791500000200"
+  state.apply(s2, U("steer_requested", "00:23.000", { steer_id = K3, agent_id = C2, text = "late", via = "hook" }))
+  state.apply(s2, U("steer_expired", "00:30.000", { steer_id = K3, reason = "agent_finished", skip_reason = "handback" }))
+  eq(s2.steers[K3].status .. "/" .. s2.steers[K3].end_reason .. "/" .. tostring(s2.steers[K3].skip_reason),
+    "EXPIRED/agent_finished/handback", "steer_expired keeps reason agent_finished and skip_reason handback")
+  eq(state.SV, 12, "SV = 12")
 end
 
 vim.fn.delete(TMP, "rf")

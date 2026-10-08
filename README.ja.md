@@ -121,6 +121,8 @@ hooks を入れる前のセッションも、Claude Code が残している会�
 修正指示はエージェントが終わろうとした瞬間に届くようになり（古い登録は次の道具の直前に道具のエラーとして渡すので、今のモデルは無視することがあります）、
 `SendMessage` を記録します（親経由で伝えたことの確認用）。実行するまで、一時停止は断られ、子への `s` は先に `:AgentMapInstallHooks` を実行するよう案内します。
 記録、親の端末への指示、親経由はそのまま動きます。
+0.1.2 の登録には `SubagentHandback` 用の `PreToolUse` の hook（Claude Code の auto モードの子のため）も入ります。
+それより前の 0.1.2 の途中の版で登録していたら、もう一度 `:AgentMapInstallHooks` を実行してください。
 
 0.1.0 から上げたら、`:AgentMapInstallHooks` をもう一度実行してください。0.1.1 では、
 TaskCreate / TaskUpdate / TaskList（親の手順表）を記録し、修正指示を届ける待たせる形の `PreToolUse` を足し、
@@ -290,6 +292,10 @@ require("agentmap").setup({
                                -- Claude Code の入力欄に残って送信されない。下の「知っておくこと」）
     input = "window",          -- "window"（浮かせた小さな窓）| "line"（1 行の入力）
     text_max = 4000,           -- 文字数の上限
+    handback = "relay",        -- 報告を SubagentHandback で返す子（auto モード）への届け方：
+                               -- "relay"：親の端末があれば親経由。無ければ置いて、届かない見込みを知らせる
+                               -- | "deny"：無ければ報告の直前に道具の結果として渡す（無視されることがある。変えたら :AgentMapInstallHooks）
+    handback_reroute = true,   -- そうした子の終わり際で見送られた指示を、親経由に回す（子は再開する）
   },
   pause = {                    -- false = { enabled = false }
     enabled = true,            -- false：hooks に一時停止を付けない。x / X は「無効」と知らせる
@@ -303,7 +309,7 @@ require("agentmap").setup({
 
 `steer.mode` は hooks のコマンドに書き込まれます。変えたら `:AgentMapInstallHooks` をもう一度実行してください
 （登録と設定が違うと `:checkhealth agentmap` が知らせ、それまで `s` は hooks の経路を断ります）。
-`steer.at_stop` は 0.1.2 から無視します（終わり際の配達は常に有効）。
+`steer.at_stop` は 0.1.2 から無視します（終わり際の配達は常に有効）。`steer.handback` も hooks のコマンドに書き込まれます。
 `pause.auto_resume_s` も hooks のコマンドと timeout に書き込まれます。変えたら `:AgentMapInstallHooks` を実行してください。
 
 保存先のフォルダ名が `agentmap` ではなく `agentflow` なのはわざとです。公開前の版の記録をそのまま読めるようにしています。
@@ -380,10 +386,11 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
 
 | 箱 | 届け方 | いつ届くか |
 |---|---|---|
-| 動いている子・孫・レビュー係 | **終わり際に届ける。** 指示はその実行のフォルダに置かれます。そのエージェントが終わろうとした瞬間に、`SubagentStop` の hook が終わりを 1 回だけ止めて指示を渡します。エージェントは指示を反映して作業を続け、改めて終わります。 | 終わろうとした瞬間 |
+| 動いている子・孫・レビュー係で、**報告を普通の文で返す**もの | **終わり際に届ける。** 指示はその実行のフォルダに置かれます。そのエージェントが終わろうとした瞬間に、`SubagentStop` の hook が終わりを 1 回だけ止めて指示を渡します。エージェントは指示を反映して作業を続け、改めて終わります。 | 終わろうとした瞬間 |
 | 同上で、親（メインの Claude）の直接の子、かつこの Neovim に親の端末がある | メニューの 2 番目 **「書いて親経由で今すぐ伝える」**。親の端末に `[AgentMap] サブエージェント [3]「<名前>」（agent id <id>）に SendMessage で次を伝えてください：<本文>` と打ち込み（英語の画面なら英語の文）、親が `SendMessage` で子へ渡します。親が一時停止中（止まれを置いた・止まった）のときは出しません。打ち込んだ文は親が再開するまで端末に残るだけで、図は作者が止めた親を勝手に動かさないためです（`s` を押すと理由が出ます）。終わり際の経路で送るか、先に親を再開してください（ROOT の上で `x`）。 | 今（親の次の切れ目 → 子の次の道具の切れ目） |
-| 道具の直前で一時停止中の子（`[PAUSED]`） | 止まれを解いて作業を続けさせ、上と同じく終わり際に届けます。 | 終わろうとした瞬間 |
-| 終わる直前で止まっている子（`[GATE]`、または終わり際で止めた子） | 待っている hook がその場で渡します。 | 今 |
+| 動いている子で、**報告を `SubagentHandback` で返す**もの（Claude Code の auto モード。下の「報告を SubagentHandback で返す子」の節） | 終わりを止められません（Claude Code が止める指示を捨てます）。この Neovim に親の端末があれば、メニューの 1 番が **「書いて親経由で今すぐ渡す」**（上と同じ）です。端末が無い・孫・親が一時停止中のときは、指示を置いたうえで「この子の終わり際には届かない」と知らせます。親の端末ができる前に子が報告を返してしまえば、期限切れになります（`steer.handback = "deny"` にすると、代わりに報告を返す直前に道具の結果として渡します）。 | 子の次の道具の切れ目。終わっていれば再開して受け取る |
+| 道具の直前で一時停止中の子（`[PAUSED]`） | 止まれを解いて作業を続けさせ、上と同じく終わり際に届けます。報告を `SubagentHandback` で返す子なら、解いてから親経由で渡します。 | 終わろうとした瞬間 |
+| 終わる直前で止まっている子（`[GATE]`、または終わり際で止めた子） | 待っている hook がその場で渡します。報告を `SubagentHandback` で返す子は報告を返す直前で待っており、「直す」は報告を通してから親経由で渡します（子は報告のあと再開します）。 | 今 |
 | 親（ROOT、メインの Claude） | **端末に打ち込む。** この Neovim の中の `:terminal` で動いている `claude` に、`[AgentMap] <本文>` と Enter を送ります。Claude Code は作業中に打たれた文字を次の切れ目で読みます。止まっていれば新しい指示として始まります。道具の直前で一時停止中なら、先に止まれを解きます。 | 次の切れ目 |
 | 親で、この Neovim に Claude の端末が無い | 親の `Stop` の hook が番の終わりを 1 回だけ止めて指示を渡します（`steer.no_terminal = "stop"`）。 | 番の終わり |
 | 終わった箱（`DONE` / `REWORK` / `FAILED`） | **親の端末へ、やり直しの依頼を送る。** 文面は `[AgentMap] エージェント [3]「<名前>」（id …、10:31 終了）をやり直してください：<本文>。同じ任せ方で、何が変わったかを報告してください。` です（英語の画面なら英語）。差し戻し（REWORK）は自動では記録しません。やり直すかは親が決めます。 | — |
@@ -426,6 +433,9 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
   親に届く完了のお知らせ、同期の子なら親への戻りが、その子の作業の記録なしに来たとき、箱を `DONE` に戻し、指示に「止められず終了」と
   ` ✎!` を出して知らせます。そうした記録が無いとき（親自身の番の終わり、お知らせが来ないとき）は見分けられず、指示は「配達」のまま、
   箱は次の記録まで動いているように見えます。
+- **止められず（報告済みだった）。** この対応より前の 0.1.2 の hooks は、報告を `SubagentHandback` で返す子の終わり際にも
+  「配達」と記録していました（実際には Claude Code が捨てていました）。図は、親に届く報告の知らせ（hand-back）でこれを決着させます。
+  箱は `DONE` に戻り、指示には「止められず（報告済みだった）」と ` ✎!` が出ます。
 - Claude の端末が見つからないとき（別の端末の窓で Claude Code を動かしているときなど）は、親への指示を番の終わりに届けます
   （`steer.no_terminal = "stop"`）。クリップボードにコピーする（`"clipboard"`）、送らない（`"none"`）も選べます。親経由は選べません。
   その実行のフォルダ（かその親）で動いている Claude の端末を使います。複数あって決まらないときや、別のフォルダの端末しか無いときは、1 回だけ選んでもらいます。
@@ -448,6 +458,33 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
   （自分だけが読み書きできる 0600）、`<保存先>/steer.pending` は `steer.mode = "deny"` と `:checkhealth` のために残している印です。
   届けたものは `*.delivered.json` に名前が変わります。親経由はファイルを作らず、端末に打ち込んだ文を `events.jsonl` に残します。
   同じユーザーで動くプログラム（エージェントの Bash を含む）はこのファイルを書けるので、覚えのない指示が届いていないか、詳細画面の全文で確かめられます。
+
+### 報告を SubagentHandback で返す子
+
+Claude Code の権限モードが **auto**（`permissions.defaultMode = "auto"`。auto モードに対応したモデル、たとえば Sonnet を主に使うとき。
+Haiku を主にすると auto モードは切れます）のとき、fork 以外の子は最後に `SubagentHandback` という道具を呼び、それで報告を親に返して終わります。
+作者は毎日この使い方をしています。
+
+- **終わりを止められない理由。** `SubagentHandback` の結果は子の番を終わらせ（`toolEndsTurn`）、そのあと Claude Code は
+  `Stop` / `SubagentStop` / `PostToolUse` の止める指示を、モデルを呼び直さずに捨てます（debug ログに
+  `[end-turn] Stop hook block discarded (turn ended by tool result, no model re-invoke)` と出ます）。
+  これは Claude Code の作りで、agentmap.nvim の側で回避できるものではありません。この子には終わり際の指示は届きません。
+  記録係は、そこで「配達」とは書かず、指示を未配達のまま残して「見送り（handback）」と記録します。
+- **見分け方。** `:checkhealth agentmap` に、図に出している実行の権限モードが出ます。詳細画面には「報告を SubagentHandback で返す子」と出ます。
+  `hooks.jsonl` では、その子の終わりの記録に `report_via: "handback"` が付き、親には `<task-notification>` ではなく
+  `<agent-message from="<id>">[Subagent hand-back]` が届きます。子にまだその印が無い間も、auto モードの実行の子（fork を除く）は
+  報告を `SubagentHandback` で返すものとして扱います。
+- **親経由で渡す。** 親経由はこの子にも届くので、`s` のメニューの 1 番に出します。動いている子は次の道具の切れ目で受け取ります
+  （2.1.294 の実測で Haiku 2 回中 2 回・Sonnet 1 回中 1 回従った）。もう報告を返した子は、`SendMessage` で同じ id のまま再開し、
+  指示を実行して報告し直します（Haiku 3 回中 3 回・Sonnet 1 回中 1 回）。そのため親の画面には、その子の報告が **2 通** 並びます
+  （1 通目は指示の前に書いたもの）。親は渡すときに本文を言い換えることがあります（詳細画面に親が実際に送った文が出ます）。
+  置いた指示が子の終わり際で見送られたときは、親の端末があれば自動で親経由に回します（`steer.handback_reroute = true`）。
+  元の指示は「取り消し（親経由に回した）」になり、親経由の指示に置き換わります。回せないときは「届きませんでした」と知らせます。
+- **`steer.handback = "deny"`**（任意。変えたら `:AgentMapInstallHooks`）：親経由ができないとき、報告を返す直前に、
+  `SubagentHandback` の呼び出しを断る理由として指示を渡します。利用者の言葉ではなく道具の結果なので、2.1.294 の実測では
+  Sonnet は 2 回中 2 回従い、Haiku は 2 回中 0 回でした（同じ報告で `SubagentHandback` を呼び直した）。既定にしていないのはこのためです。
+- **一時停止と関門** は、この子を `PreToolUse:SubagentHandback`、つまり報告を返す直前で止めます（hook はそこで待てます）。
+  報告は図から読めます。下の「一時停止と関門」を見てください。
 
 ## 一時停止と関門
 
@@ -482,6 +519,11 @@ Claude が AskUserQuestion であなたに質問すると、HUMAN CHECK の箱�
   Claude Code は連続 8 回まで止められるので、直せるのは 8 回まで）、**待たせたまま報告を見る**、から選べます。
   放置すると 10 分で自動的に通ります。もう一度 `X` で関門を切ると、待っている子は全部通ります。
   関門の入／切は実行のフォルダに残るので、図を開き直しても続きます。
+- **報告を `SubagentHandback` で返す子** は、報告を返す直前で止まります（関門、`:AgentMapPause {番号|ID} stop`、
+  または次の道具が報告のときの `x`）。返した後ではありません。報告は図から読めます（箱の上で `Enter`）。
+  **通す** と報告が親に渡ります。**直す** も報告を通し、そのうえで指示を親経由で渡します。子は報告したあと同じ id で再開します
+  （止めている間に渡すことはできません。報告を返した後は Claude Code が捨てるためです）。`steer.handback = "deny"` なら、
+  「直す」はその場で道具の結果として渡します。
 - **Claude Code での Esc** は親の番を止めるだけです。子（と子を待たせている hook）は動き続けます。
   親に置いた一時停止は残るので、親は次に道具を使うときにまた止まります（同じ 10 分の期限の中で）。
 - **Neovim を閉じたとき**は、既定では何もしません。止めたエージェントは期限で自動的に再開し、
@@ -558,6 +600,7 @@ export = { pdf_command = { "/mnt/c/Program Files/Google/Chrome/Application/chrom
 - 道具の名前と対象：Write / Edit ならファイルの場所、Bash ならコマンドの 1 行目（120 文字まで）
 - AskUserQuestion の質問・選択肢・答え（長いものは切る）
 - 子の最後の報告（2000 文字まで）と、最後の発言の先頭 200 文字
+- 子が返そうとしている報告（`PreToolUse` の `SubagentHandback`、2000 文字まで。最後の報告と同じく伏せ字にする）と、実行の権限モード
 - 手順表：TaskCreate の件名と `## 手順` の各項目（各 60 文字まで）と、その状態の変化。TaskCreate の説明文（description）は保存しない
 - **修正指示の本文はあなたが書いたまま**（伏せ字にしない。4000 文字まで）。`events.jsonl` と `steer/*.delivered.json` に残る。
   親経由では、親の端末に打ち込んだ文全体も `events.jsonl` に残り、エージェントが送る `SendMessage` の先頭 120 文字が `hooks.jsonl` に残る
@@ -593,9 +636,11 @@ Claude Code が hooks に渡す中身には版の番号が入っていません�
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList の中身。修正指示（止めたときの文言、`stop_hook_active`、動いている `claude` への打ち込み） |
 | 2.1.289 | 2026-10-04 | Neovim からの通しの確認（進み具合・光・修正指示・親への知らせ・HUMAN CHECK・書き出し）。`claude` に打ち込む長い行は Enter を分けて送る必要がある（`steer.submit_delay_ms`、既定を 300 に） |
 | 2.1.291 | 2026-10-06 | Stop / SubagentStop の `decision: block` で渡した文に従う（子 17/17、親 9/9）。`PreToolUse` の deny に入れた文は Sonnet が無視。Agent の道具は既定で背景。`SendMessage` での親経由（子の次の道具の切れ目に届く）。終わった子に送ると再開する。対話モードでは開始の記録の無い内部の Agent の `SubagentStop` が届く（無視する） |
+| 2.1.294 | 2026-10-08 | auto モード：子は `SubagentHandback` で報告を返す（`toolEndsTurn`）。その後の `Stop` / `SubagentStop` / `PostToolUse` の止める指示は捨てられる（`[end-turn] Stop hook block discarded`）。報告の直前の deny に入れた文に Sonnet 2/2・Haiku 0/2 が従った。親経由に Haiku 2/2・Sonnet 1/1（動いている子）、Haiku 3/3・Sonnet 1/1（終わった子。再開する）が従った。hook は `PreToolUse:SubagentHandback` で待てる。hooks の中身に `permission_mode` が入る。親には `<agent-message>[Subagent hand-back]` が届く。Haiku を主にすると auto モードが切れる。Sonnet を主にした `-p` は auto |
 | 2.1.289 | 2026-10-05 | 一時停止：`timeout` を書かない hook は 600 秒で打ち切られる。書いた `timeout` は守られる（630 秒・7200 秒で確認）。timeout を超えると Claude Code は hook を終わらせ（SIGTERM）、何も表示せずに道具を動かす。Esc は裏で動いている子を止めない。裏の仕事があるときの `/exit` は 3 択（止めて終わる／裏に回して終わる／とどまる）を聞く。親の道具で hook が待つと待ち表示に `running PreToolUse hooks…` が出る。子のときは何も出ない |
 
-使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion。一時停止用に全部の道具・待たせる形でもう 1 つ）、
+使う hooks：`SessionStart`、`UserPromptSubmit`、`PreToolUse`（Agent・AskUserQuestion・SubagentHandback。一時停止用に全部の道具・待たせる形でもう 1 つ。
+報告を返す直前で止めるために SubagentHandback・待たせる形でもう 1 つ）、
 `PostToolUse`（Agent・AskUserQuestion・Write・Edit・MultiEdit・NotebookEdit・Bash・EnterWorktree・ExitWorktree・TaskCreate・TaskUpdate・TaskList・SendMessage）、
 `PostToolUseFailure`（Agent・AskUserQuestion）、`SubagentStart`、`SubagentStop`、`Stop`、`SessionEnd`。
 知らない種類の出来事は無視するので、Claude Code に hooks の種類が増えても壊れません。
@@ -613,6 +658,7 @@ Claude Code が hooks に渡す中身には版の番号が入っていません�
 ## いまの状態と今後
 
 v0.1.0 は、作者が自分の仕事のために作った道具を公開した最初の版です。v0.1.1 で進み具合・光・修正指示を、v0.1.2 で一時停止と関門を足し、修正指示を終わり際（または親経由で今すぐ）に届けるように変えました（今のモデルは道具のエラーとして渡した文を無視することがあるため）。
+報告を `SubagentHandback` で返す子（Claude Code の auto モード）は終わりを止められないので、親経由で渡します。
 Issue への返事は週に数回で、約束はできません。
 
 予定していること：

@@ -5,6 +5,7 @@
 --    sweep_pauses  : 宛先が終わった止まれを pause_expired。終わりで止まっている（関門）ものは残す
 --    set_gate / gate_on / sync_gate / release_all
 --    collector との往復：Neovim が置いた止まれで bin/agentmap-collect --pause が待ち、消すと抜ける
+--      （報告を SubagentHandback で返す子：関門は PreToolUse:SubagentHandback で止まり、SubagentStop では skipped）
 --  記録の保存先は一時フォルダ（minimal_init.lua の AGENTMAP_DIR）。
 --  実行: nvim --headless --clean -u tests/minimal_init.lua -l tests/test_pause_events.lua
 --  requires: python3（collector との往復の節。無ければその節だけ SKIP）
@@ -349,6 +350,49 @@ if vim.fn.executable("python3") == 1 and vim.fn.executable("bash") == 1 then
   events.poll(run)
   t.eq(run.state.steers[sid4].status, "DELIVERED", "mode stop round trip: DELIVERED at SubagentStop")
   t.eq(run.state.agents[G].status, "RUNNING", "mode stop round trip: the child keeps working (block reopens it)")
+  -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.5・§9）：関門（at = stop）は PreToolUse:SubagentHandback で
+  -- 止まり（--handback relay）、解くと何も出さずに抜ける。続く SubagentStop（handback で終わった）は block せず skipped
+  local HB = "afeed000000000058"
+  append_hooks({ hook("SubagentStart", 200, { agent_id = HB, agent_type = "general-purpose" }) })
+  events.poll(run)
+  local _, stop_hb, hb_cmd = hooks.steer_cmd({ record = rec, root = ROOT, mode = "stop", pause = { auto_resume_s = 5 } })
+  t.matches(hb_cmd, "%-%-handback relay %-%-pause %-%-max%-wait 5$", "hand-back: the SubagentHandback hook command")
+  local hb_payload = vim.json.encode({ session_id = SID, cwd = "/tmp/agentmap-test/pause", hook_event_name = "PreToolUse",
+    transcript_path = "/tmp/agentmap-test/claude/projects/" .. SLUG .. "/" .. SID .. ".jsonl",
+    tool_name = "SubagentHandback", tool_use_id = "toolu_hb1", agent_id = HB, prompt_id = P,
+    tool_input = { message = "## Report\n- Done: a.txt" } })
+  local ip5 = events.request_pause(run, HB, { at = "stop", kind = "gate" })
+  n0 = #util.json_lines(run_dir .. "/hooks.jsonl", 0)
+  job = vim.system({ "bash", "-c", hb_cmd }, { stdin = hb_payload, text = true })
+  t.ok(wait_hit(n0), "hand-back round trip: the gate holds at PreToolUse:SubagentHandback (hit)")
+  events.poll(run)
+  local p5 = run.state.pauses[ip5]
+  t.eq({ p5.status, p5.hit_via }, { "PAUSED", "PreToolUse:SubagentHandback" }, "hand-back round trip: PAUSED via PreToolUse:SubagentHandback")
+  t.eq(state.held_at_end(p5), true, "hand-back round trip: held_at_end")
+  t.eq(state.display_status(run.state, HB), "GATE", "hand-back round trip: GATE")
+  events.resume_pause(run, HB)
+  r = job:wait(3000)
+  t.eq({ r.code, r.stdout }, { 0, "" }, "hand-back round trip: released, prints nothing (relay)")
+  events.poll(run)
+  t.eq(run.state.pauses[ip5].status, "RESUMED", "hand-back round trip: RESUMED")
+  -- 終わり際に置いた指示と止まれ（at = next）→ handback で終わった SubagentStop：block せず、指示は PENDING（skipped）、止まれは消える
+  local sid5 = events.request_steer(run, HB, "write b.txt instead", { via = "hook" })
+  local ip6 = events.request_pause(run, HB)
+  local stop_hb_payload = vim.json.encode({ session_id = SID, cwd = "/tmp/agentmap-test/pause", hook_event_name = "SubagentStop",
+    transcript_path = "/tmp/agentmap-test/claude/projects/" .. SLUG .. "/" .. SID .. ".jsonl",
+    agent_id = HB, agent_type = "general-purpose", prompt_id = P, stop_hook_active = false, permission_mode = "auto",
+    agent_transcript_path = vim.g.agentmap_test_dir .. "/fixtures/transcript_handback.jsonl" })
+  r = vim.system({ "bash", "-c", stop_hb }, { stdin = stop_hb_payload, text = true }):wait(3000)
+  t.eq({ r.code, r.stdout }, { 0, "" }, "hand-back SubagentStop: no block, nothing printed")
+  t.ok(exists(run_dir .. "/steer/" .. sid5 .. ".json"), "hand-back SubagentStop: the instruction file stays")
+  t.ok(not exists(PDIR .. "/" .. HB .. ".json"), "hand-back SubagentStop: the pause file is removed")
+  events.poll(run)
+  local st5 = run.state.steers[sid5]
+  t.eq({ st5.status, st5.skip_reason }, { "PENDING", "handback" }, "hand-back SubagentStop: PENDING, skip_reason handback")
+  t.ok(st5.skipped_at ~= nil, "hand-back SubagentStop: skipped_at")
+  t.eq({ run.state.pauses[ip6].status, run.state.pauses[ip6].release_reason }, { "RESUMED", "handback_end" }, "hand-back SubagentStop: pause released handback_end")
+  t.eq(run.state.agents[HB].status, "DONE", "hand-back SubagentStop: DONE (no end_held)")
+  t.eq(run.state.agents[HB].handback, true, "hand-back SubagentStop: a.handback (report_via)")
 else
   t.skip("python3 / bash not found: collector round trip")
 end

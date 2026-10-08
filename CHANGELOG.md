@@ -89,6 +89,20 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   that prompt waited, the Enter typed into the Claude terminal after a relay or a redo request
   was held back too, so the line sat unsent in Claude Code's input box.
 - The unused text `ui.steer_relay_resume` is gone from the language tables.
+- Sub-agents that report through `SubagentHandback` (Claude Code's auto mode) cannot be held at
+  their end: the block is discarded by Claude Code. For them the text goes through the main agent
+  (at its next tool call, or it starts again after finishing): `s` offers the relay first when the
+  main agent's terminal is here; otherwise the text is placed and the notice says it cannot reach
+  the agent at its end. The collector records `skipped (handback)` instead of claiming delivery,
+  and an instruction skipped that way is relayed automatically when the main agent's terminal is
+  here (`steer.handback_reroute`, default true; the original shows `CANCELLED (rerouted)`).
+  `steer.handback = "deny"` hands the text over just before the hand-back as a tool result
+  (optional; may be ignored). The gate and `:AgentMapPause … stop` hold such a sub-agent just
+  before it hands back, with its report readable; Pass lets the report go, Fix lets it go and
+  relays the text (the agent starts again after reporting). Records of 0.1.2 hooks before this
+  change settle as `NOT HELD (hand-back)` from the parent's hand-back notice. The recorder keeps
+  `permission_mode` and the report about to be handed back. Hooks: a `PreToolUse` hook for
+  `SubagentHandback`; run `:AgentMapInstallHooks` again. State cache 12.
 
 ### Notes
 
@@ -108,6 +122,17 @@ state cache version changes, the cache is rebuilt from `hooks.jsonl` on the next
   default; in interactive mode hidden helper agents send a `SubagentStop` without a start (no box
   is made). The delay until an instruction arrives at the end is the rest of the agent's work
   (14–17 s for six more tool calls in tests).
+- Claude Code 2.1.294 facts behind the hand-back change (the author's own settings, a Sonnet main
+  model): in auto mode sub-agents (not forks) are told to report through `SubagentHandback`, whose
+  result carries `toolEndsTurn`; Haiku as the main model turns auto mode off, and
+  `CLAUDE_CODE_SENDMESSAGE_HANDBACK` is not read in this version. After the hand-back, `Stop` /
+  `SubagentStop` / `PostToolUse` blocks are discarded (`[end-turn] Stop hook block discarded (turn
+  ended by tool result, no model re-invoke)`). A deny of `SubagentHandback` with the text was
+  followed by Sonnet 2 of 2 and Haiku 0 of 2. Relay was followed by a running sub-agent (Haiku 2 of
+  2, Sonnet 1 of 1) and by a finished one, which started again under the same id and reported
+  again (Haiku 3 of 3, Sonnet 1 of 1); a hook can hold at `PreToolUse:SubagentHandback`, and a
+  relay sent while it holds arrives after the report, when the agent starts again. Hook payloads
+  carry `permission_mode`; the parent gets `<agent-message from="<id>">[Subagent hand-back]`.
 
 ## [0.1.1] - 2026-10-05
 

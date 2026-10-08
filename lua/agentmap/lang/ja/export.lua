@@ -158,4 +158,12 @@ return {
   ["export.steer_relayed"] = "%{time} に %{parent} が渡した（SendMessage）",
   ["export.steer_not_relayed"] = "渡らなかった: 親が番を終えた",
   ["export.steer_not_held"] = "%{time} に配達（%{via}）、止められず終了（終わりを止めた回数が上限を超え、Claude Code が終わらせた）",
+  -- v0.1.2: sub-agents that report through SubagentHandback (DESIGN-v0.1.2-handback appendix A)
+  ["export.steer_skipped_hb"] = "書き出し時点で未配達（%{time} 終わり際で見送り：報告を SubagentHandback で返す子）",
+  ["export.steer_rerouted"] = "%{time} に取り消し（#%{n} として親経由に回した）",
+  ["export.steer_not_held_hb"] = "止められず（報告済みだった）",
+  ["export.steer_delivered_hb_deny"] = "%{time} に配達（報告の直前。ツールの結果。無視されることがある）",
+  ["export.ov_permission_label"] = "権限モード",
+  ["export.steer_join"] = "、",
+  ["export.ov_handback"] = "子は報告を SubagentHandback で返す（権限モード auto）",
 }

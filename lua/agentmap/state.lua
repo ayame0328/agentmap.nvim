@@ -17,8 +17,10 @@ local brief = require("agentmap.brief")
 
 local M = {}
 
-M.SV = 11 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示、10 で一時停止、
-           -- 11 で親経由の修正指示（expect / relay_line / relayed_at …、DESIGN-v0.1.2-steer2 §6.4）が増えた
+M.SV = 12 -- 状態の形の版（控え state.json の作り直しの判断に使う）。8 で HUMAN CHECK・任せた理由・報告、9 で手順表と修正指示、10 で一時停止、
+           -- 11 で親経由の修正指示（expect / relay_line / relayed_at …、DESIGN-v0.1.2-steer2 §6.4）、
+           -- 12 で報告を SubagentHandback で返す子（permission_mode / a.handback / skipped_at / rerouted_to …、
+           -- DESIGN-v0.1.2-handback §4.4）が増えた
 
 M.STATUSES = { "PENDING", "RUNNING", "REVIEW", "DONE", "REWORK", "FAILED" }
 -- HUMAN CHECK（AskUserQuestion）の状態。Agent の状態とは別の箱で持つ（Agent の STATUSES は変えない）
@@ -177,12 +179,16 @@ local function elapsed(from, to)
 end
 
 --- 終わりを止めて届けた後の決着（a.end_held）。held: 子が続けた（道具・2 回目の終わり）／続けずに終わった（親の記録）
-local function settle_end_held(s, a, held, ev)
+local function settle_end_held(s, a, held, ev, reason)
   local eh = a.end_held
   if not eh then return end
   a.end_held = nil
   local st = s.steers and s.steers[eh.steer_id]
-  if st and st.status == "DELIVERED" then st.held = held end
+  if st and st.status == "DELIVERED" then
+    st.held = held
+    -- 止められなかった理由（"handback"：子はもう SubagentHandback で報告を返していた。DESIGN-v0.1.2-handback §3.7）
+    if not held and reason then st.held_reason = reason end
+  end
   if held then return end
   -- 止められなかった：取り消した「完了」を元に戻す（終わりの時刻は 1 回目の終わりのまま）
   local cur = cur_attempt(a)
@@ -578,6 +584,10 @@ local function confirm_terminal_steer(s, ev)
 end
 
 function H.run_prompt(s, ev)
+  -- 権限モード（"auto" なら子は SubagentHandback で報告を返す見込み）。最初の値だけ（後の値で上書きしない）
+  if s.permission_mode == nil and type(ev.permission_mode) == "string" and ev.permission_mode ~= "" then
+    s.permission_mode = ev.permission_mode
+  end
   if is_steer_prompt(ev) then confirm_terminal_steer(s, ev) end
   if is_notice(ev) then
     -- 裏で動いた Agent の終わりのお知らせ・伝言：新しい流れは作らず、直前の本物の指示の続きとして扱う
@@ -749,6 +759,10 @@ function H.agent_finished(s, ev)
   tag(s, a, ev.prompt_id, ev.ts)
   link_workflow(s, a, ev)
   fill(a, "agent_type", ev.agent_type)
+  if ev.report_via == "handback" then
+    a.handback = true -- 報告を SubagentHandback で返す子（印③）
+    if type(ev.report) == "string" and ev.report ~= "" then a.handback_report = ev.report end
+  end
   if a.end_held then
     -- 終わりを止めて届けた後の最初の「終わり」：子自身の SubagentStop なら止められて続けた末の本当の終わり、
     -- 親の記録（同期の Agent の戻り）だけなら止められずに終わった（settle_end_held）
@@ -1003,7 +1017,9 @@ end
 function H.steer_requested(s, ev)
   if not ev.steer_id then return end
   local st = get_steer(s, ev.steer_id)
-  for _, k in ipairs({ "agent_id", "text", "via", "kind", "redo_of", "notice_of", "expect", "relay_line" }) do fill(st, k, ev[k]) end
+  for _, k in ipairs({ "agent_id", "text", "via", "kind", "redo_of", "notice_of", "expect", "relay_line", "rerouted_from" }) do
+    fill(st, k, ev[k])
+  end
   fill(st, "requested_at", ev.ts)
   if st.prompt_id == nil and ev.prompt_id then st.prompt_id = resolve_pid(s, ev.prompt_id) end
   -- 親への知らせ（kind = "notice"）：元の指示に、知らせの id を付ける（同じ指示の知らせを二重に作らないため）
@@ -1064,10 +1080,36 @@ end
 --- Only used to settle a held end: a sub-agent whose end was held once by a delivered instruction but
 --- that was never seen working again was let go by Claude Code (consecutive block cap). Nothing else
 --- is changed from a notification (the sub-agent's own SubagentStop is the record of its end).
+--- kind = "handback": ROOT got the sub-agent's hand-back notice (<agent-message>[Subagent hand-back]); the
+--- sub-agent had already reported through SubagentHandback, so a block at its end (0.1.2 hooks before the
+--- hand-back change) was discarded by Claude Code: the held end settles as not held, reason "handback".
 function H.agent_notified(s, ev)
   local a = ev.agent_id and s.agents[ev.agent_id]
-  if not a or not a.end_held then return end
-  settle_end_held(s, a, false, ev)
+  if not a then return end
+  if ev.kind == "handback" then a.handback = true end
+  if not a.end_held then return end
+  settle_end_held(s, a, false, ev, ev.kind == "handback" and "handback" or nil)
+end
+
+--- The sub-agent reports through SubagentHandback (DESIGN-v0.1.2-handback §3.1): from its PreToolUse record
+--- (with the report about to be handed back) or from the reminder at the top of its transcript.
+function H.agent_handback(s, ev)
+  local a = ev.agent_id and ev.agent_id ~= "ROOT" and s.agents[ev.agent_id]
+  if not a then return end
+  a.handback = true
+  if type(ev.report) == "string" and ev.report ~= "" then a.handback_report = ev.report end
+end
+
+--- The collector did not deliver: the target ended through SubagentHandback, where a block is discarded
+--- (DESIGN-v0.1.2-handback §3.2). The instruction stays PENDING (relayed or expired later).
+function H.steer_skipped(s, ev)
+  if not ev.steer_id then return end
+  local st = get_steer(s, ev.steer_id)
+  fill(st, "agent_id", ev.agent_id)
+  if st.status ~= "PENDING" then return end
+  st.skipped_at = ev.ts
+  st.skip_reason = ev.reason or "handback"
+  attach_steer(s, st)
 end
 
 function H.steer_cancelled(s, ev)
@@ -1075,6 +1117,9 @@ function H.steer_cancelled(s, ev)
   if not st or st.status ~= "PENDING" then return end
   st.status = "CANCELLED"
   st.ended_at = ev.ts
+  -- 理由（"rerouted"：親経由に回した。rerouted_to = 新しい指示の id。DESIGN-v0.1.2-handback §3.6）
+  if type(ev.reason) == "string" then st.end_reason = ev.reason end
+  if type(ev.rerouted_to) == "string" then st.rerouted_to = ev.rerouted_to end
 end
 
 function H.steer_expired(s, ev)
@@ -1087,6 +1132,7 @@ function H.steer_expired(s, ev)
   st.status = "EXPIRED"
   st.ended_at = ev.ts
   st.end_reason = ev.reason
+  if type(ev.skip_reason) == "string" then st.skip_reason = st.skip_reason or ev.skip_reason end
 end
 
 --- 親（や子）が SendMessage を使った（PostToolUse の記録。DESIGN-v0.1.2-steer2 §4.5）。
@@ -1141,7 +1187,7 @@ end
 
 local LIVE_PAUSE = { REQUESTED = true, PAUSED = true }
 -- hook が自分で決めた再開の理由（Neovim の理由より事実として強い）
-local HOOK_OWN_REASON = { auto = true, max_wait = true, aborted = true }
+local HOOK_OWN_REASON = { auto = true, max_wait = true, aborted = true, handback_end = true }
 
 local function pause_common(s, p, ev)
   for _, k in ipairs({ "agent_id", "kind", "at" }) do fill(p, k, ev[k]) end
@@ -2021,12 +2067,28 @@ function M.pause_by_id(s, pid)
   return s and s.pauses and s.pauses[pid] or nil
 end
 
---- True when a PAUSED pause was hit at the end of its agent (SubagentStop / Stop). The collector writes the
---- ordinary stop record before it waits, so the agent already looks DONE while the hook still holds its end.
+--- True when a PAUSED pause was hit at the end of its agent (SubagentStop / Stop, or PreToolUse:SubagentHandback
+--- for a sub-agent that reports through that tool, DESIGN-v0.1.2-handback §3.4). At SubagentStop / Stop the
+--- collector writes the ordinary stop record before it waits, so the agent already looks DONE while the hook
+--- still holds its end.
 ---@return boolean
 function M.held_at_end(p)
   local via = p and p.hit_via
-  return p ~= nil and p.status == "PAUSED" and (via == "SubagentStop" or via == "Stop")
+  return p ~= nil and p.status == "PAUSED"
+    and (via == "SubagentStop" or via == "Stop" or via == "PreToolUse:SubagentHandback")
+end
+
+--- Whether a sub-agent likely reports through SubagentHandback (DESIGN-v0.1.2-handback §3.4): a.handback is
+--- true (one of the three marks was seen), or nothing is known yet (a.handback == nil) and the run's
+--- permission mode is "auto" and the agent is not a fork. Always false for ROOT.
+---@param s table state
+---@param a table|string agent or agent id
+---@return boolean
+function M.handback_likely(s, a)
+  if type(a) == "string" then a = s and s.agents and s.agents[a] end
+  if type(a) ~= "table" or a.id == "ROOT" then return false end
+  if a.handback == true then return true end
+  return a.handback == nil and type(s) == "table" and s.permission_mode == "auto" and a.agent_type ~= "fork"
 end
 
 --- Status shown on a box: "GATE" / "PAUSED" while a hook holds the agent (kind gate / pause), else a.status.

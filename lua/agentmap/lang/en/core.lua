@@ -131,4 +131,11 @@ return {
   ["health.steer_at_stop_ignored"] = "steer.at_stop is ignored since 0.1.2 (always on)",
   ["health.sendmessage_ok"] = "SendMessage recorded (relay confirmation)",
   ["health.sendmessage_missing"] = "SendMessage is not in the PostToolUse matcher: run :AgentMapInstallHooks (relays cannot be confirmed)",
+  -- v0.1.2: sub-agents that report through SubagentHandback (DESIGN-v0.1.2-handback appendix A)
+  ["health.handback_relay"] = "Hand-back route: relay (sub-agents that report through SubagentHandback get the text through the main agent)",
+  ["health.handback_deny"] = "Hand-back route: deny (sub-agents that report through SubagentHandback get the text as a tool result just before they hand back; current models may ignore it)",
+  ["health.handback_hook_ok"] = "PreToolUse SubagentHandback hook: registered (--handback %{mode})",
+  ["health.handback_hook_missing"] = "PreToolUse SubagentHandback hook: missing or different from the settings; run :AgentMapInstallHooks",
+  ["health.run_auto"] = "This run: permission mode auto → sub-agents report through SubagentHandback; instructions go through the main agent",
+  ["health.run_not_auto"] = "This run: permission mode %{mode} → instructions arrive at the agent's end",
 }

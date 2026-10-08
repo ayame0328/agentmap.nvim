@@ -793,6 +793,8 @@ function M.pause_line(state, s, p, now)
       outcome = tr("export.pause_resumed_gate_off", { time = rt })
     elseif r == "aborted" then
       outcome = tr("export.pause_aborted", { time = rt })
+    elseif r == "handback_end" then
+      outcome = rt .. " " .. tr("detail.pause_reason_handback_end")
     elseif p.steer_id then
       local x = type(state.steers) == "table" and state.steers[p.steer_id] or nil
       outcome = tr("export.pause_resumed_with", { time = rt, n = (x and x.n) or "?" })
@@ -943,6 +945,10 @@ function M.to_markdown(state, opts)
     { tr("export.ov_source"), source_text(opts.source or state.source) },
   }
   if gate_on then table.insert(rows, #rows - 1, { tr("export.ov_gate_label"), tr("export.ov_gate") }) end
+  -- 権限モード auto の run の子は報告を SubagentHandback で返す（DESIGN-v0.1.2-handback §5.4）
+  if (state.permission_mode or s.permission_mode) == "auto" then
+    table.insert(rows, #rows - 1, { tr("export.ov_permission_label"), tr("export.ov_handback") })
+  end
   for _, r in ipairs(rows) do w("| " .. r[1] .. " | " .. cell(r[2]) .. " |") end
   w()
 
@@ -1045,7 +1051,11 @@ function M.to_markdown(state, opts)
     w(tr("export.steer_none"))
   end
   local REASON = { agent_finished = "detail.steer_reason_finished", session_ended = "detail.steer_reason_session",
-    no_terminal = "detail.steer_reason_no_terminal" }
+    no_terminal = "detail.steer_reason_no_terminal", handback = "detail.steer_reason_handback" }
+  local function steer_n(id)
+    local o = id and type(state.steers) == "table" and state.steers[id] or nil
+    return (o and o.n) or "?"
+  end
   local function agent_with_name(id)
     if id == nil or id == "ROOT" then return "ROOT" end
     local ag = s.agents[id]
@@ -1053,7 +1063,17 @@ function M.to_markdown(state, opts)
   end
   local function steer_outcome(x)
     local outcome
-    if x.via == "relay" and x.status ~= "EXPIRED" and x.status ~= "CANCELLED" then
+    -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §5.4）。届いていないのに届いたと書かない
+    if x.status == "CANCELLED" and (x.end_reason == "rerouted" or x.rerouted_to) then
+      outcome = tr("export.steer_rerouted", { time = fmt_dt(x.ended_at):sub(12), n = steer_n(x.rerouted_to) })
+    elseif (x.status == nil or x.status == "PENDING") and x.skipped_at then
+      outcome = tr("export.steer_skipped_hb", { time = fmt_dt(x.skipped_at):sub(12) })
+    elseif x.status == "DELIVERED" and x.via ~= "relay" and x.held == false and x.held_reason == "handback" then
+      outcome = tr("export.steer_delivered", { time = fmt_dt(x.delivered_at):sub(12), via = one_line(x.delivered_via or "-") })
+        .. tr("export.steer_join") .. tr("export.steer_not_held_hb")
+    elseif x.status == "DELIVERED" and x.via ~= "relay" and x.delivered_via == "PreToolUse:SubagentHandback" then
+      outcome = tr("export.steer_delivered_hb_deny", { time = fmt_dt(x.delivered_at):sub(12) })
+    elseif x.via == "relay" and x.status ~= "EXPIRED" and x.status ~= "CANCELLED" then
       -- 親経由（DESIGN-v0.1.2-steer2 §7.4）: ROOT が SendMessage で渡したか、まだか
       if x.relayed_at then
         outcome = tr("export.steer_relayed", { time = fmt_dt(x.relayed_at):sub(12), parent = agent_with_name(x.relayed_by) })
@@ -1079,6 +1099,10 @@ function M.to_markdown(state, opts)
     else
       outcome = tr("export.steer_pending_next") -- expect "next"、または v0.1.1 の記録（expect 無し）
     end
+    if x.status == "EXPIRED" and x.skip_reason == "handback" and x.end_reason ~= "handback" then
+      outcome = outcome .. " (" .. tr("detail.steer_reason_handback") .. ")"
+    end
+    if x.rerouted_from then outcome = outcome .. tr("detail.steer_rerouted_from", { n = steer_n(x.rerouted_from) }) end
     return outcome
   end
   local NOTICE_LINK = { "notice_of", "of", "source_id", "about", "for_steer" }

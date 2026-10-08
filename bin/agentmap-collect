@@ -4,7 +4,7 @@
 #
 #  Usage   : agentmap-collect [--root DIR | --root=DIR]   (hook payload JSON on stdin)
 #            agentmap-collect --root DIR --steer [--mode stop|deny|context] [--at-stop] [--record]
-#                             [--pause --max-wait SECONDS]
+#                             [--pause --max-wait SECONDS] [--handback relay|deny]
 #  Input   : one hook payload (JSON) on stdin
 #  Output  : one line appended to <root>/projects/<slug>/runs/<session_id>/hooks.jsonl
 #  --steer : deliver pending steering instructions (<run>/steer/<target>-<ms>.json, written by
@@ -22,6 +22,14 @@
 #            aborted lines in hooks.jsonl. Resuming without an instruction prints nothing (DESIGN-v0.1.2-pause).
 #            At SessionEnd the recorder removes the pause files of that run (and <root>/pause.pending when no
 #            pause file is left anywhere), so a pause that never stopped the agent cannot outlive the session.
+#  Hand-back (DESIGN-v0.1.2-handback §3.2): a sub-agent that reports through the SubagentHandback tool
+#            (Claude Code's auto mode) ends its turn with that tool, and Claude Code discards any block after it.
+#            For such a sub-agent SubagentStop never blocks or waits: pending instructions stay pending and a
+#            "skipped" steer line is written; a pause request is removed ("released", reason handback_end).
+#            The end of such a sub-agent is PreToolUse:SubagentHandback, handled only by the hook registered
+#            with the matcher SubagentHandback and "--handback relay|deny": it waits for a pause of any "at",
+#            and with "deny" hands pending instructions over as the deny reason (a tool result). The matcher-less
+#            PreToolUse hook (no --handback) leaves SubagentHandback alone, so nothing waits twice.
 #  Root    : --root -> $AGENTMAP_DIR -> $AGENTFLOW_DIR (deprecated) ->
 #            $XDG_DATA_HOME/nvim/agentflow -> ~/.local/share/nvim/agentflow
 #            (the folder name stays "agentflow" so existing records keep working)
@@ -78,6 +86,16 @@ STEER_HEAD_STOP = ("[AgentMap] Instruction from the user, typed in Neovim (Agent
                    "It reaches you now, just before you finish:")
 STEER_TAIL_STOP = "Apply it now, continue your task, then finish again."
 STEER_MODES = ("stop", "deny", "context")
+# 報告を SubagentHandback で返す子に、その直前（PreToolUse:SubagentHandback の deny）で届けるときの文
+# （DESIGN-v0.1.2-handback §3.3。任意設定 steer.handback = "deny"）。出所と時機だけ。疑わせない言い回しは書かない
+STEER_HEAD_HANDBACK = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
+                       "It reaches you now, just before you hand back your report:")
+STEER_TAIL_HANDBACK = "Apply it now, continue your task, then call SubagentHandback again with your updated report."
+HANDBACK_TOOL = "SubagentHandback"
+HANDBACK_ROUTES = ("relay", "deny")
+# 親への「子が報告を返した」知らせ（UserPromptSubmit の prompt。2.1.29x 実測 H12）
+AGENT_MESSAGE = re.compile(r'^\s*<agent-message from="([A-Za-z0-9_-]{1,128})">')
+HANDBACK_NOTICE = "[Subagent hand-back]"
 # 子（ROOT 以外）への文の最後に足す 1 文（親にも知らせるため、報告に書いてもらう。DESIGN-v0.2-steer 付録 E）
 STEER_TAIL_CHILD = "Mention this instruction and what you changed because of it in your final report."
 # 一時停止（DESIGN-v0.1.2-pause §3）
@@ -271,6 +289,16 @@ def handback_report(path):
     return None
 
 
+def handback_ended(d, hb):
+    """SubagentStop の子が SubagentHandback で番を終えたか（DESIGN-v0.1.2-handback §3.1 の印③）。
+    hb は handback_report() の結果。handback で終わった子の payload には last_assistant_message が無い（H2）。
+    handback の後にモデルが何か言った（last_assistant_message がある）なら、番は道具で終わっていない"""
+    if hb is None:
+        return False
+    last = d.get("last_assistant_message")
+    return not (isinstance(last, str) and last.strip())
+
+
 def tail(s, n=TARGET):
     """長いファイル名は後ろを残して先頭を … にする"""
     if not isinstance(s, str):
@@ -359,11 +387,20 @@ def build(d):
     elif ev == "UserPromptSubmit":
         p = d.get("prompt")
         if isinstance(p, str):
+            m = AGENT_MESSAGE.match(p)
             if p.lstrip().startswith("<task-notification>"):
                 rec["kind"] = "task_notification"
                 rec["prompt_head"] = task_notification_head(p)
+            elif m and HANDBACK_NOTICE in p[:1000]:
+                # 子が SubagentHandback で報告を返した知らせ（DESIGN-v0.1.2-handback §3.2）。from はその子の agent id
+                rec["kind"] = "agent_message"
+                rec["from"] = m.group(1)
+                rec["prompt_head"] = head(p)
             else:
                 rec["prompt_head"] = head(p)
+        # 権限モード（"auto" なら子は SubagentHandback で報告を返す見込み。H1・H11）。このイベントと SubagentStop だけ
+        if isinstance(d.get("permission_mode"), str):
+            rec["permission_mode"] = d["permission_mode"][:40]
     elif ev == "PreToolUse":
         rec["tool_use_id"] = d.get("tool_use_id")
         rec["tool_name"] = tool
@@ -375,6 +412,11 @@ def build(d):
             desc = d["tool_input"].get("description")
             if desc is not None:
                 rec["tool_input"] = {"description": head(desc) if isinstance(desc, str) else desc}
+        elif tool == HANDBACK_TOOL:
+            # 子が返そうとしている報告（関門で止めている間に読めるように。SubagentStop の report と同じ扱い）
+            ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+            if isinstance(ti.get("message"), str) and ti["message"].strip():
+                rec["report"] = clip(ti["message"], REPORT)
     elif ev == "PostToolUse":
         rec["tool_use_id"] = d.get("tool_use_id")
         rec["tool_name"] = tool
@@ -456,11 +498,16 @@ def build(d):
         if isinstance(d.get("last_assistant_message"), str):
             rec["last_head"] = head(d["last_assistant_message"])
         # 子の報告：handback の message があればそれ、無ければ最後の返答（handback を使わずに終わった子）
-        rep = handback_report(d.get("agent_transcript_path"))
+        hb = handback_report(d.get("agent_transcript_path"))
+        rep = hb
         if rep is None and isinstance(d.get("last_assistant_message"), str) and d["last_assistant_message"].strip():
             rep = d["last_assistant_message"]
         if rep is not None:
             rec["report"] = clip(rep, REPORT)
+        if handback_ended(d, hb):
+            rec["report_via"] = "handback"
+        if isinstance(d.get("permission_mode"), str):
+            rec["permission_mode"] = d["permission_mode"][:40]
     elif ev == "Stop":
         if isinstance(d.get("last_assistant_message"), str):
             rec["last_head"] = head(d["last_assistant_message"])
@@ -559,12 +606,18 @@ def log_error(root, e, ev):
         pass
 
 
-def steer_message(texts, child=False, paused_ms=None, at_stop=False):
+def steer_message(texts, child=False, paused_ms=None, at_stop=False, handback=False):
     """モデルに渡す文（英語固定。本文だけ作者の言語）。子への文には報告に書く頼みを足す。
     止まれから解けて届けるときは、止まっていた時間の 1 行を見出しの次に足す。
-    at_stop（SubagentStop / Stop の block）は終わり際用の見出しと結び（DESIGN-v0.1.2-steer2 §3.3）"""
+    at_stop（SubagentStop / Stop の block）は終わり際用の見出しと結び（DESIGN-v0.1.2-steer2 §3.3）。
+    handback（PreToolUse:SubagentHandback の deny）は報告の直前用の見出しと結び（DESIGN-v0.1.2-handback §3.3）"""
     extra = (PAUSE_LINE % dur_text(paused_ms) + "\n") if paused_ms is not None else ""
-    h, t = (STEER_HEAD_STOP, STEER_TAIL_STOP) if at_stop else (STEER_HEAD, STEER_TAIL)
+    if handback:
+        h, t = STEER_HEAD_HANDBACK, STEER_TAIL_HANDBACK
+    elif at_stop:
+        h, t = STEER_HEAD_STOP, STEER_TAIL_STOP
+    else:
+        h, t = STEER_HEAD, STEER_TAIL
     return h + "\n" + extra + "\n\n".join(texts) + "\n" + t + (" " + STEER_TAIL_CHILD if child else "")
 
 
@@ -709,8 +762,10 @@ def end_session_cleanup(root, run):
     clear_pause_flag(root)
 
 
-def pause_wait(root, d, run, argv):
+def pause_wait(root, d, run, argv, at_end=False):
     """止まれがあれば hook の中で待つ（DESIGN-v0.1.2-pause §3.2）。
+    at_end: PreToolUse:SubagentHandback（handback の子の終わり際）。at が "stop" の止まれ（関門）でも待つ
+    （DESIGN-v0.1.2-handback §3.5）。
     戻り値: 待った場合 {"id", "target", "reason", "waited_ms"}、待たなかった場合 None。
     released 行は呼び出し側が配達のあとに書く（steer_ids を入れるため）"""
     ev = d.get("hook_event_name")
@@ -733,8 +788,8 @@ def pause_wait(root, d, run, argv):
     except (TypeError, ValueError):
         auto = PAUSE_AUTO
     auto = min(max(auto, PAUSE_AUTO_MIN), PAUSE_AUTO_MAX)
-    if ev == "PreToolUse" and at != "next":
-        return None  # 終わる直前だけの止まれ（関門）は道具では止めない
+    if ev == "PreToolUse" and at != "next" and not at_end:
+        return None  # 終わる直前だけの止まれ（関門）は道具では止めない（handback の直前は終わり際なので止める）
     side = os.path.join(pdir, target + ".hit.json")
     start = time.time()
     deadline, mine = claim_hit(side, pause, auto, d, ev)
@@ -848,13 +903,74 @@ def take_steers(run, target):
     return out
 
 
-def steer(root, d, run, argv):
-    """修正指示を配達する（--pause なら先に止まれを待つ）。配達したら hook の答え（JSON 文字列）を返す。何も無ければ None"""
+def handback_stop(root, d, run):
+    """handback で終わった子の SubagentStop（DESIGN-v0.1.2-handback §3.2）。block は出さない・待たない
+    （Claude Code が捨てる。H3）。未配達の指示はファイル名を変えずに id だけ集めて skipped の 1 行、
+    止まれがあれば消して released（reason handback_end）の 1 行。何も返さない"""
     ev = d.get("hook_event_name")
+    target = target_of(d)
+    sdir = os.path.join(run, "steer")
+    try:
+        names = os.listdir(sdir)
+    except OSError:
+        names = []
+    pat = re.compile("^" + re.escape(target) + r"-(\d+)\.json$")
+    ids = [n[:-len(".json")] for _ms, n in sorted((int(m.group(1)), n) for n in names for m in [pat.match(n)] if m)]
+    if ids:
+        try:
+            hook_line(run, d, {"steer": {"ids": ids, "mode": "skipped", "reason": "handback", "target": target}})
+        except Exception as e:
+            log_error(root, e, ev)
+    pdir = os.path.join(run, "pause")
+    pf = os.path.join(pdir, target + ".json")
+    try:
+        pause, _st = read_pause(pf)
+    except Exception as e:
+        log_error(root, e, ev)
+        pause = None
+        try:
+            os.remove(pf)  # 読めない止まれも、この子にはもう意味が無い
+        except OSError:
+            pass
+    if pause is not None:
+        try:
+            os.remove(pf)
+        except OSError:
+            pass
+        try:
+            hook_line(run, d, {"pause": {"id": pause["id"], "phase": "released", "reason": "handback_end",
+                                         "target": target}})
+        except Exception as e:
+            log_error(root, e, ev)
+    try:
+        os.remove(os.path.join(pdir, target + ".hit.json"))
+    except OSError:
+        pass
+    clear_pause_flag(root)
+    return None
+
+
+def steer(root, d, run, argv, rec=None):
+    """修正指示を配達する（--pause なら先に止まれを待つ）。配達したら hook の答え（JSON 文字列）を返す。何も無ければ None。
+    rec: 同じ起動で記録係が作った 1 行（SubagentStop の report_via を見る。transcript を 2 回読まないため）"""
+    ev = d.get("hook_event_name")
+    is_hb_tool = ev == "PreToolUse" and d.get("tool_name") == HANDBACK_TOOL
+    hb_route = opt_value(argv, "--handback")
+    if hb_route not in HANDBACK_ROUTES:
+        hb_route = None
+    if is_hb_tool and hb_route is None:
+        return None  # matcher 無しの門番：SubagentHandback は matcher 付きの門番に任せる（二重に待たない）
+    if ev == "SubagentStop":
+        if rec is not None:
+            ended_hb = rec.get("report_via") == "handback"
+        else:
+            ended_hb = handback_ended(d, handback_report(d.get("agent_transcript_path")))
+        if ended_hb:
+            return handback_stop(root, d, run)
     paused = None
     if "--pause" in argv:
         try:
-            paused = pause_wait(root, d, run, argv)
+            paused = pause_wait(root, d, run, argv, at_end=is_hb_tool)
         except Exception as e:
             log_error(root, e, ev)  # 待ちの中の失敗は止まらない側に倒す
             paused = None
@@ -862,7 +978,10 @@ def steer(root, d, run, argv):
     if mode not in STEER_MODES:
         mode = "stop"  # 0.1.2 から既定は終わり際（DESIGN-v0.1.2-steer2 §3.2）
     used = None
-    if ev in ("SubagentStop", "Stop"):
+    if is_hb_tool:
+        # handback の直前：--handback deny のときだけ deny の理由で渡す（relay は親経由に任せ、ファイルは残す）
+        used = "deny" if hb_route == "deny" else None
+    elif ev in ("SubagentStop", "Stop"):
         # 終わり際で届ける：mode stop、v0.1.1 の --at-stop、止まれから解けた直後（関門の「直す」）
         if mode == "stop" or "--at-stop" in argv or paused:
             used = "block"
@@ -892,7 +1011,8 @@ def steer(root, d, run, argv):
     except Exception as e:
         log_error(root, e, ev)
     msg = steer_message([t for _i, t in got], child=(target != "ROOT"),
-                        paused_ms=paused["waited_ms"] if paused else None, at_stop=(used == "block"))
+                        paused_ms=paused["waited_ms"] if paused else None, at_stop=(used == "block"),
+                        handback=is_hb_tool)
     if used == "block":
         out = {"decision": "block", "reason": msg}
     elif used == "context":
@@ -927,12 +1047,14 @@ def main():
     except Exception as e:
         log_error(root, e, ev)
         return None
+    rec = None
     if want_record:
         try:
             os.makedirs(run, exist_ok=True)
             if ev == "SessionStart" or not os.path.exists(os.path.join(pdir, "project.json")):
                 write_project(pdir, d, slug)
-            append(os.path.join(run, "hooks.jsonl"), encode(build(d)))
+            rec = build(d)
+            append(os.path.join(run, "hooks.jsonl"), encode(dict(rec)))
         except Exception as e:
             log_error(root, e, ev)
         if ev == "SessionEnd":
@@ -942,7 +1064,7 @@ def main():
                 log_error(root, e, ev)
     if want_steer:
         try:
-            answer = steer(root, d, run, argv)
+            answer = steer(root, d, run, argv, rec)
         except Exception as e:
             log_error(root, e, ev)
     return answer

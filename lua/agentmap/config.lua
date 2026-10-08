@@ -69,6 +69,15 @@ M.defaults = {
     submit_delay_ms = 300,
     input = "window",        -- "window" | "line"
     text_max = 4000,
+    -- 報告を SubagentHandback で返す子（Claude Code の auto モード）への届け方（DESIGN-v0.1.2-handback §3.4）。
+    -- この子の終わり際の block は Claude Code が捨てるので、終わり際には届かない。
+    -- "relay": 親経由（ROOT の端末があるとき。動いていれば次の道具、終わっていれば再開して届く）。
+    --          親経由できないときは置くだけにして、届かない見込みを正直に知らせる（既定）
+    -- "deny" : 加えて、親経由できないときは報告の直前（PreToolUse:SubagentHandback）にツールの結果として渡す
+    --          （sonnet は従った 2/2、haiku は 0/2。変えたら :AgentMapInstallHooks）
+    handback = "relay",
+    -- 終わり際に置いて届かなかった（skipped）指示を、親の端末があれば自動で親経由に回す（Q26）
+    handback_reroute = true,
   },
   -- 動いている Agent の一時停止と、終わる前に待たせる関門（DESIGN-v0.1.2-pause §8.1）。false を渡すと { enabled = false }
   pause = {
@@ -82,6 +91,7 @@ M.defaults = {
 
 local STEER_MODES = { stop = true, deny = true, context = true }
 local STEER_RELAY = { menu = true, never = true, always = true }
+local STEER_HANDBACK = { relay = true, deny = true }
 local at_stop_given = false -- setup() の steer に at_stop があったか（0.1.2 で廃止。health 13 行目）
 
 -- setup({ progress = false }) / { progress = true } を表に直す（animation / steer / pause も同じ）
@@ -105,6 +115,12 @@ local function normalize(opts)
     if out.steer.no_terminal == "hook" then out.steer.no_terminal = "stop" end
     if out.steer.mode ~= nil and not STEER_MODES[out.steer.mode] then out.steer.mode = nil end
     if out.steer.relay ~= nil and not STEER_RELAY[out.steer.relay] then out.steer.relay = nil end
+    -- handback（DESIGN-v0.1.2-handback §7.1）: 知らない値は既定 "relay"。handback_reroute は boolean に直す
+    if out.steer.handback ~= nil and not STEER_HANDBACK[out.steer.handback] then out.steer.handback = nil end
+    if out.steer.handback_reroute ~= nil and type(out.steer.handback_reroute) ~= "boolean" then
+      local v = out.steer.handback_reroute
+      out.steer.handback_reroute = not (v == 0 or v == "false" or v == "no" or v == "off")
+    end
   end
   -- 自動再開の秒数は hook と同じ範囲（5〜86400）に収める。数でなければ既定に戻す
   if type(out.pause) == "table" and out.pause.auto_resume_s ~= nil then

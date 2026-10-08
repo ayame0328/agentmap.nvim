@@ -262,4 +262,44 @@ do
   t.ok(vim.fn.strdisplaywidth(e) <= math.max(vim.fn.strdisplaywidth(j), 24), "graph.legend_steer の幅")
 end
 
+-- ------------------------------------------------------------
+-- 7. 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback 付録 A。W3 の通知の鍵も W2 が書く）
+-- ------------------------------------------------------------
+local HB_KEYS = {
+  "ui.steer_write_relay_hb", "ui.steer_write_hb_deny", "ui.steer_write_hb_pending", "ui.pause_fix_relay_hb",
+  "ui.steer_relay_hb", "ui.steer_resumed_relay", "ui.steer_hb_pending", "ui.steer_hb_deny", "ui.steer_rerouted_hb",
+  "ui.steer_skipped_hb", "ui.steer_not_held_hb", "ui.pause_hit_hb", "ui.pause_fixed_relay_hb",
+  "detail.steer_skipped_hb", "detail.steer_rerouted", "detail.steer_rerouted_from", "detail.steer_not_held_hb",
+  "detail.steer_delivered_hb_deny", "detail.steer_reason_handback", "detail.pause_hit_hb", "detail.pause_reason_handback_end",
+  "detail.h_handback_report",
+  "export.steer_skipped_hb", "export.steer_rerouted", "export.steer_not_held_hb", "export.steer_delivered_hb_deny",
+  "export.ov_handback", "export.ov_permission_label", "export.steer_join",
+  "health.handback_relay", "health.handback_deny", "health.handback_hook_ok", "health.handback_hook_missing",
+  "health.run_auto", "health.run_not_auto",
+}
+local miss3 = {}
+for _, k in ipairs(HB_KEYS) do
+  if en[k] == nil or ja[k] == nil then miss3[#miss3 + 1] = k end
+end
+t.eq(miss3, {}, "handback 付録 A の鍵が en と ja の両方にある")
+-- 差し込み口（W3 は通知に label を渡す。詳細・書き出しは time / n）
+local HB_HOLES = {
+  ["ui.steer_write_relay_hb"] = {}, ["ui.steer_write_hb_deny"] = {}, ["ui.steer_write_hb_pending"] = {}, ["ui.pause_fix_relay_hb"] = {},
+  ["ui.steer_relay_hb"] = { "label" }, ["ui.steer_resumed_relay"] = { "label" }, ["ui.steer_hb_pending"] = { "label" },
+  ["ui.steer_hb_deny"] = { "label" }, ["ui.steer_rerouted_hb"] = { "label" }, ["ui.steer_skipped_hb"] = { "label" },
+  ["ui.steer_not_held_hb"] = { "label" }, ["ui.pause_hit_hb"] = { "label" }, ["ui.pause_fixed_relay_hb"] = { "label" },
+  ["detail.steer_skipped_hb"] = { "time" }, ["detail.steer_rerouted"] = { "n", "time" }, ["detail.steer_rerouted_from"] = { "n" },
+  ["detail.steer_delivered_hb_deny"] = { "time" }, ["detail.pause_hit_hb"] = { "time" },
+  ["export.steer_skipped_hb"] = { "time" }, ["export.steer_rerouted"] = { "n", "time" }, ["export.steer_delivered_hb_deny"] = { "time" },
+  ["health.handback_hook_ok"] = { "mode" }, ["health.run_not_auto"] = { "mode" },
+}
+for k, want in pairs(HB_HOLES) do
+  t.eq(holes(en[k]), want, k .. " の差し込み口")
+end
+-- 届いていないのに届いたと書かない：見送り・止められずは PENDING / NOT HELD と言う
+t.matches(en["detail.steer_skipped_hb"], "^PENDING ", "skipped は PENDING のまま")
+t.matches(en["detail.steer_not_held_hb"], "^NOT HELD %(hand%-back", "NOT HELD (hand-back)")
+t.matches(en["detail.steer_delivered_hb_deny"], "may be ignored", "deny は無視されることがあると言う")
+t.matches(ja["detail.steer_delivered_hb_deny"], "無視されることがある", "ja: deny")
+
 t.done()

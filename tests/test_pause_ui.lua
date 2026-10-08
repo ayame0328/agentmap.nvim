@@ -301,6 +301,99 @@ t.run("relay to a paused child", function()
   term.find, term.send = orig_find, orig_send
 end)
 
+-- 5b. 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.4・§3.5・§5.1・§5.5、付録 D の Q24・Q27）
+--     PAUSED（普通の道具の前）に s → 止まれを解いてから親経由。報告の直前（PreToolUse:SubagentHandback）で
+--     止まっている子（関門・x）の Fix → relay：通してから親経由（子は報告してから同じ id で再開）、deny：ファイル → 解く
+t.run("hand-back sub-agent", function()
+  clear_pauses()
+  local term = require("agentmap.term")
+  local orig_find, orig_send = term.find, term.send
+  term.find = function() return { buf = 1, job = 1, score = 3 }, { { buf = 1, job = 1, score = 3 } }, false end
+  term.send = function(_, line)
+    rec({ fn = "term_send", line = line })
+    return true
+  end
+  events.mark_steer_sent = function() rec({ fn = "mark_steer_sent" }) end
+  -- 本物の resume_pause と同じく、記録を書いた瞬間に止まれは RESUMED になる
+  local orig_resume = events.resume_pause
+  events.resume_pause = function(r, agent_id, opts)
+    rec({ fn = "resume_pause", agent_id = agent_id, opts = opts })
+    local q = ui._live_pause(agent_id)
+    if q then
+      q.status = "RESUMED"
+      s.agents[agent_id].pause = nil
+    end
+    return true
+  end
+  s.agents.a1.handback = true
+  -- PAUSED（普通の道具の前）
+  set_pause("a1", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "PreToolUse:Read" })
+  t.eq(ui.steer_kind("a1"), "relay", "止まっている handback の子も親経由")
+  notes = {}
+  local n0 = #calls
+  t.eq(ui.steer_send("a1", "v3 へ"), "relayed", "親経由で打った")
+  t.eq(fns(n0), { "resume_pause", "request_steer", "term_send", "mark_steer_sent" }, "止まれを解いてから親経由")
+  t.eq(last("request_steer").opts.via, "relay", "via relay")
+  t.ok(noted(ui._st("ui.steer_resumed_relay", { label = L1 })), "§5.5 の知らせ（再開して親経由）")
+  clear_pauses()
+  -- 関門で報告の直前に止まっている（箱はまだ RUNNING。報告は PreToolUse の記録で読める）
+  local g = set_pause("a1", "PAUSED", "gate", "stop", { hit_at = "2026-09-28T04:30:50.000Z", hit_via = "PreToolUse:SubagentHandback" })
+  ui._seed_pauses()
+  g.status = "REQUESTED"
+  ui._seed_pauses()
+  g.status = "PAUSED"
+  notes = {}
+  t.eq(ui.notify_pauses(), 1, "止まったことを 1 回知らせる")
+  t.ok(noted(ui._st("ui.pause_hit_hb", { label = L1 })), "報告の直前で止まった（x 通す / s 直す）")
+  t.eq(ui.relay_available("a1"), true, "報告の直前の関門は親経由できる（まだ終わっていない）")
+  t.eq(ui.steer_kind("a1"), "relay", "Fix は親経由")
+  menus, picks = {}, {}
+  ui.gate_menu("a1")
+  t.eq(menus[#menus].items[2], ui._st("ui.pause_fix_relay_hb"), "関門のメニューの Fix は「通してから親経由」")
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.pause_fix_relay_hb"), "s のメニューの 1 番も同じ")
+  notes = {}
+  n0 = #calls
+  t.eq(ui.steer_send("a1", "テストも"), "relayed", "Fix → 親経由")
+  t.eq(fns(n0), { "resume_pause", "request_steer", "term_send", "mark_steer_sent" }, "通してから親経由（H9）")
+  t.eq(calls[n0 + 1].opts.steer_id, nil, "hook には渡さないので steer_id は付けない")
+  t.ok(noted(ui._st("ui.pause_fixed_relay_hb", { label = L1 })), "通した・親経由で渡す・再開する、と知らせた")
+  clear_pauses()
+  -- deny の設定：今までどおりファイル → 解く（待っている hook がその場で deny で渡す）
+  config.get().steer = { handback = "deny" }
+  set_pause("a1", "PAUSED", "gate", "stop", { hit_at = "2026-09-28T04:30:50.000Z", hit_via = "PreToolUse:SubagentHandback" })
+  t.eq(ui.steer_kind("a1"), "hook", "deny なら hook")
+  menus = {}
+  ui.gate_menu("a1")
+  t.eq(menus[#menus].items[2], P("ui.pause_fix"), "Fix は普通の文")
+  n0 = #calls
+  t.eq(ui.steer_send("a1", "その場で"), "queued", "置いた")
+  t.eq(fns(n0), { "request_steer", "resume_pause" }, "ファイルを置いてから止まれを消す")
+  t.eq(calls[n0 + 2].opts.steer_id, calls[n0 + 1].id, "止まれは指示つきで解く")
+  config.get().steer = nil
+  clear_pauses()
+  -- x で報告の直前に止まった（kind pause）も終わり際として扱う
+  set_pause("a1", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:50.000Z", hit_via = "PreToolUse:SubagentHandback" })
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.pause_fix_relay_hb"), "x の止まれでも「通してから親経由」")
+  clear_pauses()
+  -- 端末が無い：置いて正直に知らせる（解いてから）
+  term.find = function() return nil, {}, false end
+  set_pause("a1", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "PreToolUse:Read" })
+  t.eq(ui.steer_kind("a1"), "hook", "端末が無ければ置く")
+  notes = {}
+  n0 = #calls
+  t.eq(ui.steer_send("a1", "置く"), "queued", "置いた")
+  t.eq(fns(n0), { "request_steer", "resume_pause" }, "置いてから解く")
+  t.ok(noted(ui._st("ui.steer_hb_pending", { label = L1 })), "届かない見込みを知らせた")
+  clear_pauses()
+  s.agents.a1.handback = nil
+  events.resume_pause = orig_resume
+  term.find, term.send = orig_find, orig_send
+end)
+
 -- 6. 断る場合
 t.run("refusals", function()
   clear_pauses()

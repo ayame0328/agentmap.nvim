@@ -1,12 +1,12 @@
 -- agentmap/health.lua ... :checkhealth agentmap (DESIGN §8, DESIGN-v0.2 §4.2, DESIGN-v0.2-steer §8.2,
---   DESIGN-v0.1.2-pause §8.2, DESIGN-v0.1.2-steer2 §9.2).
+--   DESIGN-v0.1.2-pause §8.2, DESIGN-v0.1.2-steer2 §9.2, DESIGN-v0.1.2-handback §7.2).
 --   Read-only except for one temp file in the record store (writability check);
 --   the progress statistics are loaded without writing stats.json.
 --   Never calls hooks.install().
 local M = {}
 
 --- Claude Code version the hook payloads were last verified with.
-M.VERIFIED_CLAUDE_CODE = "2.1.291"
+M.VERIFIED_CLAUDE_CODE = "2.1.294"
 
 local function t(key, vars)
   return require("agentmap.i18n").t(key, vars)
@@ -133,6 +133,45 @@ function M.sendmessage_recorded(path)
     end
   end
   return false
+end
+
+--- The --handback word ("relay" | "deny") of our registered PreToolUse hook for SubagentHandback
+--- (DESIGN-v0.1.2-handback §6, §7.2), or nil when it is not registered. Uses hooks.features().handback
+--- when it is a string; otherwise reads the commands in settings.json.
+---@param path string settings.json
+---@return string|nil
+function M.handback_registration(path)
+  local ok_h, hooks = pcall(require, "agentmap.hooks")
+  if ok_h and type(hooks.features) == "function" then
+    local ok, r = pcall(hooks.features, path)
+    if ok and type(r) == "table" and type(r.handback) == "string" and r.handback ~= "" then return r.handback end
+  end
+  for _, c in ipairs(registered_commands(path)) do
+    if c.event == "PreToolUse" and c.command:find("--handback", 1, true) then
+      return c.command:match("%-%-handback%s+'?([%w_]+)") or "relay"
+    end
+  end
+  return nil
+end
+
+--- The hand-back route the settings ask for: "deny" when steer.handback = "deny" or steer.mode is
+--- deny / context (those modes also hand over before tools), else "relay".
+---@param scfg table config.get().steer
+---@return string
+function M.handback_route(scfg)
+  scfg = type(scfg) == "table" and scfg or {}
+  if scfg.mode == "deny" or scfg.mode == "context" or scfg.handback == "deny" then return "deny" end
+  return "relay"
+end
+
+-- 図で見ている run の権限モード（state.permission_mode。W1 が足す欄。無ければ nil）
+local function viewed_permission_mode()
+  -- 図を開いていなければ ui は読み込まれていない（health のために読み込まない）
+  local ui = package.loaded["agentmap.ui"]
+  local st = type(ui) == "table" and type(ui.run) == "table" and ui.run.state or nil
+  if type(st) ~= "table" then return nil end
+  local m = st.permission_mode
+  return (type(m) == "string" and m ~= "") and m or nil
 end
 
 -- 未配達の指示ファイル（.delivered.json と書きかけを除く）の数
@@ -388,6 +427,29 @@ function M.check()
   end
   if type(config.steer_at_stop_given) == "function" and config.steer_at_stop_given() then
     h.info(t("health.steer_at_stop_ignored"))
+  end
+
+  -- 13b. 報告を SubagentHandback で返す子への経路と、その登録（DESIGN-v0.1.2-handback §7.2）
+  local pz_on = (config.get().pause or {}).enabled ~= false
+  local hb_route = M.handback_route(scfg)
+  if scfg.enabled ~= false then
+    h.info(t(hb_route == "deny" and "health.handback_deny" or "health.handback_relay"))
+  end
+  -- 登録が要るのは、止まれ（関門・stop）を使うとき、または deny で渡すとき（relay で止まれも無効なら登録しない）
+  local hb_need = pz_on or (scfg.enabled ~= false and hb_route == "deny")
+  if hb_need then
+    local reg = M.handback_registration(spath)
+    if reg and (reg == hb_route or scfg.enabled == false) then
+      h.ok(t("health.handback_hook_ok", { mode = reg }))
+    else
+      h.warn(t("health.handback_hook_missing"))
+    end
+  end
+  local pmode = viewed_permission_mode()
+  if pmode == "auto" then
+    h.info(t("health.run_auto"))
+  elseif pmode then
+    h.info(t("health.run_not_auto", { mode = pmode }))
   end
 
   -- 14. 未配達の印（health は書かないので、古い印も消さない）

@@ -7,6 +7,8 @@
 --    親経由（via relay。DESIGN-v0.1.2-steer2 §6.5）：ファイルも印も書かない、relay_line と expect、
 --      READ のあと親の番が終わって渡されなければ not_relayed、渡せば（SendMessage）期限切れにしない
 --    collector との往復：Neovim が書いたファイルを bin/agentmap-collect --steer が配達し、provider が DELIVERED にする
+--    報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback）：印①の agent_handback、request_steer(rerouted_from)、
+--      cancel_steer(reason = "rerouted")、skipped の期限切れ（agent_finished, skip_reason handback）
 --  記録の保存先は一時フォルダ（minimal_init.lua の AGENTMAP_DIR）。
 --  実行: nvim --headless --clean -u tests/minimal_init.lua -l tests/test_steer_events.lua
 --  requires: python3（collector との往復の節）
@@ -340,5 +342,95 @@ events.sweep_steers(run3, T0 + 781)
 t.eq(run3.state.steers[r4].end_reason, "not_relayed", "session ended: READ relay → not_relayed")
 t.eq(run3.state.steers[r3].status, "DELIVERED", "session ended: unread relay stays SENT (DELIVERED/terminal)")
 t.eq(run3.state.steers[h1].end_reason, "session_ended", "session ended: the stop one → session_ended")
+
+-- ---------- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.6・§4.2） ----------
+do
+  local SID4 = "c0ffee48-0000-4000-8000-000000000048"
+  local run4_dir = ROOT .. "/projects/" .. SLUG .. "/runs/" .. SID4
+  vim.fn.mkdir(run4_dir, "p")
+  local H4 = "afeed000000000048"
+  local P4 = "c0ffee49-0000-4000-8000-000000000049"
+  local TR = vim.fn.tempname() .. "-agent.jsonl"
+  local function hook4(ev, sec, extra)
+    local r = { session_id = SID4, hook_event_name = ev, cwd = "/tmp/agentmap-test/steer", prompt_id = P4,
+      transcript_path = "/tmp/agentmap-test/claude/projects/" .. SLUG .. "/" .. SID4 .. ".jsonl",
+      _v = 1, _ts = iso(T0 + sec), _src = "claude_hook" }
+    for k, v in pairs(extra or {}) do r[k] = v end
+    return vim.json.encode(r)
+  end
+  local function append4(lines)
+    local f = assert(io.open(run4_dir .. "/hooks.jsonl", "ab"))
+    for _, l in ipairs(lines) do f:write(l .. "\n") end
+    f:close()
+  end
+  append4({
+    hook4("SessionStart", 0, { source = "startup" }),
+    hook4("UserPromptSubmit", 1, { prompt_head = "work", permission_mode = "auto" }),
+    hook4("SubagentStart", 2, { agent_id = H4, agent_type = "general-purpose" }),
+  })
+  local run4 = events.load(run4_dir)
+  t.eq(run4.state.permission_mode, "auto", "hand-back: s.permission_mode from the first prompt")
+  -- 印①：transcript の先頭の固定文を poll_steps が見つけたら agent_handback を 1 回だけ記録する
+  vim.fn.writefile(vim.fn.readfile(vim.g.agentmap_test_dir .. "/fixtures/transcript_handback.jsonl"), TR)
+  events.emit(run4, { event = "agent_updated", agent_id = H4, transcript_path = TR, src = "system" })
+  events.poll_steps(run4)
+  local function count(name, dir)
+    local n = 0
+    for _, e in ipairs(util.json_lines((dir or run4_dir) .. "/events.jsonl", 0)) do if e.event == name then n = n + 1 end end
+    return n
+  end
+  t.eq(count("agent_handback"), 1, "poll_steps: the reminder at the top → agent_handback (source transcript)")
+  t.eq(run4.state.agents[H4].handback, true, "poll_steps: a.handback = true")
+  vim.fn.writefile({ '{"type":"assistant","message":{"content":[{"type":"text","text":"more"}]}}' }, TR, "a")
+  events.poll_steps(run4)
+  t.eq(count("agent_handback"), 1, "poll_steps: recorded once")
+  -- 終わり際に置いた指示 → collector が skipped → 自動で親経由（rerouted_from）→ 元は CANCELLED（rerouted）
+  local k1 = events.request_steer(run4, H4, "write b.txt", { via = "hook" })
+  append4({
+    hook4("SubagentStop", 600, { agent_id = H4, agent_type = "general-purpose", report = "r", report_via = "handback" }),
+    hook4("SubagentStop", 600, { agent_id = H4, steer = { ids = { k1 }, mode = "skipped", reason = "handback", target = H4 } }),
+  })
+  events.poll(run4)
+  t.eq({ run4.state.steers[k1].status, run4.state.steers[k1].skip_reason }, { "PENDING", "handback" }, "skipped: PENDING with skip_reason")
+  local k2 = events.request_steer(run4, H4, "write b.txt", { via = "relay", relay_line = "[AgentMap] Tell … write b.txt", rerouted_from = k1 })
+  local req
+  for _, e in ipairs(util.json_lines(run4_dir .. "/events.jsonl", 0)) do
+    if e.event == "steer_requested" and e.steer_id == k2 then req = e end
+  end
+  t.eq(req and req.rerouted_from, k1, "request_steer: steer_requested carries rerouted_from")
+  t.eq(run4.state.steers[k2].rerouted_from, k1, "state: rerouted_from")
+  local okc = events.cancel_steer(run4, k1, { reason = "rerouted", rerouted_to = k2 })
+  t.ok(okc, "cancel_steer with reason rerouted")
+  local can
+  for _, e in ipairs(util.json_lines(run4_dir .. "/events.jsonl", 0)) do
+    if e.event == "steer_cancelled" and e.steer_id == k1 then can = e end
+  end
+  t.eq(can and { can.reason, can.rerouted_to }, { "rerouted", k2 }, "steer_cancelled carries reason / rerouted_to")
+  t.eq({ run4.state.steers[k1].status, run4.state.steers[k1].end_reason, run4.state.steers[k1].rerouted_to },
+    { "CANCELLED", "rerouted", k2 }, "state: CANCELLED (rerouted), rerouted_to")
+  t.ok(vim.uv.fs_stat(run4_dir .. "/steer/" .. k1 .. ".json") == nil, "cancel_steer: the skipped file is removed")
+  -- 回さなかった skipped は、宛先が終わって 3 秒たてば EXPIRED（agent_finished）＋ skip_reason handback
+  local k3 = events.request_steer(run4, H4, "late one", { via = "hook" })
+  append4({ hook4("SubagentStop", 600, { agent_id = H4, steer = { ids = { k3 }, mode = "skipped", reason = "handback", target = H4 } }) })
+  events.poll(run4)
+  t.eq(run4.state.steers[k3].status, "PENDING", "skipped: still PENDING within 3 s of the end")
+  events.sweep_steers(run4, T0 + 600 + 4) -- 宛先は T0+600 に終わった
+  local ex
+  for _, e in ipairs(util.json_lines(run4_dir .. "/events.jsonl", 0)) do
+    if e.event == "steer_expired" and e.steer_id == k3 then ex = e end
+  end
+  t.eq(ex and { ex.reason, ex.skip_reason }, { "agent_finished", "handback" }, "sweep_steers: steer_expired (agent_finished, skip_reason handback)")
+  t.eq({ run4.state.steers[k3].status, run4.state.steers[k3].end_reason, run4.state.steers[k3].skip_reason },
+    { "EXPIRED", "agent_finished", "handback" }, "state: EXPIRED (agent_finished, handback)")
+  t.ok(vim.uv.fs_stat(run4_dir .. "/steer/" .. k3 .. ".json") == nil, "sweep_steers: the file is removed")
+  -- skipped でない期限切れには skip_reason を付けない
+  local k4 = events.request_steer(run4, H4, "plain", { via = "hook" })
+  events.sweep_steers(run4, T0 + 600 + 4)
+  for _, e in ipairs(util.json_lines(run4_dir .. "/events.jsonl", 0)) do
+    if e.event == "steer_expired" and e.steer_id == k4 then ex = e end
+  end
+  t.eq({ ex.steer_id, ex.skip_reason }, { k4, nil }, "an ordinary expiry has no skip_reason")
+  os.remove(TR)
+end
 
 t.done()

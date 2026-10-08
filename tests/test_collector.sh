@@ -9,9 +9,11 @@
 #    - PostToolUse の SendMessage は to / head / summary だけ残す（DESIGN-v0.1.2-steer2 §4.5）
 #    - --pause：止まれファイルがある間 hook の中で待つ（期限・--max-wait・再開・指示つき再開・SIGTERM・壊れたファイル）
 #    - 保存場所（projects/<slug>/runs/<sid>/hooks.jsonl, project.json）
-#    - 残す項目だけ残っているか（依頼文の全文・permission_mode などが無いこと）
+#    - 残す項目だけ残っているか（依頼文の全文などが無いこと。permission_mode は UserPromptSubmit / SubagentStop だけ）
 #    - 空の入力・壊れた入力でも終了コード 0
 #    - 書き方の決まり（日本語・英語）を brief.lua と同じ規則で読む（fixtures/convention_cases.jsonl）
+#    - 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback）：permission_mode・agent_message・返す直前の報告・
+#      report_via、SubagentStop では block せず skipped、PreToolUse:SubagentHandback の --handback relay / deny
 #    - 保存先の決め方（--root → AGENTMAP_DIR → AGENTFLOW_DIR → XDG_DATA_HOME）
 #  使い方: bash tests/test_collector.sh [--regen-fixture]
 #    --regen-fixture を付けると fixtures/hooks_probe.jsonl と fixtures/hooks_tasks.jsonl を作り直す
@@ -62,9 +64,13 @@ check(oct(os.stat(hp).st_mode & 0o777) == "0o600", "hooks.jsonl mode 0600")
 recs = [json.loads(l) for l in open(hp)]
 check(len(recs) == 14, "14 records written")
 text = open(hp, encoding="utf-8").read()
-for forbidden in ('"prompt"', '"permission_mode"', '"outputFile"', '"background_tasks"',
+for forbidden in ('"prompt"', '"outputFile"', '"background_tasks"',
                   '"session_crons"', '"last_assistant_message"', '"canReadOutputFile"'):
     check(forbidden not in text, "not stored: " + forbidden)
+# permission_mode は UserPromptSubmit と SubagentStop の記録だけに残す（DESIGN-v0.1.2-handback §3.2）
+check(all(("permission_mode" in r) == (r["hook_event_name"] in ("UserPromptSubmit", "SubagentStop")) for r in recs),
+      "permission_mode only on UserPromptSubmit / SubagentStop records")
+check(all(r.get("permission_mode") == "bypassPermissions" for r in recs if "permission_mode" in r), "permission_mode value kept")
 check(all(r.get("_v") == 1 and r.get("_src") == "claude_hook" and r.get("_ts", "").endswith("Z") for r in recs),
       "_v/_src/_ts on every record")
 check(all(len(r.get("prompt_head", "")) <= 200 for r in recs), "prompt_head <= 200 chars")
@@ -814,6 +820,226 @@ check(code == 0 and out == "" and err == "" and lines()[-1].get("hook_event_name
 check(not os.path.isfile(os.path.join(root, "collector.log")) or "SessionEnd" not in open(os.path.join(root, "collector.log")).read(),
       "(k) SessionEnd: nothing logged to collector.log")
 shutil.rmtree(os.path.join(root, "projects", "-other"))
+sys.exit(1 if bad else 0)
+PY
+
+# 4i) 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §3.2・§3.3・§9 の (h1)〜(h5)）
+#     payload は fixtures/hook_payloads_handback.jsonl（2.1.294 の形）、子の transcript は fixtures/transcript_handback.jsonl
+python3 - "$COLLECT" "$TMP/handback" "$HERE/fixtures" <<'PY' || FAIL=1
+import json, sys, os, subprocess, time, threading, shutil
+collect, root, fx = sys.argv[1:4]
+bad = []
+def check(c, msg):
+    print(("  ok   " if c else "  FAIL ") + msg)
+    if not c: bad.append(msg)
+pl = [json.loads(l) for l in open(os.path.join(fx, "hook_payloads_handback.jsonl"), encoding="utf-8") if l.strip()]
+TR = os.path.join(fx, "transcript_handback.jsonl")
+for d in pl:
+    if d.get("agent_transcript_path"):
+        d["agent_transcript_path"] = TR  # 子の transcript は fixture を直接読む（読むだけ）
+up1, pre_hb, stop_hb, notice = pl[1], pl[7], pl[8], pl[9]
+CH = pre_hb["agent_id"]
+slug = os.path.basename(os.path.dirname(pre_hb["transcript_path"]))
+run = os.path.join(root, "projects", slug, "runs", pre_hb["session_id"])
+sdir, pdir, hp = os.path.join(run, "steer"), os.path.join(run, "pause"), os.path.join(run, "hooks.jsonl")
+PF, SIDE, FLAG = os.path.join(pdir, CH + ".json"), os.path.join(pdir, CH + ".hit.json"), os.path.join(root, "pause.pending")
+def call(d, *args, later=None, timeout=20):
+    p = subprocess.Popen(["python3", collect, "--root", root] + list(args), stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if later:
+        threading.Timer(later[0], later[1]).start()
+    t0 = time.time()
+    out, err = p.communicate(json.dumps(d).encode("utf-8"), timeout=timeout)
+    return p.returncode, out.decode("utf-8"), err.decode("utf-8"), time.time() - t0
+def lines():
+    return [json.loads(l) for l in open(hp, encoding="utf-8")] if os.path.isfile(hp) else []
+def put_steer(text, ms, target=CH):
+    os.makedirs(sdir, exist_ok=True)
+    sid = "%s-%d" % (target, ms)
+    with open(os.path.join(sdir, sid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"id": sid, "agent_id": target, "text": text}, f)
+    return sid
+n_pause = [0]
+def put_pause(at="next", kind="pause"):
+    os.makedirs(pdir, exist_ok=True)
+    n_pause[0] += 1
+    pid = "%s-17914000%05d" % (CH, n_pause[0])
+    with open(PF, "w", encoding="utf-8") as f:
+        json.dump({"id": pid, "agent_id": CH, "at": at, "kind": kind, "auto_resume_s": 600}, f)
+    open(FLAG, "a").close()
+    return pid
+def rm(p):
+    return lambda: os.path.exists(p) and os.remove(p)
+
+# 14 件を記録係として流す：終了コード 0・何も出さない
+for i, d in enumerate(pl):
+    code, out, err, dt = call(d)
+    if code != 0 or out or err:
+        check(False, "record payload %d: exit 0, silent (%d %r %r)" % (i + 1, code, out, err))
+recs = lines()
+check(len(recs) == 14, "14 hand-back payloads recorded")
+by = lambda ev, **kw: [r for r in recs if r["hook_event_name"] == ev and all(r.get(k) == v for k, v in kw.items())]
+# (h1) UserPromptSubmit に permission_mode、<agent-message from=…>[Subagent hand-back] は kind agent_message・from
+u = by("UserPromptSubmit")
+check(len(u) == 3 and all(r.get("permission_mode") == "auto" for r in u), "(h1) UserPromptSubmit keeps permission_mode")
+check("kind" not in u[0] and "from" not in u[0], "(h1) an ordinary prompt has no kind / from")
+check(u[1].get("kind") == "agent_message" and u[1].get("from") == CH, "(h1) hand-back notice → kind agent_message, from = the child's id")
+check(u[1]["prompt_head"].startswith('<agent-message from="%s"> [Subagent hand-back]' % CH) and len(u[1]["prompt_head"]) <= 200,
+      "(h1) hand-back notice keeps a 200-character prompt_head (newlines as spaces)")
+check(all("permission_mode" not in r for r in recs if r["hook_event_name"] not in ("UserPromptSubmit", "SubagentStop")),
+      "(h1) permission_mode only on UserPromptSubmit / SubagentStop")
+check(not any('"prompt"' in json.dumps(r) for r in recs) and not any("tool_input" in r for r in by("PreToolUse", tool_name="Write")),
+      "(h1) no full prompt, no Write tool input")
+# <agent-message> でも hand-back の印が無ければ普通の依頼文
+d = dict(up1); d["prompt"] = '<agent-message from="%s">hello from a sub-agent</agent-message>' % CH
+call(d)
+check("kind" not in lines()[-1], "(h1) <agent-message> without [Subagent hand-back]: no kind")
+# (h2) PreToolUse SubagentHandback → report（改行は残す・2000 文字）
+r = by("PreToolUse", tool_name="SubagentHandback")
+msg = pre_hb["tool_input"]["message"]
+check(len(r) == 1 and r[0].get("report") == msg and r[0].get("agent_id") == CH and r[0].get("tool_use_id") == pre_hb["tool_use_id"],
+      "(h2) PreToolUse SubagentHandback: report = tool_input.message (newlines kept), agent_id, tool_use_id")
+check("tool_input" not in r[0], "(h2) the tool input itself is not stored")
+d = json.loads(json.dumps(pre_hb)); d["tool_input"]["message"] = "## Report\n" + "x" * 5000 + " api_key=sk-abcdefghijklmnop"
+call(d)
+r = lines()[-1]
+check(len(r.get("report", "")) == 2000 and r["report"].startswith("## Report\n"), "(h2) a long report is cut to 2000 characters")
+d["tool_input"]["message"] = "token: sk-abcdefghijklmnopqrstu done"
+call(d)
+check("sk-abc" not in json.dumps(lines()[-1]), "(h2) secrets in the report are redacted")
+d["tool_input"]["message"] = ("あ" * 2000)
+d["tool_use_id"] = "x" * 6000  # 行を長くする
+call(d)
+raw_last = open(hp, "rb").read().splitlines()[-1]
+check(len(raw_last) <= 16000 and len(raw_last) > 8000, "(h2) a report line uses the larger line limit (%d bytes)" % len(raw_last))
+# (h3) SubagentStop：transcript の末尾が handback → report_via handback（last_assistant_message 無し）
+s = by("SubagentStop")
+check(len(s) == 2 and all(x.get("report_via") == "handback" and x.get("permission_mode") == "auto" for x in s),
+      "(h3) SubagentStop of a hand-back child: report_via handback, permission_mode")
+check(s[0].get("report") == msg and "last_head" not in s[0], "(h3) SubagentStop: report from the transcript's SubagentHandback, no last_head")
+d = dict(stop_hb); d["last_assistant_message"] = "one more word after the hand-back"
+call(d)
+check("report_via" not in lines()[-1], "(h3) a final assistant message after the hand-back: not report_via handback")
+d = dict(stop_hb); d["agent_transcript_path"] = os.path.join(fx, "agent_report_text.jsonl")
+call(d)
+check("report_via" not in lines()[-1], "(h3) a transcript without SubagentHandback: no report_via")
+
+# (h3) 配達：handback の子の SubagentStop では block を出さない・待たない。未配達はファイル名そのまま、skipped の 1 行
+os.remove(hp)
+s1 = put_steer("write b.txt instead", 1791400000001)
+s2 = put_steer("and c.txt", 1791400000002)
+other = put_steer("for root", 1791400000003, target="ROOT")
+pid = put_pause(at="stop", kind="gate")
+open(SIDE, "w").write(json.dumps({"id": pid, "deadline": int(time.time()) + 600}))
+code, out, err, dt = call(stop_hb, "--steer", "--mode", "stop", "--pause", "--max-wait", "10", "--record")
+check(code == 0 and out == "" and err == "" and dt < 1.5, "(h3) --steer at a hand-back SubagentStop: stdout empty, no wait (%.2f s)" % dt)
+check(os.path.exists(os.path.join(sdir, s1 + ".json")) and os.path.exists(os.path.join(sdir, s2 + ".json"))
+      and not any(n.endswith(".delivered.json") for n in os.listdir(sdir)), "(h3) the instruction files keep their names (not delivered)")
+ls = lines()
+check([("steer" in l and "steer") or ("pause" in l and "pause") or "record" for l in ls] == ["record", "steer", "pause"],
+      "(h3) record, then the skipped line, then the released line")
+check(ls[1].get("steer") == {"ids": [s1, s2], "mode": "skipped", "reason": "handback", "target": CH}, "(h3) steer mode skipped reason handback, ids in order")
+check(ls[2].get("pause") == {"id": pid, "phase": "released", "reason": "handback_end", "target": CH}, "(h3) pause released reason handback_end")
+check(not os.path.exists(PF) and not os.path.exists(SIDE), "(h3) the pause file and .hit.json are removed")
+check(not os.path.exists(FLAG), "(h3) pause.pending removed when no pause is left")
+check(ls[0].get("report_via") == "handback", "(h3) the record of the same call has report_via handback")
+# 未配達も止まれも無ければ、記録の 1 行だけ
+os.remove(os.path.join(sdir, s1 + ".json")); os.remove(os.path.join(sdir, s2 + ".json"))
+n0 = len(lines())
+code, out, err, dt = call(stop_hb, "--steer", "--mode", "stop", "--pause", "--max-wait", "10", "--record")
+check(out == "" and len(lines()) == n0 + 1, "(h3) nothing pending: only the record line")
+# --record 無しで呼ばれても（記録を作らない起動）、transcript を見て同じに扱う
+s3 = put_steer("again", 1791400000004)
+n0 = len(lines())
+code, out, err, dt = call(stop_hb, "--steer", "--mode", "stop")
+check(out == "" and lines()[n0:] and lines()[-1].get("steer", {}).get("mode") == "skipped", "(h3) without --record: still skipped (reads the transcript)")
+# v0.1.1 の登録（--mode deny --at-stop）でも block しない
+n0 = len(lines())
+code, out, err, dt = call(stop_hb, "--steer", "--mode", "deny", "--at-stop", "--record")
+check(out == "" and lines()[-1].get("steer", {}).get("mode") == "skipped", "(h3) v0.1.1 words (--mode deny --at-stop): skipped, no block")
+os.remove(os.path.join(sdir, s3 + ".json"))
+
+# (h4) handback でない子の SubagentStop は今までどおり block
+d = dict(stop_hb); d["agent_transcript_path"] = os.path.join(fx, "agent_report_text.jsonl"); d["last_assistant_message"] = "done"
+s4 = put_steer("not a hand-back child", 1791400000005)
+code, out, err, dt = call(d, "--steer", "--mode", "stop", "--record")
+o = json.loads(out) if out else {}
+check(o.get("decision") == "block" and "not a hand-back child" in o.get("reason", "")
+      and o["reason"].startswith("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. It reaches you now, just before you finish:"),
+      "(h4) a plain-text child: block at its end as before")
+check(lines()[-1].get("steer") == {"ids": [s4], "mode": "block", "target": CH}, "(h4) steer line mode block")
+
+# (h5) PreToolUse:SubagentHandback
+HB_HEAD = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "
+           "It reaches you now, just before you hand back your report:\n")
+HB_TAIL = ("Apply it now, continue your task, then call SubagentHandback again with your updated report. "
+           "Mention this instruction and what you changed because of it in your final report.")
+# --handback 無しの起動（matcher 無しの門番）は即 exit 0・記録なし（止まれ・未配達があっても）
+s5 = put_steer("wait for the matcher hook", 1791400000006)
+put_pause(at="next")
+n0 = len(lines())
+for args in (["--steer", "--mode", "stop", "--pause", "--max-wait", "10"], ["--steer", "--mode", "deny", "--pause", "--max-wait", "10"]):
+    code, out, err, dt = call(pre_hb, *args)
+    check(code == 0 and out == "" and err == "" and dt < 1.0 and len(lines()) == n0,
+          "(h5) no --handback (%s): exit 0 at once, nothing written (%.2f s)" % (args[2], dt))
+check(os.path.exists(PF) and os.path.exists(os.path.join(sdir, s5 + ".json")), "(h5) no --handback: pause and instruction files untouched")
+# --handback relay ＋止まれ（at = next）→ 待つ・解けたら stdout 空・ファイルは残る
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "relay", "--pause", "--max-wait", "10", later=(0.3, rm(PF)))
+new = lines()[n0:]
+check(code == 0 and out == "" and 0.25 <= dt < 1.2, "(h5) --handback relay + pause at next: waits, resumes with stdout empty (%.2f s)" % dt)
+check([l["pause"]["phase"] for l in new if "pause" in l] == ["hit", "released"] and not any("steer" in l for l in new),
+      "(h5) relay: hit + released, no steer line")
+check(new and new[0].get("tool_name") == "SubagentHandback" and new[0]["pause"].get("at") == "next", "(h5) hit line carries tool_name SubagentHandback")
+check(os.path.exists(os.path.join(sdir, s5 + ".json")), "(h5) relay: the instruction stays pending (relayed by Neovim)")
+# 関門（at = stop）でも handback の直前で止まる
+pid = put_pause(at="stop", kind="gate")
+n0 = len(lines())
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "relay", "--pause", "--max-wait", "10", later=(0.3, rm(PF)))
+new = lines()[n0:]
+check(out == "" and 0.25 <= dt < 1.2 and [l["pause"]["phase"] for l in new if "pause" in l] == ["hit", "released"]
+      and new[0]["pause"].get("kind") == "gate" and new[0]["pause"].get("at") == "stop",
+      "(h5) a gate (at = stop) holds just before the hand-back (%.2f s)" % dt)
+# 普通の道具（Write）では at = stop の止まれで止まらない（今までどおり）
+pid = put_pause(at="stop", kind="gate")
+code, out, err, dt = call(pl[5], "--steer", "--mode", "stop", "--handback", "relay", "--pause", "--max-wait", "10")
+check(out == "" and dt < 1.0 and os.path.exists(PF), "(h5) at = stop does not hold an ordinary tool, even with --handback")
+os.remove(PF)
+# 止まれ無し・--handback relay → 何もせず抜ける（未配達があっても配達しない）
+n0 = len(lines())
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "relay", "--pause", "--max-wait", "10")
+check(out == "" and len(lines()) == n0 and os.path.exists(os.path.join(sdir, s5 + ".json")), "(h5) relay, no pause: nothing delivered, nothing written")
+# --handback deny ＋未配達 → deny、文は §3.3、止まっていた時間の行は無し
+n0 = len(lines())
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "deny", "--pause", "--max-wait", "10")
+h = (json.loads(out) if out else {}).get("hookSpecificOutput") or {}
+check(h.get("hookEventName") == "PreToolUse" and h.get("permissionDecision") == "deny"
+      and h.get("permissionDecisionReason") == HB_HEAD + "wait for the matcher hook\n" + HB_TAIL,
+      "(h5) --handback deny: deny with the before-hand-back text, no paused-for line")
+for phrase in ("not a tool error", "treat this as a test", "really from", "trust", "genuine", "do not ignore"):
+    check(phrase not in (h.get("permissionDecisionReason") or "").lower(), "(h5) no reassurance wording (%r)" % phrase)
+check(lines()[n0:] and lines()[-1].get("steer") == {"ids": [s5], "mode": "deny", "target": CH}
+      and lines()[-1].get("tool_name") == "SubagentHandback", "(h5) deny: steer line mode deny, tool_name SubagentHandback")
+check(os.path.exists(os.path.join(sdir, s5 + ".delivered.json")), "(h5) deny: the file is renamed .delivered.json")
+# --handback deny ＋止まれ（関門）＋未配達、0.3 秒後に rm → その場で deny＋止まっていた時間の行
+s6 = put_steer("fix the report", 1791400000007)
+pid = put_pause(at="stop", kind="gate")
+n0 = len(lines())
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "stop", "--handback", "deny", "--pause", "--max-wait", "10", later=(0.3, rm(PF)))
+r = ((json.loads(out) if out else {}).get("hookSpecificOutput") or {}).get("permissionDecisionReason") or ""
+new = lines()[n0:]
+check(r == HB_HEAD + "(You were paused by the user for 0 s before this instruction.)\nfix the report\n" + HB_TAIL,
+      "(h5) deny after a gate: the paused-for line right after the header")
+check([("pause" in l and l["pause"]["phase"]) or ("steer" in l and "steer") for l in new] == ["hit", "released", "steer"]
+      and new[1]["pause"].get("steer_ids") == [s6], "(h5) deny after a gate: hit, released (steer_ids), steer")
+# mode context でも handback の直前は deny（allow では番が終わって届かない）
+s7 = put_steer("context mode", 1791400000008)
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "context", "--handback", "deny")
+h = (json.loads(out) if out else {}).get("hookSpecificOutput") or {}
+check(h.get("permissionDecision") == "deny" and "context mode" in h.get("permissionDecisionReason", ""), "(h5) mode context + --handback deny: still deny")
+# 知らない語の --handback は無いのと同じ
+s8 = put_steer("bogus", 1791400000009)
+code, out, err, dt = call(pre_hb, "--steer", "--mode", "deny", "--handback", "bogus")
+check(out == "" and os.path.exists(os.path.join(sdir, s8 + ".json")), "(h5) unknown --handback word: treated as absent")
 sys.exit(1 if bad else 0)
 PY
 

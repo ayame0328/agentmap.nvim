@@ -36,6 +36,7 @@ local notice_done = {} -- { [sid] = { [steer_id] = true } } 親への知らせ�
 local pause_seen = {} -- { [sid] = { [pause_id] = status } } 一時停止の状態の変わり目を知らせ済み
 local relay_seen = {} -- { [sid] = { [steer_id] = true } } 「親が渡した」「終わり際に届いた」を知らせ済み
 local not_held_seen = {} -- { [sid] = { [steer_id] = true } } 「届けたが止められなかった」を知らせ済み
+local skipped_seen = {} -- { [sid] = { [steer_id] = true } } 終わり際で見送られた（handback）指示を親経由に回した・知らせた
 
 local VIEWS = {
   detail = "agentmap.views.detail",
@@ -1132,6 +1133,7 @@ end
 local STEER_DEFAULTS = {
   enabled = true, mode = "stop", relay = "menu", root_via = "terminal", no_terminal = "stop",
   submit_delay_ms = 300, input = "window", text_max = 4000,
+  handback = "relay", handback_reroute = true,
 }
 local STEER_PREFIX = "[AgentMap] " -- 端末へ送る文の先頭（固定。state が「流れの続き」の判定に使う）
 local FINISHED = { DONE = true, REWORK = true, FAILED = true }
@@ -1154,6 +1156,20 @@ local STEER_TEXT = {
   ["ui.steer_relayed"] = "The main agent passed your instruction on to %{label} (SendMessage)",
   ["ui.steer_not_relayed"] = "The main agent ended its turn without passing your instruction on to %{label}",
   ["ui.steer_delivered_stop"] = "%{label} received your instruction at its end and continues",
+  -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback 付録 A・§5.5）
+  ["ui.steer_write_relay_hb"] = "Write and relay now through the main agent (this agent reports through SubagentHandback)",
+  ["ui.steer_write_hb_deny"] = "Write; handed over just before it hands back (as a tool result; may be ignored)",
+  ["ui.steer_write_hb_pending"] = "Write; it cannot reach this agent at its end (relayed when the main agent's terminal is here)",
+  ["ui.pause_fix_relay_hb"] = "Fix: let it hand back, then relay the text (it starts again)",
+  ["ui.steer_relay_hb"] = "%{label} reports through SubagentHandback, so the text goes through the main agent: it arrives at its next tool call, or it starts again after finishing",
+  ["ui.steer_resumed_relay"] = "%{label} resumed; the text goes through the main agent (next tool call, or it starts again after finishing)",
+  ["ui.steer_hb_pending"] = "%{label} reports through SubagentHandback; the text cannot reach it at its end. It will be relayed when the main agent's terminal is here, else expire",
+  ["ui.steer_hb_deny"] = "%{label} reports through SubagentHandback; the text will be handed over just before it hands back, as a tool result (current models may ignore it)",
+  ["ui.steer_rerouted_hb"] = "%{label} had already reported through SubagentHandback; relaying through the main agent (it starts again)",
+  ["ui.steer_skipped_hb"] = "%{label} had already reported through SubagentHandback; the text could not be delivered (no main-agent terminal here)",
+  ["ui.steer_not_held_hb"] = "%{label} was not held: it had already reported through SubagentHandback",
+  ["ui.pause_hit_hb"] = "%{label} stopped just before handing back its report (x: pass / s: fix)",
+  ["ui.pause_fixed_relay_hb"] = "%{label} passed; the text goes through the main agent and it starts again",
   ["steer.relay_en"] = '[AgentMap] Tell sub-agent [%{index}] "%{name}" (agent id %{id}) this, with SendMessage: %{text}',
   ["steer.relay_ja"] = "[AgentMap] サブエージェント [%{index}]「%{name}」（agent id %{id}）に SendMessage で次を伝えてください：%{text}",
 }
@@ -1184,6 +1200,8 @@ function M.steer_cfg()
   end
   if cfg.no_terminal == "hook" then cfg.no_terminal = "stop" end
   if cfg.relay ~= "never" and cfg.relay ~= "always" then cfg.relay = "menu" end
+  if cfg.handback ~= "deny" then cfg.handback = "relay" end
+  cfg.handback_reroute = cfg.handback_reroute ~= false
   cfg.at_stop = nil
   return cfg
 end
@@ -1208,13 +1226,55 @@ local function label_of(id)
 end
 M._steer_label = label_of
 
+-- 報告を返す道具（DESIGN-v0.1.2-handback）。この道具の直前で止まっていれば「終わり際」
+local HB_VIA = "PreToolUse:SubagentHandback"
+
+-- 止まれが「終わり際」で握っているか（関門・ROOT の Stop・報告を SubagentHandback で返す直前）。
+-- 普通の道具の PreToolUse で止まっているなら false（state.held_at_end と同じ規則に、関門を足したもの）
+local function held_at_end(p)
+  if p == nil or p.status ~= "PAUSED" then return false end
+  local via = tostring(p.hit_via or "")
+  return p.kind == "gate" or via == HB_VIA or not via:find("^PreToolUse")
+end
+
+--- True when sub-agent `id` reports through SubagentHandback, or probably does
+--- (DESIGN-v0.1.2-handback §3.1, §3.4): state.handback_likely when it exists; else a.handback
+--- (set from the records), a pause held at PreToolUse:SubagentHandback, or, while nothing is known
+--- about the agent (a.handback == nil), the run's permission mode "auto" for a non-fork agent.
+--- Always false for ROOT and unknown ids.
+---@param id string
+---@return boolean
+function M.handback_likely(id)
+  if type(id) ~= "string" or id == "ROOT" then return false end
+  local s = M.run and M.run.state
+  local a = type(s) == "table" and type(s.agents) == "table" and s.agents[id] or nil
+  if type(a) ~= "table" then return false end
+  if a.handback == true then return true end
+  local p = M._live_pause(id)
+  if p and p.hit_via == HB_VIA then return true end
+  if type(state_mod.handback_likely) == "function" then
+    local ok, r = pcall(state_mod.handback_likely, s, a)
+    if ok and type(r) == "boolean" then return r end
+  end
+  return a.handback == nil and s.permission_mode == "auto" and a.agent_type ~= "fork"
+end
+
 --- How a steering instruction to `id` is delivered: "root" (the terminal), "redo" (a finished
---- agent: ask the main agent in the terminal to redo it) or "hook" (a file a hook hands over when
---- the agent tries to finish; DESIGN-v0.1.2-steer2 §2).
+--- agent: ask the main agent in the terminal to redo it), "hook" (a file a hook hands over when
+--- the agent tries to finish; DESIGN-v0.1.2-steer2 §2) or "relay" (through the main agent; only
+--- for a sub-agent that reports through SubagentHandback, see below).
 ---   A sub-agent held by a pause gets "hook" (also one waiting at its end at the gate: its stop is
 ---   already recorded, so it looks finished). ROOT paused before a tool call gets "root" (the pause
 ---   is lifted first, then the terminal; Q23); ROOT paused at its end or with a pause placed gets
 ---   "hook" (its Stop hook hands the text over).
+---
+--- A sub-agent that reports through SubagentHandback (Claude Code's auto mode; M.handback_likely)
+--- cannot be held at its end: Claude Code discards the block (DESIGN-v0.1.2-handback §1). For it
+--- the answer is "relay" (typed into ROOT's terminal for SendMessage) whenever relay is possible
+--- (M.handback_relay_ok); a paused one is resumed first. Held just before its hand-back (the gate or
+--- a pause at PreToolUse:SubagentHandback) with `steer.handback = "deny"`, it gets "hook" (the
+--- waiting hook hands the text over as a tool result). Without relay it gets "hook": the file waits,
+--- and if it is skipped at the agent's end it is relayed later (M.reroute_skipped) or expires.
 function M.steer_kind(id)
   local p = M._live_pause(id)
   if id == "ROOT" then
@@ -1222,9 +1282,15 @@ function M.steer_kind(id)
     if p.status == "PAUSED" and tostring(p.hit_via or ""):sub(1, 10) == "PreToolUse" then return "root" end
     return "hook"
   end
-  if p and p.status == "PAUSED" then return "hook" end
+  local hb = M.handback_likely(id)
+  if p and p.status == "PAUSED" then
+    if hb and held_at_end(p) and M.steer_cfg().handback == "deny" then return "hook" end
+    if hb and M.handback_relay_ok(id) then return "relay" end
+    return "hook"
+  end
   local a = agent_of(id) or (M.run and M.run.state and M.run.state.agents and M.run.state.agents[id])
   if a and FINISHED[a.status] then return "redo" end
+  if hb and M.handback_relay_ok(id) then return "relay" end
   return "hook"
 end
 
@@ -1437,15 +1503,20 @@ end
 --- the line typed into its terminal would sit there until it resumes, and the map does not resume
 --- a main agent the user stopped; `opts.ignore_root_pause` skips this last test). The terminal is
 --- checked separately (terminal_present).
+--- A box held by the gate just before it hands back through SubagentHandback has not finished and
+--- is accepted (DESIGN-v0.1.2-handback §3.4). `opts.allow_finished` accepts a finished box too:
+--- an instruction skipped at the end of a hand-back sub-agent is relayed and the agent starts
+--- again under the same id (§3.6).
 ---@param id string
----@param opts? { ignore_root_pause?: boolean }
+---@param opts? { ignore_root_pause?: boolean, allow_finished?: boolean }
 function M.relay_target_ok(id, opts)
   if M.steer_cfg().relay == "never" then return false end
   if type(id) ~= "string" or id == "ROOT" or run_ended() then return false end
   local a = M.run and M.run.state and M.run.state.agents and M.run.state.agents[id]
-  if type(a) ~= "table" or a.parent_id ~= "ROOT" or FINISHED[a.status] then return false end
+  if type(a) ~= "table" or a.parent_id ~= "ROOT" then return false end
+  if FINISHED[a.status] and not (opts and opts.allow_finished) then return false end
   local p = M._live_pause(id)
-  if p and p.kind == "gate" and p.status == "PAUSED" then return false end
+  if p and p.kind == "gate" and p.status == "PAUSED" and p.hit_via ~= HB_VIA then return false end
   if not (opts and opts.ignore_root_pause) and M._live_pause("ROOT") then return false end
   return true
 end
@@ -1459,6 +1530,15 @@ end
 --- True when the `s` menu offers "relay now through the main agent" for box `id`.
 function M.relay_available(id)
   return M.relay_target_ok(id) and M.terminal_present()
+end
+
+--- True when an instruction for hand-back sub-agent `id` can go through the main agent now
+--- (DESIGN-v0.1.2-handback §3.4: ROOT's terminal is here, a direct sub-agent of ROOT, the run goes
+--- on, the main agent is not paused). Same test as relay_available; `opts.allow_finished` for the
+--- automatic relay of an instruction skipped at the agent's end.
+---@param opts? { allow_finished?: boolean }
+function M.handback_relay_ok(id, opts)
+  return M.relay_target_ok(id, opts) and M.terminal_present()
 end
 
 --- The line typed into the main agent's terminal for a relay, without the leading "[AgentMap] "
@@ -1498,48 +1578,55 @@ end
 M._eta_suffix = eta_suffix
 
 -- 親経由（relay）：ROOT の端末に「子へ SendMessage で伝えて」と打つ（DESIGN-v0.1.2-steer2 §4）
-local function via_relay(ev, cfg, aid, text, prompt_id, done)
-  if not M.relay_target_ok(aid) then
+-- ro（任意）: allow_finished（終わった箱も可。skipped の自動の親経由）、rerouted_from（元の指示の id）、
+-- no_pick（同点の端末を選ばせない）、notice（打てたときの知らせの文。既定は ui.steer_relay_sent）、quiet（知らせない）。
+-- done(result, steer_id) は 1 回だけ呼ぶ
+local function via_relay(ev, cfg, aid, text, prompt_id, done, ro)
+  ro = ro or {}
+  if not M.relay_target_ok(aid, { allow_finished = ro.allow_finished }) then
+    local warn = ro.quiet and function() end or function(msg) notify(msg, vim.log.levels.WARN) end
     if run_ended() then
-      notify(t("ui.steer_run_ended"), vim.log.levels.WARN)
+      warn(t("ui.steer_run_ended"))
       return done("ended")
     end
     -- 親が止まっている（止まれを置いた・止まった）：打った文は親が再開するまで端末に残るだけで、子には渡らない。
     -- 作者が止めた親を勝手に動かさないので、理由を言って断る（終わり際の経路か、先に親を再開してもらう）
     if M.relay_root_paused(aid) then
-      notify(st_text("ui.steer_relay_root_paused"), vim.log.levels.WARN)
+      warn(st_text("ui.steer_relay_root_paused"))
       return done("root_paused")
     end
-    notify(st_text("ui.steer_relay_not_target"), vim.log.levels.WARN)
+    warn(st_text("ui.steer_relay_not_target"))
     return done("not_target")
   end
   pick_terminal(function(cand, term)
     local line = term.sanitize(STEER_PREFIX .. M.relay_text(aid, text))
-    local sid = request(ev, aid, text, { via = "relay", relay_line = line, kind = "steer", prompt_id = prompt_id })
+    local sid = request(ev, aid, text, { via = "relay", relay_line = line, kind = "steer", prompt_id = prompt_id,
+      rerouted_from = ro.rerouted_from })
     if not sid then
-      notify(t("ui.steer_disabled"), vim.log.levels.WARN)
+      if not ro.quiet then notify(t("ui.steer_disabled"), vim.log.levels.WARN) end
       return done(nil)
     end
     if not term.send(cand.job, line, { delay_ms = cfg.submit_delay_ms }) then
       if ev.cancel_steer then pcall(ev.cancel_steer, M.run, sid) end
-      notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN)
+      if not ro.quiet then notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN) end
       return done("no_terminal")
     end
     if ev.mark_steer_sent then pcall(ev.mark_steer_sent, M.run, sid) end
     -- 止まっている子は、伝言を次の道具の切れ目で受け取れるように止まれを解く。止まれを置いただけ（REQUESTED）の
     -- 子は取り下げる（残すと次の道具の直前で止まり、伝言は再開まで届かない。hooks の経路と同じ扱い）。関門は残す
+    -- （ただし報告を SubagentHandback で返す直前で関門に止まっている子は通す：報告してから再開して受け取る。H9）
     local p = M._live_pause(aid)
-    if p and (p.status == "PAUSED" or p.status == "REQUESTED") and p.kind ~= "gate" then
+    if p and (p.status == "PAUSED" or p.status == "REQUESTED") and (p.kind ~= "gate" or p.hit_via == HB_VIA) then
       M._resume_raw(aid, { reason = "user" })
     end
-    notify(st_text("ui.steer_relay_sent"))
+    if not ro.quiet then notify(ro.notice or st_text("ui.steer_relay_sent")) end
     after_steer()
-    return done("relayed")
+    return done("relayed", sid)
   end, function(cancelled)
     if cancelled then return done(nil) end
-    notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN)
+    if not ro.quiet then notify(st_text("ui.steer_relay_no_terminal"), vim.log.levels.WARN) end
     return done("no_terminal")
-  end)
+  end, ro.no_pick)
 end
 
 --- Send a steering instruction `text` for box `id`, choosing the route from the box
@@ -1548,13 +1635,17 @@ end
 --- ROOT gets it in its terminal (a ROOT paused before a tool call is resumed first; without a
 --- terminal, at the end of its turn); a finished agent is redone by asking ROOT in its terminal.
 --- With `opts.route = "relay"` it is typed into ROOT's terminal for ROOT to pass on with SendMessage.
+--- A sub-agent that reports through SubagentHandback gets the relay by itself when it is possible
+--- (steer_kind "relay"; a paused one is resumed first, one held just before its hand-back passes and
+--- starts again after reporting; DESIGN-v0.1.2-handback §3.4). `opts.route = "hook"` places the
+--- file instead (the `steer.handback = "deny"` item of the menu).
 ---@param id string agent id (gate: ids are accepted)
 ---@param text string
 ---@param cb? fun(result: string|nil) "queued" | "sent" | "relayed" | "fallback_hook" | "clipboard"
 ---   | "none" | "empty" | "outdated" (hooks route, but the registered hooks are outdated or use another
 ---   mode: nothing sent) | "ended" (terminal route, but the run has ended: nothing sent)
 ---   | "no_terminal" / "not_target" / "root_paused" (relay not possible; the last: the main agent is paused) | nil
----@param opts? { route?: "relay" }
+---@param opts? { route?: "relay"|"hook" }
 ---@return string|nil result (nil while waiting for the user to pick a terminal)
 function M.steer_send(id, text, cb, opts)
   opts = opts or {}
@@ -1593,6 +1684,21 @@ function M.steer_send(id, text, cb, opts)
     return result
   end
   local kind = M.steer_kind(aid)
+  if kind == "relay" and opts.route == "hook" then kind = "hook" end
+  -- 報告を SubagentHandback で返す子への親経由（DESIGN-v0.1.2-handback §3.4）。止まっている子は先に解く：
+  -- 普通の道具の前なら次の道具の切れ目で、報告の直前（関門・x）なら報告してから同じ id で再開して受け取る（H7・H9）
+  if kind == "relay" then
+    local p = M._live_pause(aid)
+    local notice = st_text("ui.steer_relay_hb", { label = label_of(aid) })
+    if p and p.status == "PAUSED" then
+      local at_end = held_at_end(p)
+      if M._resume_raw(aid, { reason = "user" }) then
+        notice = st_text(at_end and "ui.pause_fixed_relay_hb" or "ui.steer_resumed_relay", { label = label_of(aid) })
+      end
+    end
+    via_relay(ev, cfg, aid, text, prompt_id, done, { notice = notice })
+    return result
+  end
   -- hooks で届ける経路：登録が古い・届け方が違うと終わり際に届かないので、送らずに知らせる（Q22。端末へ送る経路は関係ない）
   if kind == "hook" or (kind == "root" and cfg.root_via == "hook") then
     if not M.steer_hooks_ok() then
@@ -1609,14 +1715,21 @@ function M.steer_send(id, text, cb, opts)
     local held = M._live_pause(aid)
     local held_status = held and held.status
     -- 関門・ROOT の Stop で止まっている：待っている hook がその場で渡す。PreToolUse で止まっている子：解いて続けさせ、終わり際に届く
-    local at_end = held and (held.kind == "gate" or not tostring(held.hit_via or ""):find("^PreToolUse"))
+    local at_end = held_at_end(held)
     local sid = request(ev, aid, text, { via = "hook", kind = "steer", prompt_id = prompt_id })
     if not sid then
       notify(t("ui.steer_disabled"), vim.log.levels.WARN)
       return done(nil)
     end
+    -- 報告を SubagentHandback で返す子：終わり際の block は捨てられる。置いたうえで正直に知らせる
+    -- （deny の設定なら報告の直前にツールの結果として渡る。relay なら skipped になったとき親経由に回すか期限切れ）
+    local hb_key = M.handback_likely(aid) and (cfg.handback == "deny" and "ui.steer_hb_deny" or "ui.steer_hb_pending")
     -- 止まれのある宛先：指示のファイルを置いた**後で**止まれを消す（hook は止まれが消えた後に指示を取りに行く）
-    if held and M._resume_raw(aid, { reason = "user", steer_id = sid }) and held_status == "PAUSED" then
+    local resumed = held and M._resume_raw(aid, { reason = "user", steer_id = sid }) and held_status == "PAUSED"
+    if hb_key then
+      if resumed then notify(pt("ui.pause_resumed", { label = label_of(aid) })) end
+      notify(st_text(hb_key, { label = label_of(aid) }))
+    elseif resumed then
       if at_end then
         notify(pt("ui.pause_resumed_with", { label = label_of(aid) }))
       else
@@ -1659,15 +1772,12 @@ end
 
 local input_seq = 0
 
--- 止まれが「終わり際」で握っているか（関門・ROOT の Stop）。PreToolUse で止まっているなら false
-local function held_at_end(p)
-  return p ~= nil and p.status == "PAUSED" and (p.kind == "gate" or not tostring(p.hit_via or ""):find("^PreToolUse"))
-end
-
 -- 入力の窓の題（DESIGN-v0.1.2-steer2 §7.1）
 local function input_title(aid, kind, route)
   local label = label_of(aid)
-  if route == "relay" then return st_text("ui.steer_prompt_relay", { label = label }) end
+  if route == "relay" or kind == "relay" then return st_text("ui.steer_prompt_relay", { label = label }) end
+  -- 報告を SubagentHandback で返す子に置く指示：終わり際には届かないので「終わり際」と書かない
+  if kind == "hook" and M.handback_likely(aid) then return t("ui.steer_prompt", { label = label }) end
   if kind == "root" then
     if M.steer_cfg().root_via ~= "hook" and M.terminal_present() then
       return t("ui.steer_prompt", { label = "ROOT (terminal)" })
@@ -1684,7 +1794,8 @@ end
 --- Open the instruction editor for `id` (a small floating window; steer.input = "line" uses
 --- vim.ui.input). <C-s>, :w or <CR> in normal mode sends, q / <Esc> cancels.
 ---@param on_submit? fun(text: string) default: M.steer_send(id, text, nil, { route = route })
----@param route? "relay" relay through the main agent (DESIGN-v0.1.2-steer2 §4); refused when not possible
+---@param route? "relay"|"hook" "relay": through the main agent (DESIGN-v0.1.2-steer2 §4), refused when
+---  not possible; "hook": place the file even for a hand-back sub-agent (DESIGN-v0.1.2-handback §5.1)
 ---@return integer|nil buf, integer|nil win
 function M.steer_input(id, on_submit, route)
   local aid = M.steer_target(id)
@@ -1707,6 +1818,7 @@ function M.steer_input(id, on_submit, route)
   on_submit = on_submit or function(text) M.steer_send(aid, text, nil, { route = route }) end
   local cfg = M.steer_cfg()
   local kind = M.steer_kind(aid)
+  if kind == "relay" and route == "hook" then kind = "hook" end
   local title = input_title(aid, kind, route)
   if cfg.input == "line" then
     vim.ui.input({ prompt = title .. ": " }, function(text)
@@ -1789,6 +1901,11 @@ end
 --- without one) or ask the parent to redo a finished box; for a running direct sub-agent of ROOT,
 --- when ROOT's terminal is here, also "relay now through the main agent" (first with
 --- steer.relay = "always"); cancel pending instructions; show the steering history.
+--- A sub-agent that reports through SubagentHandback (DESIGN-v0.1.2-handback §5.1) gets no
+--- "at its end" item: relay through the main agent comes first when possible ("let it hand back,
+--- then relay" while it is held just before its hand-back); otherwise the item says honestly that
+--- the text cannot reach it at its end (or, with steer.handback = "deny", that it is handed over
+--- just before the hand-back as a tool result).
 function M.steer_menu(id)
   local cfg = M.steer_cfg()
   if not cfg.enabled then
@@ -1807,7 +1924,24 @@ function M.steer_menu(id)
     return
   end
   local first
-  if kind == "redo" then
+  local first_act = "write"
+  local items, acts
+  -- 報告を SubagentHandback で返す子（DESIGN-v0.1.2-handback §5.1、Q24・Q25）：終わり際の項目は出さない
+  local hb = kind ~= "redo" and M.handback_likely(aid)
+  local deny_item = false
+  if hb then
+    local at_end = held_at_end(M._live_pause(aid))
+    if kind == "relay" then
+      -- 親経由できる：1 番が親経由（関門・報告の直前で止まっていれば「通してから親経由」）。deny の設定なら 2 番に報告の直前
+      first = st_text(at_end and "ui.pause_fix_relay_hb" or "ui.steer_write_relay_hb")
+      deny_item = cfg.handback == "deny"
+    elseif at_end and cfg.handback == "deny" then
+      first = st_text("ui.steer_write_gate") -- 待っている hook がその場で渡す
+    else
+      first = st_text(cfg.handback == "deny" and "ui.steer_write_hb_deny" or "ui.steer_write_hb_pending")
+      first_act = "write_hook"
+    end
+  elseif kind == "redo" then
     first = t("ui.steer_redo")
   elseif kind == "root" then
     local term_ok = cfg.root_via ~= "hook" and M.terminal_present()
@@ -1824,8 +1958,12 @@ function M.steer_menu(id)
       first = t("ui.steer_write")
     end
   end
-  local items, acts = { first }, { "write" }
-  if M.relay_available(aid) then
+  items, acts = { first }, { first_act }
+  if deny_item then
+    items[#items + 1] = st_text("ui.steer_write_hb_deny")
+    acts[#acts + 1] = "write_hook"
+  end
+  if not hb and M.relay_available(aid) then
     if cfg.relay == "always" then
       table.insert(items, 1, st_text("ui.steer_relay"))
       table.insert(acts, 1, "relay")
@@ -1855,6 +1993,8 @@ function M.steer_menu(id)
     local act = idx and acts[idx]
     if act == "write" then
       M.steer_input(aid)
+    elseif act == "write_hook" then
+      M.steer_input(aid, nil, "hook")
     elseif act == "relay" then
       M.steer_input(aid, nil, "relay")
     elseif act == "cancel" then
@@ -1894,9 +2034,11 @@ function M._seed_expired()
   local s = M.run and M.run.state
   local sid = M.run and M.run.sid
   if not sid then return end
-  local seen, done, relayed, unheld = {}, {}, {}, {}
+  local seen, done, relayed, unheld, skipped = {}, {}, {}, {}, {}
   for k, st in pairs(s and type(s.steers) == "table" and s.steers or {}) do
     if st.status == "EXPIRED" then seen[k] = true end
+    -- 開く前に終わり際で見送られた指示は、今さら親経由に回さない（見ていない間のことは分からない）
+    if st.skipped_at or st.skip_reason then skipped[k] = true end
     -- 開いた時点でもう届いていた指示の知らせは、今さら作らない（見ていない間のことは分からない）
     if st.status == "DELIVERED" then done[k] = true end
     if st.relayed_at or (st.status == "DELIVERED" and st.via ~= "relay") then relayed[k] = true end
@@ -1906,6 +2048,7 @@ function M._seed_expired()
   notice_done[sid] = done
   relay_seen[sid] = relayed
   not_held_seen[sid] = unheld
+  skipped_seen[sid] = skipped
 end
 
 --- Notify (once each) steering instructions that expired without being delivered.
@@ -1969,7 +2112,8 @@ function M.notify_relays()
     -- 終わり際に届けたが止められなかった（連続の上限。state が親の記録から判定する）：配達の知らせの後で 1 回
     if type(st) == "table" and st.held == false and unheld and not unheld[k] and (st.kind or "steer") == "steer" then
       unheld[k] = true
-      notify(st_text("ui.steer_not_held", { label = label_of(st.agent_id) }), vim.log.levels.WARN)
+      local key = st.held_reason == "handback" and "ui.steer_not_held_hb" or "ui.steer_not_held"
+      notify(st_text(key, { label = label_of(st.agent_id) }), vim.log.levels.WARN)
       n = n + 1
     end
   end
@@ -2063,12 +2207,71 @@ function M.notify_parents()
   return n
 end
 
+--- Instructions skipped at the end of a sub-agent that reported through SubagentHandback (the
+--- collector did not hand them over: Claude Code would discard the block; DESIGN-v0.1.2-handback
+--- §3.6, Q26). Once each, for skips seen while the map is open: with `steer.handback_reroute` and
+--- relay possible (ROOT's terminal here, a direct sub-agent of ROOT, the run goes on, the main agent
+--- not paused) the text is typed into ROOT's terminal for SendMessage, which starts the agent again
+--- under the same id, and the original instruction is cancelled as "rerouted"; otherwise the user
+--- is told it could not be delivered (it expires by the usual rule).
+---@return integer number of instructions relayed
+function M.reroute_skipped()
+  local s = M.run and M.run.state
+  local sid = M.run and M.run.sid
+  if not s or not sid or type(s.steers) ~= "table" then return 0 end
+  local seen = skipped_seen[sid]
+  if not seen then
+    M._seed_expired()
+    return 0
+  end
+  local cfg = M.steer_cfg()
+  if not cfg.enabled then return 0 end
+  local ev = events_mod()
+  local list = {}
+  for k, st in pairs(s.steers) do
+    if type(st) == "table" and st.status == "PENDING" and (st.skipped_at or st.skip_reason == "handback")
+      and not seen[k] and not st.rerouted_to and (st.kind or "steer") == "steer" then
+      list[#list + 1] = k
+    end
+  end
+  table.sort(list, function(x, y)
+    return tostring(s.steers[x].requested_at or "") < tostring(s.steers[y].requested_at or "")
+  end)
+  local n = 0
+  for _, k in ipairs(list) do
+    seen[k] = true
+    local st = s.steers[k]
+    local aid = st.agent_id
+    local label = label_of(aid)
+    -- 期限切れの知らせ（届きませんでした）とは重ねない：ここで知らせる
+    if expired_seen[sid] then expired_seen[sid][k] = true end
+    local relayed = false
+    if ev and cfg.handback_reroute and M.handback_relay_ok(aid, { allow_finished = true }) then
+      via_relay(ev, cfg, aid, st.text or "", st.prompt_id, function(r, new_id)
+        if r ~= "relayed" then return end
+        relayed = true
+        if ev.cancel_steer then pcall(ev.cancel_steer, M.run, k, { reason = "rerouted", rerouted_to = new_id }) end
+      end, { allow_finished = true, rerouted_from = k, no_pick = true, quiet = true })
+    end
+    if relayed then
+      n = n + 1
+      notify(st_text("ui.steer_rerouted_hb", { label = label }))
+    else
+      notify(st_text("ui.steer_skipped_hb", { label = label }), vim.log.levels.WARN)
+    end
+  end
+  return n
+end
+
 --- Expire undelivered instructions whose agent finished (events.sweep_steers), tell the user,
 --- and pass delivered instructions on to the parent (notify_parents).
 ---@return boolean changed
 function M.sweep_steers()
   local ev = try_require("agentmap.events")
   local changed = false
+  -- 期限切れにする前に：終わり際で見送られた指示を親経由に回す（宛先が終わった数秒後に片付けられるため先に）
+  local okr, nr = pcall(M.reroute_skipped)
+  if okr and type(nr) == "number" and nr > 0 then changed = true end
   if ev and ev.sweep_steers and M.run then
     local ok, r = pcall(ev.sweep_steers, M.run)
     changed = ok and r == true
@@ -2181,6 +2384,7 @@ local function restate(aid, p)
   local cfg = M.pause_cfg()
   local label = label_of(aid)
   if p.status == "PAUSED" then
+    if p.hit_via == HB_VIA then return notify(st_text("ui.pause_hit_hb", { label = label })) end
     if p.kind == "gate" then return notify(pt("ui.pause_hit_gate", { label = label, time = clock_of(deadline_of(p)) })) end
     return notify(pt("ui.pause_hit", { label = label, via = p.hit_via or "?", time = clock_of(deadline_of(p)) }))
   end
@@ -2286,7 +2490,9 @@ end
 function M.gate_menu(id)
   local aid = M.steer_target(id)
   if not aid then return end
-  local items = { pt("ui.pause_pass"), pt("ui.pause_fix"), pt("ui.pause_keep_gate") }
+  -- 報告を SubagentHandback で返す直前で待っている子：Fix は「通してから親経由」（DESIGN-v0.1.2-handback §3.4）
+  local fix = M.steer_kind(aid) == "relay" and st_text("ui.pause_fix_relay_hb") or pt("ui.pause_fix")
+  local items = { pt("ui.pause_pass"), fix, pt("ui.pause_keep_gate") }
   vim.ui.select(items, { prompt = pt("ui.pause_prompt", { label = label_of(aid) }) }, function(_, idx)
     -- the built-in select leaves its list in the message area; clear it so that the notice of the
     -- choice (e.g. "resumed") does not end in a "Press ENTER" prompt
@@ -2410,6 +2616,8 @@ end
 local function pause_message(p)
   local label = label_of(p.agent_id)
   if p.status == "PAUSED" then
+    -- 報告を SubagentHandback で返す直前（関門・x・stop。DESIGN-v0.1.2-handback §3.5）
+    if p.hit_via == HB_VIA then return st_text("ui.pause_hit_hb", { label = label }) end
     if p.kind == "gate" then
       return pt("ui.pause_hit_gate", { label = label, time = clock_of(deadline_of(p)) })
     end

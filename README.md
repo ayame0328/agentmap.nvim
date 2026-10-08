@@ -131,7 +131,9 @@ From 0.1.1 to 0.1.2: run `:AgentMapInstallHooks` again. The delivery hooks get `
 over at the next tool call as a tool error, which current models may ignore), and `SendMessage`
 is recorded (to confirm a relay through the main agent). Until then pausing is refused and `s` on a
 sub-agent says to run `:AgentMapInstallHooks` first; recording, steering the main agent in its
-terminal and relays keep working.
+terminal and relays keep working. The 0.1.2 registration also adds a `PreToolUse` hook for
+`SubagentHandback` (sub-agents in Claude Code's auto mode); if you installed an earlier 0.1.2
+build, run `:AgentMapInstallHooks` once more.
 
 After upgrading from 0.1.0, run `:AgentMapInstallHooks` again. Version 0.1.1 records
 TaskCreate / TaskUpdate / TaskList (the main agent's step list), adds the synchronous
@@ -311,6 +313,11 @@ require("agentmap").setup({
                                -- lines then stay unsent in Claude Code's input box, see below)
     input = "window",          -- "window" (floating editor) | "line" (vim.ui.input)
     text_max = 4000,           -- characters
+    handback = "relay",        -- sub-agents that report through SubagentHandback (auto mode):
+                               -- "relay": through the main agent when its terminal is here, else placed with
+                               -- an honest notice | "deny": else just before the hand-back, as a tool result
+                               -- (may be ignored; run :AgentMapInstallHooks after changing it)
+    handback_reroute = true,   -- relay an instruction skipped at such an agent's end (it starts again)
   },
   pause = {                    -- false = { enabled = false }
     enabled = true,            -- false: no pause in the hook command; x / X say it is off
@@ -324,7 +331,8 @@ require("agentmap").setup({
 
 `steer.mode` is written into the hook command: run `:AgentMapInstallHooks` again after changing it
 (`:checkhealth agentmap` warns when it differs, and `s` refuses the hook route until then).
-`steer.at_stop` is ignored since 0.1.2 (delivery at the end is always on).
+`steer.at_stop` is ignored since 0.1.2 (delivery at the end is always on). `steer.handback` is
+written into the hook command too.
 `pause.auto_resume_s` is written into the hook command and timeout: run `:AgentMapInstallHooks`
 after changing it.
 
@@ -410,10 +418,11 @@ is delivered depends on the box:
 
 | Box | Route | When it arrives |
 |---|---|---|
-| A running sub-agent (child, grandchild, reviewer) | **At its end.** The text waits in the run's folder. When the agent tries to finish, its `SubagentStop` hook holds the end once and hands it the text; the agent applies it, continues and finishes again. | When it tries to finish |
+| A running sub-agent that **reports with plain text** (child, grandchild, reviewer) | **At its end.** The text waits in the run's folder. When the agent tries to finish, its `SubagentStop` hook holds the end once and hands it the text; the agent applies it, continues and finishes again. | When it tries to finish |
 | The same, a direct sub-agent of the main agent, with the main agent's terminal in this Neovim | Menu item 2, **relay now through the main agent**: the text is typed into the main agent's terminal as `[AgentMap] Tell sub-agent [3] "<name>" (agent id <id>) this, with SendMessage: <text>`, and the main agent passes it on with `SendMessage`. Not offered while the main agent is paused (a pause placed or reached): the line would wait in its terminal until it resumes, and the map never resumes a main agent you stopped (`s` says so). Use the route at its end, or resume the main agent first (`x` on ROOT). | Now (the main agent's next step, then the sub-agent's next tool call) |
-| A sub-agent paused before a tool call (`[PAUSED]`) | The pause is lifted and the agent continues; the text arrives at its end, as above. | When it tries to finish |
-| A sub-agent waiting at its end (`[GATE]`, or paused when it finished) | The hook that holds it hands the text over on the spot. | Now |
+| A running sub-agent that **reports through `SubagentHandback`** (Claude Code's auto mode; see [below](#sub-agents-that-report-through-subagenthandback)) | Its end cannot be held: Claude Code discards the block. With the main agent's terminal in this Neovim, item 1 is **relay now through the main agent** (as above). Without it (no terminal, a grandchild, or the main agent paused), the text is placed and the notice says it cannot reach the agent at its end; if the agent hands back before the terminal is here, it expires (`steer.handback = "deny"` hands it over just before the hand-back instead, as a tool result). | At its next tool call, or it starts again after finishing |
+| A sub-agent paused before a tool call (`[PAUSED]`) | The pause is lifted and the agent continues; the text arrives at its end, as above. A hand-back sub-agent: resumed and relayed. | When it tries to finish |
+| A sub-agent waiting at its end (`[GATE]`, or paused when it finished) | The hook that holds it hands the text over on the spot. A hand-back sub-agent waits just before it hands back; Fix lets the report go, relays the text, and the agent starts again. | Now |
 | The main agent (ROOT) | **Terminal.** The text is typed into the `:terminal` running `claude` in this Neovim, as `[AgentMap] <text>` followed by Enter. Claude Code reads text typed while it works at its next step; if it is idle, the text starts a new turn. Paused before a tool call: the pause is lifted first. | Its next step |
 | The main agent, no Claude terminal here | Its `Stop` hook holds the end of its turn once and hands it the text (`steer.no_terminal = "stop"`). | The end of its turn |
 | A finished agent (`DONE` / `REWORK` / `FAILED`) | **Redo request** to the main agent's terminal: `[AgentMap] Please redo agent [3] "<name>" (id …, finished 10:31): <text>. Use the same delegation; report what changed.` Nothing is marked as rework automatically; the main agent decides. | — |
@@ -472,6 +481,10 @@ What to know:
   the instruction shows `NOT HELD` with ` ✎!`, and you get a notice. Without such a record (the
   main agent's own turn, or a notice that never comes) the map cannot tell: the instruction stays
   `DELIVERED` and the box keeps looking busy until the next record.
+- **NOT HELD (hand-back).** Records written by the 0.1.2 hooks before hand-back support claimed
+  `DELIVERED` at the end of a sub-agent that reports through `SubagentHandback`, although Claude
+  Code discarded it. The map settles these from the parent's hand-back notice: the box goes back to
+  `DONE` and the instruction shows `NOT HELD (hand-back: it had already reported)` with ` ✎!`.
 - No Claude terminal (for example Claude Code runs in another terminal window): an instruction for
   the main agent arrives at the end of its turn (`steer.no_terminal = "stop"`), is copied to the
   clipboard (`"clipboard"`), or is not sent (`"none"`); relay is not offered. The Claude terminal in
@@ -505,6 +518,43 @@ What to know:
   typed into the terminal is kept in `events.jsonl`. Any process running as your user can write
   these files (an agent's Bash included), so read the delivered text in the detail view if
   something looks odd.
+
+### Sub-agents that report through SubagentHandback
+
+In Claude Code's **auto** permission mode (`permissions.defaultMode = "auto"`, with a main model
+that supports it, such as Sonnet; Haiku as the main model turns auto mode off), sub-agents other
+than forks end by calling the `SubagentHandback` tool, which hands their report to the parent.
+The author works this way every day.
+
+- **Why the end cannot be held.** The `SubagentHandback` result ends the agent's turn
+  (`toolEndsTurn`), and Claude Code then discards any `Stop` / `SubagentStop` / `PostToolUse` block
+  without calling the model again (its debug log says `[end-turn] Stop hook block discarded (turn
+  ended by tool result, no model re-invoke)`). This is Claude Code's design, not something
+  agentmap.nvim can work around, so for such a sub-agent an instruction at its end never arrives.
+  The recorder no longer claims delivery there: it leaves the instruction undelivered and records
+  `skipped (handback)`.
+- **How to tell.** `:checkhealth agentmap` shows the permission mode of the run on screen; the
+  detail view says "reports through SubagentHandback"; in `hooks.jsonl` the sub-agent's stop has
+  `report_via: "handback"` and the main agent receives `<agent-message from="<id>">[Subagent
+  hand-back]` instead of a `<task-notification>`. Before a sub-agent shows any of these, a run in
+  auto mode is treated as one whose sub-agents (forks excepted) hand back.
+- **Relay to a hand-back sub-agent.** Relay through the main agent works for them, and is what `s`
+  offers first. A running one gets the text at its next tool call (followed: Haiku 2 of 2, Sonnet
+  1 of 1 on 2.1.294); one that has already handed back is started again by `SendMessage` under the
+  same id, applies the text and reports again (Haiku 3 of 3, Sonnet 1 of 1). So the parent's screen
+  shows **two reports** from that sub-agent, the first one written before your instruction. The
+  main agent may reword the text when it passes it on (the detail view shows what it sent). An
+  instruction that was placed and then skipped at the agent's end is relayed automatically when
+  the main agent's terminal is here (`steer.handback_reroute = true`): the original shows
+  `CANCELLED (rerouted …)` and the relay takes its place; otherwise you get a notice that it could
+  not be delivered.
+- **`steer.handback = "deny"`** (optional; run `:AgentMapInstallHooks` after changing it): when
+  relay is not possible, the text is handed over just before the agent hands back, as the reason of
+  a denied `SubagentHandback` call. It is a tool result, not a user message: on 2.1.294 Sonnet
+  followed it 2 of 2 times, Haiku 0 of 2 (it called `SubagentHandback` again with the same report).
+  That is why it is not the default.
+- **Pausing and the gate** hold such a sub-agent at `PreToolUse:SubagentHandback`, just before it
+  hands back (the hook can wait there); its report is readable from the map. See below.
 
 ## Pausing an agent and the gate
 
@@ -545,6 +595,13 @@ file every 100 ms) instead of returning. Removing the file (`x`) lets the hook r
   row, so 8 fixes) and **Keep waiting** (show the report). Left alone, it passes after 10 minutes.
   `X` again turns the gate off and lets every waiting agent pass. The gate is kept in the run's
   folder, so it stays on when you reopen the map.
+- **A sub-agent that reports through `SubagentHandback`** stops just before it hands back (the gate,
+  `:AgentMapPause {n|id} stop`, or `x` when the hand-back is its next tool call), not after: its
+  report is readable from the map (`Enter` on the box). **Pass** lets the report go. **Fix** lets
+  it go too and relays your text through the main agent; the agent starts again under the same id
+  after reporting (a hold cannot hand the text over in time: Claude Code would discard it after the
+  hand-back). With `steer.handback = "deny"`, Fix hands the text over on the spot as a tool result
+  instead.
 - **Esc in Claude Code** interrupts only the main agent's turn; sub-agents (and a hook holding
   one) keep going. A pause on the main agent stays placed: it stops again at its next tool call
   (within the same 10 minutes).
@@ -628,6 +685,8 @@ Stored, per event:
 - tool name and its target: the file path for Write / Edit, the first line of a Bash command (up to 120 characters)
 - AskUserQuestion questions, options and answers (clipped)
 - the child's final report (up to 2000 characters) and the first 200 characters of the last message
+- the report a sub-agent is about to hand back (`PreToolUse` `SubagentHandback`, up to 2000
+  characters, redacted like the final report) and the run's permission mode
 - step lists: TaskCreate subjects and `## Steps` items (up to 60 characters each) and their
   status changes; TaskCreate descriptions are not stored
 - **steering instructions as you wrote them** (not redacted; up to 4000 characters), in
@@ -668,10 +727,12 @@ real hook payloads (see `tests/fixtures/`).
 | 2.1.288 | 2026-10-04 | TaskCreate / TaskUpdate / TaskList payloads; steering (deny wording, `stop_hook_active`, typing into a running `claude`) |
 | 2.1.289 | 2026-10-04 | Full run through Neovim: progress, light, steering, parent notice, HUMAN CHECK, export. A long line typed into `claude` needs Enter sent separately (`steer.submit_delay_ms`, now 300) |
 | 2.1.291 | 2026-10-06 | Stop / SubagentStop `decision: block` feedback followed (sub-agents 17/17, main agent 9/9); text in a `PreToolUse` deny ignored by Sonnet; the Agent tool runs in the background by default; relay with `SendMessage` (queued to the sub-agent's next tool round); a message to a finished sub-agent starts it again; hidden helper agents send a `SubagentStop` without a start in interactive mode (ignored) |
+| 2.1.294 | 2026-10-08 | Auto mode: sub-agents report through `SubagentHandback` (`toolEndsTurn`); `Stop` / `SubagentStop` / `PostToolUse` blocks after it are discarded (`[end-turn] Stop hook block discarded`); a deny just before the hand-back followed by Sonnet 2/2, Haiku 0/2; relay followed by Haiku 2/2 + Sonnet 1/1 (running) and Haiku 3/3 + Sonnet 1/1 (finished: it starts again); the hook can hold at `PreToolUse:SubagentHandback`; payloads carry `permission_mode`; the parent gets `<agent-message>[Subagent hand-back]`; Haiku as main model turns auto mode off; `-p` with a Sonnet main model is auto |
 | 2.1.289 | 2026-10-05 | Pausing: a hook without `timeout` is stopped after 600 s; an explicit `timeout` is kept (630 s and 7200 s tested). Past the timeout Claude Code ends the hook (SIGTERM) and runs the tool, showing nothing. Esc does not stop background sub-agents; `/exit` with background work asks (stop tasks / move to background / stay). A hook that waits on the main agent's tool shows `running PreToolUse hooks…` in the spinner; on a sub-agent nothing is shown |
 
-Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion; and every
-tool for pausing, synchronous), `PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit,
+Hooks used: `SessionStart`, `UserPromptSubmit`, `PreToolUse` (Agent, AskUserQuestion,
+SubagentHandback; every tool for pausing, synchronous; and SubagentHandback, synchronous, to hold a
+hand-back sub-agent just before it reports), `PostToolUse` (Agent, AskUserQuestion, Write, Edit, MultiEdit,
 NotebookEdit, Bash, EnterWorktree, ExitWorktree, TaskCreate, TaskUpdate, TaskList, SendMessage),
 `PostToolUseFailure` (Agent, AskUserQuestion), `SubagentStart`, `SubagentStop`, `Stop`,
 `SessionEnd`. Unknown events are ignored, so new hook types do not break it.
@@ -692,7 +753,8 @@ The record format is versioned (`_v`). Records written by older versions stay re
 v0.1.0 is the first public release of a tool I built for my own work; v0.1.1 adds progress,
 the light and steering; v0.1.2 adds pausing and the gate, and delivers steering when an agent tries
 to finish (or right away through the main agent) because current models may ignore text handed
-over as a tool error. I answer issues a few times a week, without promises.
+over as a tool error; for sub-agents that report through `SubagentHandback` (Claude Code's auto
+mode), whose end cannot be held, it goes through the main agent. I answer issues a few times a week, without promises.
 
 Planned:
 

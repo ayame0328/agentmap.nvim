@@ -14,6 +14,14 @@
 --   their timeout is auto_resume_s + 30 (default 630) so that the hook keeps its own deadline before
 --   Claude Code kills it. With mode stop and pausing off, the PreToolUse hook is not registered.
 --   PostToolUse records SendMessage (relay through the main agent, DESIGN-v0.1.2-steer2 §4.5).
+--   Hand-back (DESIGN-v0.1.2-handback §6): a third, synchronous PreToolUse hook with the matcher
+--   SubagentHandback handles the end of a sub-agent that reports through that tool (Claude Code's auto mode):
+--     steer.handback "relay" (default): [ -e '<root>/pause.pending' ] || exit 0;
+--                                       exec <record> --steer --mode <mode> --handback relay --pause --max-wait <s>
+--                                       (only for pausing; not registered while pause.enabled = false)
+--     steer.handback "deny" (or mode deny / context): [ -e steer.pending ] || [ -e pause.pending ] || exit 0;
+--                                       exec <record> --steer --mode <mode> --handback deny --pause --max-wait <s>
+--   The recording PreToolUse matcher also lists SubagentHandback (the report about to be handed back).
 local J = require("agentmap.jsonfmt")
 local i18n = require("agentmap.i18n")
 
@@ -33,9 +41,13 @@ M.EVENTS = {
   -- AskUserQuestion は HUMAN CHECK（人への確認）の記録用。質問の中身は PreToolUse で全部取れるので、
   -- 「許可の判断」を返せる PermissionRequest や、時刻しか増えない Notification は登録しない（設計書 §7.1）。
   -- PostToolUseFailure(AskUserQuestion) は Esc で取り消したとき何が来るか未確認なので、保険として登録だけする
-  { "PreToolUse", "Agent|AskUserQuestion" },
+  -- SubagentHandback は子が返そうとしている報告（関門で止めている間に読む。DESIGN-v0.1.2-handback §3.2）
+  { "PreToolUse", "Agent|AskUserQuestion|SubagentHandback" },
   -- 一時停止の待ち（と mode deny / context の配達）。全道具・同期・シェルの門番つき。印が無ければ約 2 ms で抜ける
+  -- （SubagentHandback は下の matcher 付きの門番に任せ、collector がすぐ抜ける）
   { "PreToolUse", nil, { sync = true, steer = true } },
+  -- 報告を SubagentHandback で返す子の終わり際（関門・一時停止の待ちと、steer.handback = "deny" の配達）
+  { "PreToolUse", "SubagentHandback", { sync = true, steer = true, handback = true } },
   -- TaskCreate / TaskUpdate / TaskList は手順表（進み具合の事実。DESIGN-v0.2 §2.2）。
   -- SendMessage は親経由の修正指示が渡った事実（DESIGN-v0.1.2-steer2 §4.5）
   { "PostToolUse", "Agent|AskUserQuestion|Write|Edit|MultiEdit|NotebookEdit|Bash|EnterWorktree|ExitWorktree|TaskCreate|TaskUpdate|TaskList|SendMessage" },
@@ -53,6 +65,7 @@ M.EVENTS = {
 local SYNC_WITHOUT_STEER = { Stop = true, SessionEnd = true }
 
 local MODES = { stop = true, deny = true, context = true }
+local HANDBACK = { relay = true, deny = true }
 
 --- 修正指示の設定（config.steer が無い版でも動くように既定を補う）。
 ---   mode の既定は "stop"（0.1.2。DESIGN-v0.1.2-steer2 §9.1）。at_stop は 0.1.2 で廃止（常に on）：
@@ -64,9 +77,13 @@ local function steer_cfg(scfg)
   end
   if scfg == false then scfg = { enabled = false } end
   if type(scfg) ~= "table" then scfg = {} end
+  local mode = MODES[scfg.mode] and scfg.mode or "stop"
   return {
     enabled = scfg.enabled ~= false,
-    mode = MODES[scfg.mode] and scfg.mode or "stop",
+    mode = mode,
+    -- 報告を SubagentHandback で返す子への経路（DESIGN-v0.1.2-handback §6）。mode deny / context は道具の直前にも
+    -- 届ける設定なので deny 固定。それ以外は steer.handback（知らない値・無い版は "relay"）
+    handback = mode ~= "stop" and "deny" or (HANDBACK[scfg.handback] and scfg.handback or "relay"),
   }
 end
 M._steer_cfg = steer_cfg
@@ -93,7 +110,9 @@ M._pause_cfg = pause_cfg
 ---   The PreToolUse delivery hook (no matcher) is kept while pause.enabled, or while steer.enabled with
 ---   mode deny / context (mode stop delivers nothing there, so without pausing it has nothing to do);
 ---   SubagentStop / Stop deliver (and wait) when steer.enabled or pause.enabled,
----   otherwise they go back to recording only.
+---   otherwise they go back to recording only. The PreToolUse hook for SubagentHandback is kept while
+---   pause.enabled, or while steer.enabled with the hand-back route "deny" (steer.handback = "deny", or
+---   mode deny / context); with "relay" it only waits for a pause.
 ---@param scfg? table|false
 ---@param pcfg? table|false
 ---@return table[] list of { event, matcher?, opts? }
@@ -111,6 +130,8 @@ function M.events(scfg, pcfg)
       else
         out[#out + 1] = { e[1], e[2], { sync = SYNC_WITHOUT_STEER[e[1]] or nil } }
       end
+    elseif o.handback then
+      if p.enabled or (c.enabled and c.handback == "deny") then out[#out + 1] = e end
     elseif p.enabled or (c.enabled and c.mode ~= "stop") then
       out[#out + 1] = e
     end
@@ -200,19 +221,25 @@ end
 ---     stop:  <record> --steer --mode <mode> --at-stop --pause --max-wait <s> --record
 ---   With pause.enabled = false the pause test and "--pause --max-wait" are left out (for deny / context:
 ---   the v0.1.1 strings; for stop the guard is "exit 0" alone and M.events() does not register it).
----@param opts? { record?: string, root?: string|false, mode?: string, at_stop?: boolean, python?: string[], pause?: table|false }
+---   hand-back (PreToolUse, matcher SubagentHandback; DESIGN-v0.1.2-handback §6):
+---     relay: [ -e '<root>/pause.pending' ] || exit 0; exec <record> --steer --mode <mode> --handback relay --pause --max-wait <s>
+---     deny:  [ -e '<root>/steer.pending' ] || [ -e '<root>/pause.pending' ] || exit 0;
+---            exec <record> --steer --mode <mode> --handback deny --pause --max-wait <s>
+---     (deny is used for mode deny / context whatever opts.handback says)
+---@param opts? { record?: string, root?: string|false, mode?: string, at_stop?: boolean, python?: string[], pause?: table|false, handback?: string }
 ---   record   the recording command (default: default_cmd({ root = opts.root, python = opts.python }))
 ---   root     record root whose steer.pending / pause.pending flags the guard tests (nil or false → config.root())
 ---   mode     "stop" | "deny" | "context" (default: config.get().steer.mode, else "stop")
 ---   at_stop  deny / context only: false leaves out --at-stop (default true; ignored for mode stop)
 ---   pause    { enabled, auto_resume_s } (default: config.get().pause)
----@return string|nil guard, string|nil stop   nil when no Python was found
+---   handback "relay" | "deny" (default: config.get().steer.handback, else "relay")
+---@return string|nil guard, string|nil stop, string|nil handback   nil when no Python was found
 function M.steer_cmd(opts)
   opts = opts or {}
   local record = opts.record
   if not record then
     record = M.default_cmd({ root = opts.root, python = opts.python })
-    if not record then return nil, nil end
+    if not record then return nil, nil, nil end
   end
   local mode = opts.mode
   if not MODES[mode] then mode = steer_cfg(nil).mode end
@@ -229,7 +256,12 @@ function M.steer_cmd(opts)
   end
   local guard = test .. "exit 0; exec " .. record .. " --steer --mode " .. mode .. pause
   local stop = record .. " --steer --mode " .. mode .. (at_stop and " --at-stop" or "") .. pause .. " --record"
-  return guard, stop
+  -- 報告を SubagentHandback で返す子の終わり際。relay は止まれの待ちだけなので pause.pending だけを見る
+  local hb = mode ~= "stop" and "deny" or (HANDBACK[opts.handback] and opts.handback or steer_cfg(nil).handback)
+  local hb_test = hb == "deny" and ("[ -e " .. M.quote(slashes(root) .. "/steer.pending") .. " ] || ") or ""
+  if p.enabled then hb_test = hb_test .. "[ -e " .. M.quote(slashes(root) .. "/pause.pending") .. " ] || " end
+  local handback = hb_test .. "exit 0; exec " .. record .. " --steer --mode " .. mode .. " --handback " .. hb .. pause
+  return guard, stop, handback
 end
 
 --- 登録したい hooks の中身（settings.json の "hooks" の値）。
@@ -241,12 +273,12 @@ function M.desired(cmd, opts)
   opts = opts or {}
   local c = steer_cfg(opts.steer)
   local p = pause_cfg(opts.pause)
-  local guard, stop = M.steer_cmd({ record = cmd, root = opts.root, mode = c.mode, pause = p })
+  local guard, stop, handback = M.steer_cmd({ record = cmd, root = opts.root, mode = c.mode, pause = p, handback = c.handback })
   local hooks = J.object()
   for _, e in ipairs(M.events(opts.steer, p)) do
     local o = e[3] or {}
     local command = cmd
-    if o.steer then command = o.record and stop or guard end
+    if o.steer then command = (o.handback and handback) or (o.record and stop) or guard end
     local h = J.obj({ { "type", "command" }, { "command", command }, { "async", not o.sync },
       { "timeout", M.timeout_for(e, p) } })
     local group = J.object()
@@ -527,7 +559,7 @@ local function each_ours(hk, fn)
 end
 
 local function features_of(hk)
-  local f = { steer = false, pause = false, at_stop = false, sendmessage = false }
+  local f = { steer = false, pause = false, at_stop = false, sendmessage = false, handback = false }
   local delivery, with_pause = 0, 0
   each_ours(hk, function(ev, matcher, h)
     local cmd = h.command
@@ -538,6 +570,15 @@ local function features_of(hk)
     end
     if not cmd:find("%-%-steer") then return end
     f.steer = true
+    -- 報告を SubagentHandback で返す子の門番（--handback relay|deny）。語が無い・知らない語なら "relay"（collector と同じ）
+    if ev == "PreToolUse" and (matcher == "SubagentHandback" or cmd:find("%-%-handback")) then
+      local w = cmd:match("%-%-handback[ =]'?([%a]+)")
+      if w ~= nil or matcher == "SubagentHandback" then
+        w = HANDBACK[w] and w or "relay"
+        -- 2 つあれば deny が勝つ（届ける方の登録があることを優先して見せる）
+        if f.handback ~= "deny" then f.handback = w end
+      end
+    end
     delivery = delivery + 1
     if cmd:find("%-%-pause") then with_pause = with_pause + 1 end
     if ev == "SubagentStop" or ev == "Stop" then
@@ -569,13 +610,15 @@ end
 ---   at_stop        those commands deliver when the agent tries to finish (mode stop or --at-stop)
 ---   sendmessage    one of our PostToolUse matchers lists SendMessage (relay confirmation)
 ---   max_wait       the smallest --max-wait N among them (nil when none)
----   guard_timeout  the timeout of the PreToolUse delivery hook (0 when it has none; nil when not registered)
+---   handback       the --handback word ("relay" | "deny") of the PreToolUse hook for SubagentHandback
+---                  (DESIGN-v0.1.2-handback §6); false when that hook is not registered
+---   guard_timeout  the timeout of the PreToolUse delivery hooks (0 when it has none; nil when not registered)
 ---   stop_timeout   the smallest timeout of the SubagentStop / Stop delivery hooks (same rules)
 ---@param path? string default: default_path()
----@return table { steer: boolean, pause: boolean, at_stop: boolean, sendmessage: boolean, mode?: string, max_wait?: integer, guard_timeout?: number, stop_timeout?: number }
+---@return table { steer: boolean, pause: boolean, at_stop: boolean, sendmessage: boolean, handback: string|false, mode?: string, max_wait?: integer, guard_timeout?: number, stop_timeout?: number }
 function M.features(path)
   local hk = read_hooks(path)
-  if not hk then return { steer = false, pause = false, at_stop = false, sendmessage = false } end
+  if not hk then return { steer = false, pause = false, at_stop = false, sendmessage = false, handback = false } end
   return features_of(hk)
 end
 
@@ -585,7 +628,9 @@ end
 ---   "outdated"  every event has one of ours, but the (event, matcher) pairs differ from M.events()
 ---               (e.g. registered by v0.1.0: no TaskCreate matcher and no steering hook; by v0.1.1: no
 ---               SendMessage), or pausing is on and the delivery commands lack --pause or have a smaller
----               timeout, or steering is on and the registered --mode differs from steer.mode
+---               timeout, or steering is on and the registered --mode differs from steer.mode, or the
+---               --handback word of the SubagentHandback hook differs from the hand-back route (0.1.2 hooks
+---               registered before the hand-back change lack that hook and the SubagentHandback recording matcher)
 ---   "partial"   some events have ours, some not
 ---   "missing"   none (or no / unreadable file)
 --- Other differences of the command text (paths, quoting) are not compared.
@@ -630,6 +675,8 @@ function M.status(path, scfg, pcfg)
   -- 修正指示：登録の mode が設定と違えば（v0.1.1 の deny の登録など）outdated（DESIGN-v0.1.2-steer2 §8.1）
   local c = steer_cfg(scfg)
   if c.enabled and f.steer and f.mode ~= nil and f.mode ~= c.mode then return "outdated" end
+  -- 報告を SubagentHandback で返す子の門番の語（relay / deny）が設定と違えば outdated（DESIGN-v0.1.2-handback §6）
+  if c.enabled and f.handback and f.handback ~= c.handback then return "outdated" end
   return "installed"
 end
 

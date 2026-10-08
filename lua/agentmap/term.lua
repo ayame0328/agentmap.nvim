@@ -3,7 +3,8 @@
 --   (DESIGN-v0.2-steer.md §4) and to relay an instruction to one of its sub-agents, which it passes
 --   on with SendMessage (DESIGN-v0.1.2-steer2 §4). A candidate is a terminal buffer whose name is
 --   term://<dir>//<pid>:<cmd> (:terminal, snacks.nvim and toggleterm all follow this) and whose
---   <cmd> contains the word "claude", with a job that is still running.
+--   <cmd> contains the word "claude", or whose shell has Claude Code running under it (started
+--   through an alias such as `claude-personal`), with a job that is still running.
 --   Claude Code reads text typed while it works at its next tool boundary. A short line with "\r"
 --   in one chansend is submitted, but a long line (about 250 characters, the length of a notice to
 --   the parent) arriving in one write is treated as a paste and stays in the input box unsent;
@@ -46,6 +47,25 @@ local function job_alive(job)
   return ok and r[1] == -1
 end
 
+--- True when Claude Code runs as a descendant of process `pid` (a shell started by :terminal, with
+--- Claude typed into it, e.g. through an alias such as `claude-personal`). The buffer name then
+--- ends in the shell (":/bin/bash"), so the name alone cannot tell.
+--- Uses nvim_get_proc_children / nvim_get_proc, which work on Linux, macOS and Windows.
+---@param pid integer
+---@param depth? integer how many levels to look down (default 3)
+function M.runs_claude(pid, depth)
+  if type(pid) ~= "number" or pid <= 0 then return false end
+  depth = depth or 3
+  local ok, kids = pcall(vim.api.nvim_get_proc_children, pid)
+  if not ok or type(kids) ~= "table" then return false end
+  for _, k in ipairs(kids) do
+    local okp, info = pcall(vim.api.nvim_get_proc, k)
+    if okp and type(info) == "table" and M.is_claude_cmd(tostring(info.name or "")) then return true end
+    if depth > 1 and M.runs_claude(k, depth - 1) then return true end
+  end
+  return false
+end
+
 --- Claude terminals, best first. score: 3 = same folder as `cwd`, 2 = a parent of `cwd`, 1 = other.
 ---@param cwd? string the run's folder (state.cwd); default getcwd()
 ---@param bufs? integer[] buffers to look at (default: all buffers; tests pass their own)
@@ -55,8 +75,9 @@ function M.candidates(cwd, bufs)
   local out = {}
   for _, b in ipairs(bufs or vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(b) and vim.bo[b].buftype == "terminal" then
-      local dir, _, cmd = M.parse_name(vim.api.nvim_buf_get_name(b))
-      if dir and M.is_claude_cmd(cmd) then
+      local dir, pid, cmd = M.parse_name(vim.api.nvim_buf_get_name(b))
+      -- 名前に claude が無くても（シェルの中で別名から起動した claude）、子のプロセスに claude がいれば数える
+      if dir and (M.is_claude_cmd(cmd) or M.runs_claude(vim.b[b].terminal_job_pid or pid)) then
         local job = vim.b[b].terminal_job_id
         if job_alive(job) then
           local d = norm(dir)

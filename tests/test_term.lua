@@ -133,6 +133,36 @@ t.run("dead job", function()
   t.eq({ ok, err }, { false, "terminal job is not running" }, "終わった端末には送らない")
 end)
 
+-- 3. シェルの中で別名から起動した claude（例：alias claude-personal='CLAUDE_CONFIG_DIR=… claude'）。
+--    端末の名前は ":…shell" のままで、claude はシェルの子のプロセスとして動く
+t.run("claude started from a shell", function()
+  local alias_dir = tmp .. "/alias"
+  vim.fn.mkdir(alias_dir, "p")
+  local shell = bin .. "/myshell"
+  vim.fn.writefile({ "#!/bin/sh", '"' .. claude .. '"', "echo shell-again", "exec cat >/dev/null" }, shell)
+  vim.fn.setfperm(shell, "rwxr-xr-x")
+  local out_alias = tmp .. "/alias.out"
+  local b_alias, j_alias = open_term(shell, alias_dir, out_alias)
+  t.ok(ready(b_alias), "シェルの中で偽の claude が動いた")
+  t.ok(not term.is_claude_cmd(select(3, term.parse_name(vim.api.nvim_buf_get_name(b_alias)))),
+    "端末の名前には claude が無い（" .. vim.api.nvim_buf_get_name(b_alias) .. "）")
+  t.ok(term.runs_claude(vim.b[b_alias].terminal_job_pid), "シェルの子に claude がいると分かる")
+  local cand = term.find(alias_dir)
+  t.ok(cand ~= nil and cand.buf == b_alias, "その端末が送り先に選ばれる")
+  t.ok(term.send(j_alias, "relay line"), "送れた")
+  vim.wait(3000, function() return #read(out_alias) >= 1 end, 20)
+  t.eq(read(out_alias)[1], "relay line", "シェルの中の claude に届いた")
+  -- claude が終わってシェルに戻ったら、もう Claude の端末ではない
+  vim.fn.chansend(j_alias, "\4") -- 偽の claude の入力を閉じる（read が終わる）
+  vim.wait(3000, function()
+    return table.concat(vim.api.nvim_buf_get_lines(b_alias, 0, -1, false), "\n"):find("shell-again", 1, true) ~= nil
+  end, 20)
+  t.ok(not term.runs_claude(vim.b[b_alias].terminal_job_pid), "claude が終わると数えない")
+  t.eq(term.find(alias_dir), nil, "送り先にも選ばない")
+  t.ok(not term.runs_claude(nil) and not term.runs_claude(-1), "pid が無いときは false")
+  vim.fn.jobstop(j_alias)
+end)
+
 vim.fn.jobstop(j_work)
 local _ = b_other
 t.done()

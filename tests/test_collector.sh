@@ -558,7 +558,14 @@ def start(d, *args):
 def call(d, *args, later=None, timeout=20):
     p = start(d, *args)
     if later:
-        threading.Timer(later[0], later[1]).start()
+        def go(delay=later[0], fn=later[1]):
+            # 止まった（.hit.json ができた）のを見てから数える。負荷が高く起動が遅いとき、止まる前に解いてしまわないように
+            end = time.time() + 5
+            while time.time() < end and not os.path.exists(SIDE) and p.poll() is None:
+                time.sleep(0.02)
+            time.sleep(delay)
+            fn()
+        threading.Thread(target=go, daemon=True).start()
     t0 = time.time()
     out, err = p.communicate(json.dumps(d).encode("utf-8"), timeout=timeout)
     return p.returncode, out.decode("utf-8"), err.decode("utf-8"), time.time() - t0
@@ -703,6 +710,10 @@ put_pause()
 n0 = len(lines())
 p = start(pre_child, *ARGS, "--max-wait", "10")
 p.stdin.write(json.dumps(pre_child).encode("utf-8")); p.stdin.close()
+# 止まった（hit 行）のを見てから 0.4 秒待つ（起動が遅い負荷の高いときに、止まる前に止めてしまわないように）
+t_hit = time.time() + 5
+while time.time() < t_hit and not any(x["phase"] == "hit" for x in pause_lines(n0)):
+    time.sleep(0.02)
 time.sleep(0.4)
 p.terminate()
 try:
@@ -847,7 +858,14 @@ def call(d, *args, later=None, timeout=20):
     p = subprocess.Popen(["python3", collect, "--root", root] + list(args), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if later:
-        threading.Timer(later[0], later[1]).start()
+        def go(delay=later[0], fn=later[1]):
+            # 止まった（.hit.json ができた）のを見てから数える。負荷が高く起動が遅いとき、止まる前に解いてしまわないように
+            end = time.time() + 5
+            while time.time() < end and not os.path.exists(SIDE) and p.poll() is None:
+                time.sleep(0.02)
+            time.sleep(delay)
+            fn()
+        threading.Thread(target=go, daemon=True).start()
     t0 = time.time()
     out, err = p.communicate(json.dumps(d).encode("utf-8"), timeout=timeout)
     return p.returncode, out.decode("utf-8"), err.decode("utf-8"), time.time() - t0
@@ -917,9 +935,20 @@ s = by("SubagentStop")
 check(len(s) == 2 and all(x.get("report_via") == "handback" and x.get("permission_mode") == "auto" for x in s),
       "(h3) SubagentStop of a hand-back child: report_via handback, permission_mode")
 check(s[0].get("report") == msg and "last_head" not in s[0], "(h3) SubagentStop: report from the transcript's SubagentHandback, no last_head")
-d = dict(stop_hb); d["last_assistant_message"] = "one more word after the hand-back"
+# モデルが handback の後に何か言った（transcript に handback の後の assistant の行がある）→ 番は道具で終わっていない
+TR_AFTER = os.path.join(root, "transcript_after_handback.jsonl")
+with open(TR, encoding="utf-8") as f, open(TR_AFTER, "w", encoding="utf-8") as g:
+    g.write(f.read())
+    g.write(json.dumps({"type": "assistant", "agentId": CH, "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "one more word after the hand-back"}]}}, separators=(",", ":")) + "\n")
+d = dict(stop_hb); d["agent_transcript_path"] = TR_AFTER; d["last_assistant_message"] = "one more word after the hand-back"
 call(d)
 check("report_via" not in lines()[-1], "(h3) a final assistant message after the hand-back: not report_via handback")
+# payload に last_assistant_message があっても、transcript の最後のモデルの行が handback なら番はその道具で終わっている
+# （Claude Code は後の block を捨てる。届いていないのに届いたと書かない）
+d = dict(stop_hb); d["last_assistant_message"] = "text written before the hand-back call"
+call(d)
+check(lines()[-1].get("report_via") == "handback", "(h3) last_assistant_message present but the hand-back is the last model line: report_via handback")
 d = dict(stop_hb); d["agent_transcript_path"] = os.path.join(fx, "agent_report_text.jsonl")
 call(d)
 check("report_via" not in lines()[-1], "(h3) a transcript without SubagentHandback: no report_via")
@@ -968,6 +997,18 @@ check(o.get("decision") == "block" and "not a hand-back child" in o.get("reason"
       and o["reason"].startswith("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. It reaches you now, just before you finish:"),
       "(h4) a plain-text child: block at its end as before")
 check(lines()[-1].get("steer") == {"ids": [s4], "mode": "block", "target": CH}, "(h4) steer line mode block")
+# handback の後に何も言っていない子は、payload に last_assistant_message があっても block しない（skipped）
+s5 = put_steer("text before the call", 1791400000006)
+d = dict(stop_hb); d["last_assistant_message"] = "text written before the hand-back call"
+code, out, err, dt = call(d, "--steer", "--mode", "stop", "--record")
+check(out == "" and lines()[-1].get("steer", {}).get("mode") == "skipped" and os.path.exists(os.path.join(sdir, s5 + ".json")),
+      "(h4) hand-back as the last model line: skipped even with last_assistant_message")
+os.remove(os.path.join(sdir, s5 + ".json"))
+# handback の後に言った子（番は道具で終わっていない）は block（従来どおり届く）
+s6 = put_steer("after the hand-back", 1791400000007)
+d = dict(stop_hb); d["agent_transcript_path"] = TR_AFTER; d["last_assistant_message"] = "one more word after the hand-back"
+code, out, err, dt = call(d, "--steer", "--mode", "stop", "--record")
+check((json.loads(out) if out else {}).get("decision") == "block", "(h4) a model line after the hand-back: block as before")
 
 # (h5) PreToolUse:SubagentHandback
 HB_HEAD = ("[AgentMap] Instruction from the user, typed in Neovim (AgentMap) while you were working. "

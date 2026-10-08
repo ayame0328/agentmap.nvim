@@ -17,6 +17,11 @@ local T = i18n.t
 local hooks_status = "installed"
 hooks.status = function() return hooks_status end
 
+-- 毎秒の描き直し（ticker）を止める：本物の tick は sweep_steers（親経由に回す・期限切れ）と notify_parents を
+-- 試験の外の時刻に走らせる。vim.wait（settle など）の間に動くと、試験が自分で呼ぶ前に指示を処理してしまい、
+-- 「1 件作った」「回したので changed」が 0 / false になる（負荷が高く待ちが長いときだけ落ちていた）
+ui.tick = function() end
+
 local notes = {}
 vim.notify = function(msg) notes[#notes + 1] = tostring(msg) end
 local function noted(s)
@@ -204,6 +209,23 @@ end
 local out1 = tmp .. "/t1.out"
 local tb1, tj1 = open_term(work, out1)
 local function read(p) return vim.fn.filereadable(p) == 1 and vim.fn.readfile(p) or {} end
+-- 端末に打てた行の数（端末ごと）。偽の claude は 1 行ごとに OUT へ 1 行書くので、settle はこの数まで待つ
+local term_mod = require("agentmap.term")
+local sent_n = {}
+do
+  local real_send = term_mod.send
+  term_mod.send = function(job, text, o)
+    local ok, err = real_send(job, text, o)
+    if ok then sent_n[job] = (sent_n[job] or 0) + 1 end
+    return ok, err
+  end
+end
+-- 端末への送信（Enter を遅らせて 1 行ずつ）が全部終わり、偽の claude が全部の行を書き終えるまで待つ
+-- （時間だけで待つと、負荷が高いとき前の行が後から届き、「最後の行」が前の文になる）
+local function settle()
+  vim.wait(5000, function() return term_mod.pending(tj1) == 0 end, 20)
+  vim.wait(5000, function() return #read(out1) >= (sent_n[tj1] or 0) end, 20)
+end
 
 t.run("ROOT to terminal", function()
   notes = {}
@@ -275,6 +297,7 @@ t.run("hooks outdated", function()
   t.eq(#calls, n0, "記録もしない")
   t.ok(noted(T("ui.steer_hooks_outdated")), "「登録が古いので届きません」と知らせた")
   notes = {}
+  settle()
   local before = #read(out1)
   t.eq(ui.steer_send("ROOT", "terminal still works"), "sent", "ROOT を端末へ → 送る")
   vim.wait(3000, function() return #read(out1) > before end, 20)
@@ -334,12 +357,6 @@ t.run("relay menu", function()
   config.get().steer.relay = nil
 end)
 
--- 端末への送信（Enter を遅らせて 1 行ずつ）が全部終わるまで待つ
-local term_mod = require("agentmap.term")
-local function settle()
-  vim.wait(5000, function() return term_mod.pending(tj1) == 0 end, 20)
-  vim.wait(100)
-end
 
 local A1_EN = '[AgentMap] Tell sub-agent [1] "調査：既存設定の確認" (agent id a1) this, with SendMessage: '
 local A1_JA = "[AgentMap] サブエージェント [1]「調査：既存設定の確認」（agent id a1）に SendMessage で次を伝えてください："
@@ -558,6 +575,7 @@ t.run("notice to parent", function()
   events.request_steer = function() return nil, "duplicate" end
   s.steers["n11"] = { id = "n11", agent_id = "a1", kind = "steer", status = "DELIVERED", text = "y" }
   s.steer_order[#s.steer_order + 1] = "n11"
+  settle()
   local before2 = #read(out1)
   t.eq(ui.notify_parents(), 0, "events が duplicate と断れば作らない")
   vim.wait(300)

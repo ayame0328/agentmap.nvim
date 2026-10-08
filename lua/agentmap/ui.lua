@@ -1164,11 +1164,11 @@ local STEER_TEXT = {
   ["ui.steer_relay_hb"] = "%{label} reports through SubagentHandback, so the text goes through the main agent: it arrives at its next tool call, or it starts again after finishing",
   ["ui.steer_resumed_relay"] = "%{label} resumed; the text goes through the main agent (next tool call, or it starts again after finishing)",
   ["ui.steer_hb_pending"] = "%{label} reports through SubagentHandback; the text cannot reach it at its end. It will be relayed when the main agent's terminal is here, else expire",
-  ["ui.steer_hb_deny"] = "%{label} reports through SubagentHandback; the text will be handed over just before it hands back, as a tool result (current models may ignore it)",
+  ["ui.steer_hb_deny"] = "Steer for %{label} queued; it will be handed over just before it hands back, as a tool result (current models may ignore it)",
   ["ui.steer_rerouted_hb"] = "%{label} had already reported through SubagentHandback; relaying through the main agent (it starts again)",
-  ["ui.steer_skipped_hb"] = "%{label} had already reported through SubagentHandback; the text could not be delivered (no main-agent terminal here)",
+  ["ui.steer_skipped_hb"] = "%{label} had already reported through SubagentHandback; the text was not delivered and cannot be relayed from here (s: ask the parent to redo it, or tell the main agent yourself)",
   ["ui.steer_not_held_hb"] = "%{label} was not held: it had already reported through SubagentHandback",
-  ["ui.pause_hit_hb"] = "%{label} stopped just before handing back its report (x: pass / s: fix)",
+  ["ui.pause_hit_hb"] = "%{label} stopped just before handing back its report: x pass, s fix (Enter shows the report)",
   ["ui.pause_fixed_relay_hb"] = "%{label} passed; the text goes through the main agent and it starts again",
   ["steer.relay_en"] = '[AgentMap] Tell sub-agent [%{index}] "%{name}" (agent id %{id}) this, with SendMessage: %{text}',
   ["steer.relay_ja"] = "[AgentMap] サブエージェント [%{index}]「%{name}」（agent id %{id}）に SendMessage で次を伝えてください：%{text}",
@@ -1725,7 +1725,10 @@ function M.steer_send(id, text, cb, opts)
     -- （deny の設定なら報告の直前にツールの結果として渡る。relay なら skipped になったとき親経由に回すか期限切れ）
     local hb_key = M.handback_likely(aid) and (cfg.handback == "deny" and "ui.steer_hb_deny" or "ui.steer_hb_pending")
     -- 止まれのある宛先：指示のファイルを置いた**後で**止まれを消す（hook は止まれが消えた後に指示を取りに行く）
-    local resumed = held and M._resume_raw(aid, { reason = "user", steer_id = sid }) and held_status == "PAUSED"
+    -- relay の設定の handback の子：待っている hook はこの指示を渡さないので、「指示つきで再開」とは記録しない
+    local hands_over = hb_key ~= "ui.steer_hb_pending"
+    local resumed = held and M._resume_raw(aid, { reason = "user", steer_id = hands_over and sid or nil })
+      and held_status == "PAUSED"
     if hb_key then
       if resumed then notify(pt("ui.pause_resumed", { label = label_of(aid) })) end
       notify(st_text(hb_key, { label = label_of(aid) }))
@@ -1935,9 +1938,9 @@ function M.steer_menu(id)
       -- 親経由できる：1 番が親経由（関門・報告の直前で止まっていれば「通してから親経由」）。deny の設定なら 2 番に報告の直前
       first = st_text(at_end and "ui.pause_fix_relay_hb" or "ui.steer_write_relay_hb")
       deny_item = cfg.handback == "deny"
-    elseif at_end and cfg.handback == "deny" then
-      first = st_text("ui.steer_write_gate") -- 待っている hook がその場で渡す
     else
+      -- deny：報告の直前で待っている hook（関門で止まっていればその場で）が道具の結果として渡す。
+      -- 「続きを始める」とは言わない（今のモデルは無視することがある。H5 haiku 0/2）
       first = st_text(cfg.handback == "deny" and "ui.steer_write_hb_deny" or "ui.steer_write_hb_pending")
       first_act = "write_hook"
     end
@@ -2491,7 +2494,16 @@ function M.gate_menu(id)
   local aid = M.steer_target(id)
   if not aid then return end
   -- 報告を SubagentHandback で返す直前で待っている子：Fix は「通してから親経由」（DESIGN-v0.1.2-handback §3.4）
-  local fix = M.steer_kind(aid) == "relay" and st_text("ui.pause_fix_relay_hb") or pt("ui.pause_fix")
+  -- 親経由できない（端末なし・孫・親が止まっている）ときは「続けます」と言わない：relay なら置くだけで届かない見込み、
+  -- deny なら待っている hook が道具の結果として渡す（無視されることがある）
+  local fix
+  if M.steer_kind(aid) == "relay" then
+    fix = st_text("ui.pause_fix_relay_hb")
+  elseif M.handback_likely(aid) then
+    fix = st_text(M.steer_cfg().handback == "deny" and "ui.steer_write_hb_deny" or "ui.steer_write_hb_pending")
+  else
+    fix = pt("ui.pause_fix")
+  end
   local items = { pt("ui.pause_pass"), fix, pt("ui.pause_keep_gate") }
   vim.ui.select(items, { prompt = pt("ui.pause_prompt", { label = label_of(aid) }) }, function(_, idx)
     -- the built-in select leaves its list in the message area; clear it so that the notice of the

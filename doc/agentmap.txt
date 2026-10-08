@@ -474,7 +474,9 @@ A sub-agent that reports through SubagentHandback is held just before it
 hands back (PreToolUse:SubagentHandback; the gate, `:AgentMapPause {n} stop`,
 or `x` when the hand-back is its next tool call); its report is readable.
 Pass lets the report go. Fix lets it go too and relays the text through the
-main agent; the agent starts again after reporting. With `steer.handback =
-"deny"` Fix hands the text over on the spot as a tool result.
+main agent; the agent starts again after reporting. Without the main agent's
+terminal here (or for a grandchild) the Fix item says the text is only placed
+and cannot reach the agent at its end. With `steer.handback = "deny"` Fix
+hands the text over on the spot as a tool result (it may be ignored).
 
  vim:tw=78:ts=8:ft=help:norl:

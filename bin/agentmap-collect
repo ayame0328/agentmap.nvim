@@ -255,12 +255,14 @@ def ask_answers(tr):
     return out
 
 
-def handback_report(path):
-    """子の transcript の末尾から、最後の SubagentHandback の message を取る。無ければ None。
+def handback_info(path):
+    """子の transcript の末尾から、最後の SubagentHandback の message を取る。
+    戻り値 (message, last): message は無ければ None。last は、その SubagentHandback の後にモデルの行
+    （type "assistant"）が 1 行も無い＝番がその道具で終わった（toolEndsTurn。DESIGN-v0.1.2-handback §3.1 の印③）。
     SubagentStop の last_assistant_message は handback の後の一言か空なので、報告の本文はここにしか無い。
     SubagentStop の時点で transcript は最後まで書かれている（2026-10-01 実測 6 件）"""
     if not isinstance(path, str) or not path:
-        return None
+        return None, False
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -269,32 +271,45 @@ def handback_report(path):
             f.seek(off)
             data = f.read()
     except Exception:
-        return None
+        return None, False
     lines = data.split(b"\n")
     if off > 0 and lines:
         lines = lines[1:]  # 途中から始まる 1 行目は捨てる
+    after = False  # この行より後にモデルの行があったか
     for raw in reversed(lines):
-        if b'"name":"SubagentHandback"' not in raw or b'"type":"assistant"' not in raw:
+        if b'"type":"assistant"' not in raw:
             continue
         try:
             t = json.loads(raw)
         except Exception:
             continue
-        content = ((t.get("message") or {}).get("content")) if isinstance(t, dict) else None
+        if not isinstance(t, dict) or t.get("type") != "assistant":
+            continue
+        content = (t.get("message") or {}).get("content")
         for b in reversed(content if isinstance(content, list) else []):
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "SubagentHandback":
                 m = (b.get("input") or {}).get("message")
                 if isinstance(m, str) and m.strip():
-                    return m
-    return None
+                    return m, not after
+        after = True
+    return None, False
 
 
-def handback_ended(d, hb):
+def handback_report(path):
+    """子の transcript の末尾から、最後の SubagentHandback の message を取る。無ければ None"""
+    return handback_info(path)[0]
+
+
+def handback_ended(d, info):
     """SubagentStop の子が SubagentHandback で番を終えたか（DESIGN-v0.1.2-handback §3.1 の印③）。
-    hb は handback_report() の結果。handback で終わった子の payload には last_assistant_message が無い（H2）。
-    handback の後にモデルが何か言った（last_assistant_message がある）なら、番は道具で終わっていない"""
+    info は handback_info() の結果 (message, last)。transcript で handback の後にモデルの行が無ければ終わっている。
+    handback で終わった子の payload には last_assistant_message も無い（H2）。handback があっても、その後に
+    モデルが何か言った（transcript の後ろの行・last_assistant_message）なら、番は道具で終わっていない"""
+    hb, last_line = info if isinstance(info, tuple) else (info, False)
     if hb is None:
         return False
+    if last_line:
+        return True
     last = d.get("last_assistant_message")
     return not (isinstance(last, str) and last.strip())
 
@@ -498,13 +513,14 @@ def build(d):
         if isinstance(d.get("last_assistant_message"), str):
             rec["last_head"] = head(d["last_assistant_message"])
         # 子の報告：handback の message があればそれ、無ければ最後の返答（handback を使わずに終わった子）
-        hb = handback_report(d.get("agent_transcript_path"))
+        info = handback_info(d.get("agent_transcript_path"))
+        hb = info[0]
         rep = hb
         if rep is None and isinstance(d.get("last_assistant_message"), str) and d["last_assistant_message"].strip():
             rep = d["last_assistant_message"]
         if rep is not None:
             rec["report"] = clip(rep, REPORT)
-        if handback_ended(d, hb):
+        if handback_ended(d, info):
             rec["report_via"] = "handback"
         if isinstance(d.get("permission_mode"), str):
             rec["permission_mode"] = d["permission_mode"][:40]
@@ -964,7 +980,7 @@ def steer(root, d, run, argv, rec=None):
         if rec is not None:
             ended_hb = rec.get("report_via") == "handback"
         else:
-            ended_hb = handback_ended(d, handback_report(d.get("agent_transcript_path")))
+            ended_hb = handback_ended(d, handback_info(d.get("agent_transcript_path")))
         if ended_hb:
             return handback_stop(root, d, run)
     paused = None

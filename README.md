@@ -600,8 +600,9 @@ file every 100 ms) instead of returning. Removing the file (`x`) lets the hook r
   report is readable from the map (`Enter` on the box). **Pass** lets the report go. **Fix** lets
   it go too and relays your text through the main agent; the agent starts again under the same id
   after reporting (a hold cannot hand the text over in time: Claude Code would discard it after the
-  hand-back). With `steer.handback = "deny"`, Fix hands the text over on the spot as a tool result
-  instead.
+  hand-back). Without the main agent's terminal here (or for a grandchild), Fix says so: the text is
+  only placed and cannot reach the agent at its end. With `steer.handback = "deny"`, Fix hands the
+  text over on the spot as a tool result instead (it may be ignored).
 - **Esc in Claude Code** interrupts only the main agent's turn; sub-agents (and a hook holding
   one) keep going. A pause on the main agent stays placed: it stops again at its next tool call
   (within the same 10 minutes).

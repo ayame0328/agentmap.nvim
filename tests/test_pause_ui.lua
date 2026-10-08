@@ -9,6 +9,8 @@
 -- are replaced with recorders; the pause state is written into the state directly (contract §13.2).
 local t = require("t")
 local ui = require("agentmap.ui")
+-- 毎秒の描き直し（ticker）は止める：vim.wait の間に動くと sweep_pauses / notify_pauses を試験の外で走らせる
+ui.tick = function() end
 local events = require("agentmap.events")
 local config = require("agentmap.config")
 local hooks = require("agentmap.hooks")
@@ -366,7 +368,10 @@ t.run("hand-back sub-agent", function()
   t.eq(ui.steer_kind("a1"), "hook", "deny なら hook")
   menus = {}
   ui.gate_menu("a1")
-  t.eq(menus[#menus].items[2], P("ui.pause_fix"), "Fix は普通の文")
+  t.eq(menus[#menus].items[2], ui._st("ui.steer_write_hb_deny"), "Fix は「報告の直前に道具の結果として渡す（無視されることがある）」")
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.steer_write_hb_deny"), "s のメニューも「続きを始める」とは言わない")
   n0 = #calls
   t.eq(ui.steer_send("a1", "その場で"), "queued", "置いた")
   t.eq(fns(n0), { "request_steer", "resume_pause" }, "ファイルを置いてから止まれを消す")
@@ -381,12 +386,23 @@ t.run("hand-back sub-agent", function()
   clear_pauses()
   -- 端末が無い：置いて正直に知らせる（解いてから）
   term.find = function() return nil, {}, false end
+  -- 関門で報告の直前に止まっていて親経由できない（relay の設定）：Fix は「続けます」と言わない
+  set_pause("a1", "PAUSED", "gate", "stop", { hit_at = "2026-09-28T04:30:50.000Z", hit_via = "PreToolUse:SubagentHandback" })
+  t.eq(ui.steer_kind("a1"), "hook", "端末が無ければ置く（関門でも）")
+  menus = {}
+  ui.gate_menu("a1")
+  t.eq(menus[#menus].items[2], ui._st("ui.steer_write_hb_pending"), "関門の Fix は「この子の終わり際には届かない」")
+  menus = {}
+  ui.steer_menu("a1")
+  t.eq(menus[#menus].items[1], ui._st("ui.steer_write_hb_pending"), "s のメニューも同じ")
+  clear_pauses()
   set_pause("a1", "PAUSED", "pause", "next", { hit_at = "2026-09-28T04:30:05.000Z", hit_via = "PreToolUse:Read" })
   t.eq(ui.steer_kind("a1"), "hook", "端末が無ければ置く")
   notes = {}
   n0 = #calls
   t.eq(ui.steer_send("a1", "置く"), "queued", "置いた")
   t.eq(fns(n0), { "request_steer", "resume_pause" }, "置いてから解く")
+  t.eq(calls[n0 + 2].opts.steer_id, nil, "hook は渡さないので「指示つきで再開」とは記録しない")
   t.ok(noted(ui._st("ui.steer_hb_pending", { label = L1 })), "届かない見込みを知らせた")
   clear_pauses()
   s.agents.a1.handback = nil

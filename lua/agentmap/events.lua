@@ -139,7 +139,9 @@ function M.poll(run)
   save(run)
   -- 宛先が終わった未配達の修正指示を片付ける（記録が増えたときだけ。sweep の中の emit から戻ってきたときは呼ばない）
   if #new > 0 and not run._sweeping then
-    pcall(M.sweep_steers, run)
+    -- 終わり際で見送られた（handback）指示は残す：図が先に親経由へ回してから片付ける（ui.sweep_steers）。
+    -- ここで片付けると、記録を読むのが子の終わりから 3 秒以上遅れたとき（Neovim が忙しい・時計のずれ）回す前に消える
+    pcall(M.sweep_steers, run, nil, { keep_skipped = true })
     -- 一時停止：宛先が終わった止まれの掃除と、関門が入っている run の新しい子への止まれ（DESIGN-v0.1.2-pause §4・§5.3）
     pcall(M.sweep_pauses, run)
     pcall(M.sync_gate, run)
@@ -638,17 +640,23 @@ end
 --- ended expires with reason "not_relayed". An instruction the collector skipped (its target reports through
 --- SubagentHandback) expires the same way and the record carries skip_reason = "handback".
 --- Also removes <root>/steer.pending when no pending file is left anywhere.
+--- opts.keep_skipped leaves skipped instructions alone: M.poll passes it, so that an instruction skipped
+--- at a hand-back sub-agent's end is not expired before the UI had its chance to relay it
+--- (ui.sweep_steers relays first, then calls this without the option).
+---@param opts? { keep_skipped?: boolean }
 ---@return boolean changed
-function M.sweep_steers(run, now)
+function M.sweep_steers(run, now, opts)
   if not run or not run.state or not run.dir then return false end
   local s = run.state
   now = now or os.time()
+  local keep_skipped = type(opts) == "table" and opts.keep_skipped
   local changed = false
   run._sweeping = true
   local ok, err = pcall(function()
     for _, sid in ipairs(vim.deepcopy(s.steer_order or {})) do
       local st = s.steers[sid]
-      local reason = st and st.status == "PENDING" and expire_reason(s, st, now)
+      local reason = st and st.status == "PENDING" and not (keep_skipped and st.skipped_at)
+        and expire_reason(s, st, now)
       if not reason and st and not_relayed(s, st, now) then reason = "not_relayed" end
       if reason then
         local gone = true

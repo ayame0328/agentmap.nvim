@@ -430,6 +430,23 @@ do
     if e.event == "steer_expired" and e.steer_id == k4 then ex = e end
   end
   t.eq({ ex.steer_id, ex.skip_reason }, { k4, nil }, "an ordinary expiry has no skip_reason")
+  -- 記録を読むのが子の終わりから 3 秒以上遅れても、poll の中の片付けは skipped を消さない
+  -- （図が先に親経由へ回す。ui.sweep_steers → reroute_skipped → sweep_steers の順）
+  local H5 = "afeed000000000058"
+  append4({ hook4("SubagentStart", 100, { agent_id = H5, agent_type = "general-purpose" }) })
+  events.poll(run4)
+  local k5 = events.request_steer(run4, H5, "late reader", { via = "hook" })
+  append4({
+    hook4("SubagentStop", 101, { agent_id = H5, agent_type = "general-purpose", report = "r", report_via = "handback" }),
+    hook4("SubagentStop", 101, { agent_id = H5, steer = { ids = { k5 }, mode = "skipped", reason = "handback", target = H5 } }),
+    hook4("PostToolUse", 102, { tool_name = "Bash", tool_use_id = "toolu_late" }),
+  })
+  events.poll(run4) -- 宛先は約 500 秒前に終わっている
+  t.eq(run4.state.steers[k5].status, "PENDING", "poll: a skipped instruction is kept even long after the end (left for the relay)")
+  t.ok(vim.uv.fs_stat(run4_dir .. "/steer/" .. k5 .. ".json") ~= nil, "poll: its file is kept")
+  events.sweep_steers(run4)
+  t.eq({ run4.state.steers[k5].status, run4.state.steers[k5].skip_reason }, { "EXPIRED", "handback" },
+    "sweep_steers without keep_skipped: expired (after the UI had its chance)")
   os.remove(TR)
 end
 
